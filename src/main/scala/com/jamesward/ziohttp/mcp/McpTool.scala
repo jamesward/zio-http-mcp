@@ -45,7 +45,12 @@ object McpOutput:
       CallToolResult(content = Chunk(ToolContent.text(output)))
 
   given [A](using schema: Schema[A]): McpOutput[A] with
-    val outputSchema: Option[Json.Obj] = Some(JsonSchemaGen.fromSchema(schema))
+    private val jsonSchema = JsonSchemaGen.fromSchema(schema)
+    // MCP spec requires outputSchema to have type "object"
+    val outputSchema: Option[Json.Obj] =
+      jsonSchema.get("type").flatMap(_.asString) match
+        case Some("object") => Some(jsonSchema)
+        case _ => None
     private val encoder = SchemaJsonCodec.jsonEncoder(schema)
     private val isStringLike: Boolean =
       import zio.schema.{Schema as S, StandardType as ST}

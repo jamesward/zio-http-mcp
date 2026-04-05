@@ -22,8 +22,21 @@ object JavaSdkClientSpec extends ZIOSpecDefault:
     .handle[Any, Nothing, AddInput, AddOutput]: input =>
       ZIO.succeed(AddOutput(input.a + input.b))
 
+  // tools with non-object output types to test outputSchema validation
+  val stringTool: McpToolHandler = McpTool("echo")
+    .description("Returns input as string")
+    .handle[Any, Nothing, AddInput, String]: input =>
+      ZIO.succeed(s"${input.a} + ${input.b}")
+
+  val listTool: McpToolHandler = McpTool("list")
+    .description("Returns a list")
+    .handle[Any, Nothing, AddInput, List[Int]]: input =>
+      ZIO.succeed(List(input.a, input.b))
+
   val testServer = McpServer("test-server", "0.1.0")
     .tool(addTool)
+    .tool(stringTool)
+    .tool(listTool)
 
   private def withClient[A](port: Int)(f: io.modelcontextprotocol.client.McpSyncClient => A): Task[A] =
     ZIO.attemptBlocking:
@@ -42,6 +55,21 @@ object JavaSdkClientSpec extends ZIOSpecDefault:
 
   override def spec =
     suite("Java SDK Client Integration")(
+      test("tools/list returns valid schemas (outputSchema must be object or absent)"):
+        for
+          port  <- Server.install(testServer.routes)
+          tools <- withClient(port)(_.listTools().tools())
+        yield
+          import scala.jdk.CollectionConverters.*
+          val toolList = tools.asScala.toList
+          assertTrue(
+            toolList.size == 3,
+            toolList.forall: tool =>
+              val schema = tool.outputSchema()
+              schema == null || schema.get("type").asInstanceOf[String] == "object",
+            toolList.forall(_.inputSchema().`type`() == "object"),
+          )
+      ,
       test("tool call with parameters"):
         for
           port   <- Server.install(testServer.routes)
