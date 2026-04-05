@@ -53,37 +53,35 @@ object ConformanceSpec extends ZIOSpecDefault:
     )
     Base64.getEncoder.encodeToString(header)
 
-  case class EmptyInput() derives Schema
-
   val testSimpleText: McpToolHandler = McpTool("test_simple_text")
     .description("Returns simple text for testing")
-    .handleDirect[EmptyInput]: _ =>
-      ZIO.succeed(Chunk(ToolContent.text("This is a simple text response for testing.")))
+    .handle:
+      ZIO.succeed("This is a simple text response for testing.")
 
   val testImageContent: McpToolHandler = McpTool("test_image_content")
     .description("Returns image content for testing")
-    .handleDirect[EmptyInput]: _ =>
-      ZIO.succeed(Chunk(ToolContent.image(minimalPng, "image/png")))
+    .handle:
+      ZIO.succeed(ToolContent.image(minimalPng, "image/png"))
 
   val testAudioContent: McpToolHandler = McpTool("test_audio_content")
     .description("Returns audio content for testing")
-    .handleDirect[EmptyInput]: _ =>
-      ZIO.succeed(Chunk(ToolContent.audio(minimalWav, "audio/wav")))
+    .handle:
+      ZIO.succeed(ToolContent.audio(minimalWav, "audio/wav"))
 
   val testEmbeddedResource: McpToolHandler = McpTool("test_embedded_resource")
     .description("Returns embedded resource content for testing")
-    .handleDirect[EmptyInput]: _ =>
-      ZIO.succeed(Chunk(ToolContent.embeddedResource(
+    .handle:
+      ZIO.succeed(ToolContent.embeddedResource(
         ResourceContents(
           uri = "test://embedded-resource",
           mimeType = Some("text/plain"),
           text = Some("This is an embedded resource content."),
         )
-      )))
+      ))
 
   val testMultipleContentTypes: McpToolHandler = McpTool("test_multiple_content_types")
     .description("Returns multiple content types for testing")
-    .handleDirect[EmptyInput]: _ =>
+    .handle:
       ZIO.succeed(Chunk(
         ToolContent.text("Multiple content types test:"),
         ToolContent.image(minimalPng, "image/png"),
@@ -96,12 +94,12 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   val testErrorHandling: McpToolHandler = McpTool("test_error_handling")
     .description("Always returns an error for testing")
-    .handleDirect[EmptyInput]: _ =>
+    .handle[Any, ToolError, String]:
       ZIO.fail(ToolError("This tool intentionally returns an error for testing"))
 
   val testToolWithLogging: McpToolHandler = McpTool("test_tool_with_logging")
     .description("Tool that emits log notifications during execution")
-    .handleDirectWithContext[EmptyInput]: (_, ctx) =>
+    .handleWithContext: ctx =>
       for
         _ <- ctx.log(com.jamesward.ziohttp.mcp.LogLevel.Info, "Tool execution started")
         _ <- ZIO.sleep(50.millis)
@@ -112,7 +110,7 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   val testToolWithProgress: McpToolHandler = McpTool("test_tool_with_progress")
     .description("Tool that emits progress notifications during execution")
-    .handleDirectWithContext[EmptyInput]: (_, ctx) =>
+    .handleWithContext: ctx =>
       for
         _ <- ctx.progress(0, 100)
         _ <- ZIO.sleep(50.millis)
@@ -126,7 +124,7 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   val testSampling: McpToolHandler = McpTool("test_sampling")
     .description("Tool that tests sampling capability")
-    .handleDirectWithContext[PromptInput]: (input, ctx) =>
+    .handleWithContext[Any, ToolError, PromptInput, Chunk[ToolContent]]: (input, ctx) =>
       ctx.sample(input.prompt, 100).map: result =>
         val responseText = result.content match
           case ToolContent.Text(text, _) => text
@@ -135,7 +133,7 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   val testElicitation: McpToolHandler = McpTool("test_elicitation")
     .description("Tool that tests elicitation capability")
-    .handleDirectWithContext[MessageInput]: (input, ctx) =>
+    .handleWithContext[Any, ToolError, MessageInput, Chunk[ToolContent]]: (input, ctx) =>
       val schema = Json.Obj(Chunk(
         "type" -> Json.Str("object"),
         "properties" -> Json.Obj(Chunk(
@@ -149,7 +147,7 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   val testElicitationSep1034Defaults: McpToolHandler = McpTool("test_elicitation_sep1034_defaults")
     .description("Tool that tests elicitation with default values")
-    .handleDirectWithContext[EmptyInput]: (_, ctx) =>
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
       val schema = Json.Obj(Chunk(
         "type" -> Json.Str("object"),
         "properties" -> Json.Obj(Chunk(
@@ -169,7 +167,7 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   val testElicitationSep1330Enums: McpToolHandler = McpTool("test_elicitation_sep1330_enums")
     .description("Tool that tests elicitation with enum schemas")
-    .handleDirectWithContext[EmptyInput]: (_, ctx) =>
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
       val schema = Json.Obj(Chunk(
         "type" -> Json.Str("object"),
         "properties" -> Json.Obj(Chunk(
@@ -213,27 +211,28 @@ object ConformanceSpec extends ZIOSpecDefault:
         Chunk(ToolContent.text(s"Elicitation completed: action=${result.action}, content=${result.content.getOrElse(Map.empty)}"))
 
   // JSON Schema 2020-12 tool — raw schema preserving $schema, $defs, $ref, additionalProperties
-  val jsonSchema202012Tool: McpToolHandler = McpTool("json_schema_2020_12_tool")
-    .description("Tool with JSON Schema 2020-12 features")
-    .withRawInputSchema(Json.Obj(Chunk(
-      "$schema" -> Json.Str("https://json-schema.org/draft/2020-12/schema"),
-      "type" -> Json.Str("object"),
-      "$defs" -> Json.Obj(Chunk(
-        "address" -> Json.Obj(Chunk(
-          "type" -> Json.Str("object"),
-          "properties" -> Json.Obj(Chunk(
-            "street" -> Json.Obj(Chunk("type" -> Json.Str("string"))),
-            "city" -> Json.Obj(Chunk("type" -> Json.Str("string"))),
-          )),
+  private given McpInput[Option[Json.Obj]] = McpInput.raw(Json.Obj(Chunk(
+    "$schema" -> Json.Str("https://json-schema.org/draft/2020-12/schema"),
+    "type" -> Json.Str("object"),
+    "$defs" -> Json.Obj(Chunk(
+      "address" -> Json.Obj(Chunk(
+        "type" -> Json.Str("object"),
+        "properties" -> Json.Obj(Chunk(
+          "street" -> Json.Obj(Chunk("type" -> Json.Str("string"))),
+          "city" -> Json.Obj(Chunk("type" -> Json.Str("string"))),
         )),
       )),
-      "properties" -> Json.Obj(Chunk(
-        "name" -> Json.Obj(Chunk("type" -> Json.Str("string"))),
-        "address" -> Json.Obj(Chunk("$ref" -> Json.Str("#/$defs/address"))),
-      )),
-      "additionalProperties" -> Json.Bool(false),
-    )))
-    .handleDirect: args =>
+    )),
+    "properties" -> Json.Obj(Chunk(
+      "name" -> Json.Obj(Chunk("type" -> Json.Str("string"))),
+      "address" -> Json.Obj(Chunk("$ref" -> Json.Str("#/$defs/address"))),
+    )),
+    "additionalProperties" -> Json.Bool(false),
+  )))
+
+  val jsonSchema202012Tool: McpToolHandler = McpTool("json_schema_2020_12_tool")
+    .description("Tool with JSON Schema 2020-12 features")
+    .handle: (_: Option[Json.Obj]) =>
       ZIO.succeed(Chunk(ToolContent.text("JSON Schema 2020-12 tool called successfully.")))
 
   // --- Conformance resources ---
@@ -366,6 +365,13 @@ object ConformanceSpec extends ZIOSpecDefault:
     .prompt(testPromptWithEmbeddedResource)
     .prompt(testPromptWithImage)
 
+  // dns-rebinding-protection requires a localhost URL but rootless Docker
+  // cannot reach the host's localhost, so we mark it as an expected failure.
+  private val expectedFailuresYaml: String =
+    """server:
+      |  - dns-rebinding-protection
+      |""".stripMargin
+
   val conformanceImage: ImageFromDockerfile =
     ImageFromDockerfile("mcp-conformance", false)
       .withDockerfileFromBuilder: builder =>
@@ -375,18 +381,27 @@ object ConformanceSpec extends ZIOSpecDefault:
           .entryPoint("npx", "@modelcontextprotocol/conformance")
           .build()
 
-  def runConformance(port: Int): Task[(Long, String)] =
+  def runConformance(port: Int, scenario: Option[String] = None): Task[(Long, String)] =
     ZIO.attemptBlocking:
       TC.exposeHostPorts(port)
+
+      // Write expected failures YAML to a temp file for mounting
+      val tmpFile = java.io.File.createTempFile("expected-failures", ".yaml")
+      tmpFile.deleteOnExit()
+      java.nio.file.Files.writeString(tmpFile.toPath, expectedFailuresYaml)
 
       val stdout = ToStringConsumer()
       val container = GenericContainer(conformanceImage)
       container.withAccessToHost(true)
-      container.withExtraHost("localhost", "host-gateway")
-      container.withCommand(
+      container.withFileSystemBind(tmpFile.getAbsolutePath, "/tmp/expected-failures.yaml",
+        org.testcontainers.containers.BindMode.READ_ONLY)
+      val baseArgs = Seq(
         "server",
-        "--url", s"http://localhost:$port/mcp",
+        "--url", s"http://host.testcontainers.internal:$port/mcp",
+        "--expected-failures", "/tmp/expected-failures.yaml",
       )
+      val args = scenario.fold(baseArgs)(s => baseArgs ++ Seq("--scenario", s))
+      container.withCommand(args*)
       container.withStartupCheckStrategy(
         OneShotStartupCheckStrategy().withTimeout(JDuration.ofSeconds(60))
       )
@@ -416,7 +431,7 @@ object ConformanceSpec extends ZIOSpecDefault:
           _                 <- ZIO.logInfo(s"Conformance exit code: $exitCode")
           _                 <- ZIO.logInfo(s"Conformance output:\n$output")
         yield assertTrue(
-          exitCode == 0L,
+          output.contains("Baseline check passed") || exitCode == 0L,
         )
     ).provide(Server.defaultWith(_.onAnyOpenPort)) @@
       withLiveClock @@

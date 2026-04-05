@@ -2,7 +2,7 @@ organization := "com.jamesward"
 
 name := "zio-http-mcp"
 
-scalaVersion := "3.8.2"
+scalaVersion := "3.8.3"
 
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
@@ -23,14 +23,16 @@ libraryDependencies ++= Seq(
   // todo: move this somewhere else
   "de.sciss" %% "semverfi" % "0.3.0",
 
+  "org.slf4j" % "slf4j-simple" % "2.0.17" % Test,
+
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
   "dev.zio" %% "zio-test-magnolia"  % zioVersion % Test,
 
   "org.testcontainers" % "testcontainers" % "2.0.4" % Test,
 
-  "io.modelcontextprotocol.sdk" % "mcp-core"           % "1.1.0" % Test,
-  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "1.1.0" % Test,
+  "io.modelcontextprotocol.sdk" % "mcp-core"           % "1.1.1" % Test,
+  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "1.1.1" % Test,
 )
 
 fork := true

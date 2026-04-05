@@ -81,6 +81,19 @@ object McpError:
   given McpError[Nothing] with
     def message(e: Nothing): String = e
 
+// --- OptBool: three-state boolean for optional annotation hints ---
+
+enum OptBool:
+  case True, False, Unset
+
+  def toOption: Option[Boolean] = this match
+    case True  => Some(true)
+    case False => Some(false)
+    case Unset => None
+
+object OptBool:
+  given CanEqual[OptBool, OptBool] = CanEqual.derived
+
 // --- Protocol Constants ---
 
 object McpProtocol:

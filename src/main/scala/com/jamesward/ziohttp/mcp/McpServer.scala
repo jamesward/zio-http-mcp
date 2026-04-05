@@ -239,7 +239,15 @@ final class McpServer[-R] private (
 
               // Fork the tool, stream messages + result as SSE
               Promise.make[Nothing, CallToolResult].flatMap: resultPromise =>
-                val runTool = toolEffect.flatMap(resultPromise.succeed).ensuring(queue.shutdown)
+                val runTool = toolEffect
+                  .flatMap(resultPromise.succeed)
+                  .catchAllDefect: defect =>
+                    val errorResult = CallToolResult(
+                      content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
+                      isError = Some(true),
+                    )
+                    resultPromise.succeed(errorResult)
+                  .ensuring(queue.shutdown)
                 runTool.fork.as:
                   sseToolCallResponse(id, queue, resultPromise)
 

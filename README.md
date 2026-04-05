@@ -27,7 +27,7 @@ val server = McpServer("my-server", "1.0.0")
   .tool(
     McpTool("greet")
       .description("Greets someone by name")
-      .handle[Any, Nothing, NameInput, String]: input =>
+      .handle: (input: NameInput) =>
         ZIO.succeed(s"Hello, ${input.name}!")
   )
 
@@ -38,38 +38,106 @@ object Main extends ZIOAppDefault:
 
 ## Tools
 
-Tools are the primary way to expose functionality to MCP clients. Define input/output types as case classes with `derives Schema`, and the library generates JSON Schema automatically.
+Tools are the primary way to expose functionality to MCP clients. Define input types as case classes with `derives Schema`, and the library generates JSON Schema automatically.
 
-### Basic Tool
+### handle — Typed Input/Output
+
+The `handle` method has overloads for common cases. Type parameters are inferred where possible.
 
 ```scala
 case class AddInput(a: Int, b: Int) derives Schema
+case class AddOutput(result: Int) derives Schema
 
+// With input, no error — types inferred
 val addTool = McpTool("add")
   .description("Adds two numbers")
-  .handle[Any, Nothing, AddInput, Int]: input =>
-    ZIO.succeed(input.a + input.b)
+  .handle: (input: AddInput) =>
+    ZIO.succeed(AddOutput(input.a + input.b))
+
+// No input, no error
+val timeTool = McpTool("time")
+  .description("Returns the current time")
+  .handle:
+    Clock.instant
+
+// With input and error — error type must be explicit
+val divTool = McpTool("divide")
+  .description("Divides two numbers")
+  .handle[Any, ToolError, AddInput, Double]: input =>
+    if input.b == 0 then ZIO.fail(ToolError("Division by zero"))
+    else ZIO.succeed(input.a.toDouble / input.b)
 ```
 
-The type parameters on `handle` are `[R, E, In, Out]`:
+### Output Types
 
-| Param | Meaning |
-|-------|---------|
-| `R` | ZIO environment requirements (use `Any` for none) |
-| `E` | Error type (use `Nothing` for infallible tools) |
-| `In` | Input type (must have `Schema`) |
-| `Out` | Output type (must have `Schema`) |
+The output type determines how the result is serialized. The `McpOutput` type class handles this:
+
+| Output type | Behavior |
+|---|---|
+| `String` | Plain text content, no output schema |
+| `ToolContent` | Single content item (text, image, audio, embedded resource) |
+| `Chunk[ToolContent]` | Multiple content items |
+| Any type with `Schema` | JSON-serialized with `structuredContent` and `outputSchema` |
+
+```scala
+// Returns plain text
+.handle: ZIO.succeed("Hello!")
+
+// Returns a single image
+.handle: ZIO.succeed(ToolContent.image(base64Data, "image/png"))
+
+// Returns multiple content items
+.handle: ZIO.succeed(Chunk(
+  ToolContent.text("Here is an image:"),
+  ToolContent.image(base64Data, "image/png"),
+))
+
+// Returns structured output with schema
+case class Result(value: Int) derives Schema
+.handle: ZIO.succeed(Result(42))
+```
+
+### handleWithContext — With Tool Context
+
+Use `handleWithContext` when your tool needs logging, progress, sampling, or elicitation:
+
+```scala
+case class ProcessInput(data: String) derives Schema
+
+val processTool = McpTool("process")
+  .description("Processes data with progress")
+  .handleWithContext: (input: ProcessInput, ctx: McpToolContext) =>
+    for
+      _ <- ctx.log(LogLevel.Info, "Starting")
+      _ <- ctx.progress(0, 100)
+      result <- doWork(input)
+      _ <- ctx.progress(100, 100)
+    yield s"Done: $result"
+
+// No input — just takes the context
+val statusTool = McpTool("status")
+  .description("Reports status")
+  .handleWithContext: ctx =>
+    for _ <- ctx.log(LogLevel.Info, "Status check")
+    yield "All systems operational"
+```
+
+`McpToolContext` provides:
+
+| Method | Description |
+|--------|-------------|
+| `ctx.log(level, message)` | Send log notification to client |
+| `ctx.progress(current, total)` | Send progress notification (requires `progressToken` in request) |
+| `ctx.sample(prompt, maxTokens)` | Request LLM completion from client |
+| `ctx.elicit(message, schema)` | Request user input from client with a JSON Schema form |
 
 ### Tools with ZIO Layers
 
-Tools can declare ZIO environment requirements. These propagate through the server to the routes, just like ZIO HTTP:
+Tools can declare ZIO environment requirements. These propagate through the server to the routes:
 
 ```scala
 trait Database:
   def query(sql: String): IO[ToolError, String]
-
-object Database:
-  val live: ULayer[Database] = ZLayer.succeed(???)
 
 case class QueryInput(sql: String) derives Schema
 
@@ -77,17 +145,12 @@ val queryTool = McpTool("query")
   .description("Runs a database query")
   .handle[Database, ToolError, QueryInput, String]: input =>
     ZIO.serviceWithZIO[Database](_.query(input.sql))
-```
 
-When tools with different requirements are added to a server, the requirements accumulate:
-
-```scala
 val server = McpServer("my-server", "1.0.0")
   .tool(queryTool)   // needs Database
   .tool(cacheTool)   // needs Cache
 
 // server.routes: Routes[Database & Cache, Response]
-// Provide layers when serving:
 Server.serve(server.routes).provide(
   Server.default,
   Database.live,
@@ -95,11 +158,9 @@ Server.serve(server.routes).provide(
 )
 ```
 
-Tools with no environment requirements (`R = Any`) don't add to the server's requirements.
-
 ### Error Handling
 
-Tool handler errors are converted to MCP tool error responses (`isError: true`) using the `McpError[E]` typeclass. You must provide an instance for any custom error type:
+Tool handler errors are converted to MCP error responses (`isError: true`) using the `McpError[E]` type class. Built-in instances exist for `ToolError`, `String`, `Throwable`, and `Nothing`.
 
 ```scala
 enum AppError:
@@ -117,65 +178,39 @@ val tool = McpTool("lookup")
     else ZIO.succeed(s"Found: ${input.id}")
 ```
 
-Built-in `McpError` instances are provided for `ToolError`, `String`, `Throwable`, and `Nothing`.
-
-No errors propagate out of the MCP server. Protocol-level errors (invalid JSON, unknown method, etc.) are handled internally as JSON-RPC error responses. Tool execution errors become `CallToolResult` with `isError: true`.
-
 ### Tool Annotations
 
 ```scala
+import OptBool.*
+
 val tool = McpTool("delete_user")
   .description("Deletes a user account")
-  .annotations(
-    destructive = Some(true),
-    idempotent = Some(true),
-  )
-  .handle[Any, Nothing, DeleteInput, String](...)
+  .annotations(destructive = True, idempotent = True)
+  .handle[Any, ToolError, DeleteInput, String](...)
 ```
 
-### Direct Content Tools
+Annotation values use `OptBool` (a tri-state enum: `True`, `False`, `Unset`) to distinguish "not set" from `false`. Available annotations: `readOnly`, `destructive`, `idempotent`, `openWorld`, plus `title: Option[String]`.
 
-For fine-grained control over response content (images, audio, embedded resources), use `handleDirect`:
+### Custom JSON Schema
+
+For tools that need a hand-crafted JSON Schema (e.g., JSON Schema 2020-12 features not covered by ZIO Schema), provide a custom `McpInput` instance:
 
 ```scala
-val imageTool = McpTool("screenshot")
-  .description("Takes a screenshot")
-  .handleDirect[EmptyInput]: _ =>
-    for
-      data <- takeScreenshot()
-    yield Chunk(
-      ToolContent.text("Screenshot captured:"),
-      ToolContent.image(base64Data, "image/png"),
-    )
+import zio.json.ast.Json
+
+given McpInput[Option[Json.Obj]] = McpInput.raw(Json.Obj(Chunk(
+  "type" -> Json.Str("object"),
+  "properties" -> Json.Obj(Chunk(
+    "value" -> Json.Obj(Chunk("type" -> Json.Str("string"))),
+  )),
+)))
+
+val tool = McpTool("validate")
+  .description("Validate data")
+  .handle: (args: Option[Json.Obj]) =>
+    val value = args.flatMap(_.get("value")).flatMap(_.asString).getOrElse("")
+    ZIO.succeed(s"Received: $value")
 ```
-
-Content types: `ToolContent.text`, `ToolContent.image`, `ToolContent.audio`, `ToolContent.embeddedResource`.
-
-### Tools with Context (Logging, Progress, Sampling, Elicitation)
-
-Use `handleDirectWithContext` to access `McpToolContext` during execution:
-
-```scala
-val processTool = McpTool("process")
-  .description("Processes data with progress")
-  .handleDirectWithContext[ProcessInput]: (input, ctx) =>
-    for
-      _ <- ctx.log(LogLevel.Info, "Starting processing")
-      _ <- ctx.progress(0, 100)
-      result <- doWork(input)
-      _ <- ctx.progress(100, 100)
-      _ <- ctx.log(LogLevel.Info, "Done")
-    yield Chunk(ToolContent.text(result))
-```
-
-`McpToolContext` provides:
-
-| Method | Description |
-|--------|-------------|
-| `ctx.log(level, message)` | Send log notification to client |
-| `ctx.progress(current, total)` | Send progress notification (requires `progressToken` in request) |
-| `ctx.sample(prompt, maxTokens)` | Request LLM completion from client |
-| `ctx.elicit(message, schema)` | Request user input from client with a JSON Schema form |
 
 ## Resources
 
@@ -243,12 +278,7 @@ val server = McpServer("my-server", "1.0.0")
   .prompt(codeReviewPrompt)
 ```
 
-The server auto-declares capabilities based on what's registered:
-
-- `tools` capability if any tools are added
-- `resources` capability (with subscribe support) if any resources or templates are added
-- `prompts` capability if any prompts are added
-- `logging` and `completions` are always enabled
+The server auto-declares capabilities based on what's registered.
 
 ### HTTP Endpoints
 
@@ -257,7 +287,7 @@ The server auto-declares capabilities based on what's registered:
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/mcp` | All JSON-RPC requests and notifications |
-| GET | `/mcp` | SSE keepalive stream |
+| GET | `/mcp` | SSE stream for server-initiated messages |
 | DELETE | `/mcp` | Session cleanup |
 
 ### Running
@@ -276,7 +306,6 @@ Or with a custom port:
 ```scala
 Server.serve(server.routes).provide(
   Server.defaultWith(_.binding("0.0.0.0", 8080)),
-  // ... your layers
 )
 ```
 

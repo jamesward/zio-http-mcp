@@ -6,6 +6,79 @@ import zio.json.ast.Json
 import zio.schema.Schema
 import zio.schema.codec.JsonCodec as SchemaJsonCodec
 
+import scala.annotation.tailrec
+
+// --- McpInput type class: provides JSON schema + decoding for tool inputs ---
+
+trait McpInput[A]:
+  def jsonSchema: Json.Obj
+  def decode(args: Option[Json.Obj]): Either[String, A]
+
+object McpInput:
+  private val emptyObjectSchema = Json.Obj(Chunk("type" -> Json.Str("object"), "properties" -> Json.Obj()))
+
+  given unit: McpInput[Unit] with
+    val jsonSchema: Json.Obj = emptyObjectSchema
+    def decode(args: Option[Json.Obj]): Either[String, Unit] = Right(())
+
+  given [A](using schema: Schema[A]): McpInput[A] with
+    val jsonSchema: Json.Obj = JsonSchemaGen.fromSchema(schema)
+    private val decoder = SchemaJsonCodec.jsonDecoder(schema)
+    def decode(args: Option[Json.Obj]): Either[String, A] =
+      decoder.decodeJson(args.getOrElse(Json.Obj()).toJson)
+
+  def raw(schema: Json.Obj): McpInput[Option[Json.Obj]] =
+    new McpInput[Option[Json.Obj]]:
+      val jsonSchema: Json.Obj = schema
+      def decode(args: Option[Json.Obj]): Either[String, Option[Json.Obj]] = Right(args)
+
+// --- McpOutput type class: converts tool output to CallToolResult ---
+
+trait McpOutput[A]:
+  def outputSchema: Option[Json.Obj]
+  def toResult(output: A): CallToolResult
+
+object McpOutput:
+  given McpOutput[String] with
+    val outputSchema: Option[Json.Obj] = None
+    def toResult(output: String): CallToolResult =
+      CallToolResult(content = Chunk(ToolContent.text(output)))
+
+  given [A](using schema: Schema[A]): McpOutput[A] with
+    val outputSchema: Option[Json.Obj] = Some(JsonSchemaGen.fromSchema(schema))
+    private val encoder = SchemaJsonCodec.jsonEncoder(schema)
+    private val isStringLike: Boolean =
+      import zio.schema.{Schema as S, StandardType as ST}
+      @tailrec
+      def check(s: S[?]): Boolean = s match
+        case S.Primitive(st, _) => st eq ST.StringType
+        case S.Transform(inner, _, _, _, _) => check(inner)
+        case S.Lazy(s0) => check(s0())
+        case _ => false
+      check(schema)
+    def toResult(output: A): CallToolResult =
+      if isStringLike then
+        CallToolResult(content = Chunk(ToolContent.text(output.toString)))
+      else
+        val jsonStr = encoder.encodeJson(output, None).toString
+        // MCP spec requires structuredContent to be a JSON object
+        val structured = jsonStr.fromJson[Json].toOption.collect:
+          case obj: Json.Obj => obj
+        CallToolResult(
+          content = Chunk(ToolContent.text(jsonStr)),
+          structuredContent = structured,
+        )
+
+  given McpOutput[ToolContent] with
+    val outputSchema: Option[Json.Obj] = None
+    def toResult(output: ToolContent): CallToolResult =
+      CallToolResult(content = Chunk(output))
+
+  given McpOutput[Chunk[ToolContent]] with
+    val outputSchema: Option[Json.Obj] = None
+    def toResult(output: Chunk[ToolContent]): CallToolResult =
+      CallToolResult(content = output)
+
 // --- Tool handler with environment requirement (contravariant, like ZIO/Routes) ---
 
 trait McpToolHandlerR[-R]:
@@ -30,27 +103,42 @@ final class McpTool private (
 
   def annotations(
     title: Option[String] = None,
-    readOnly: Option[Boolean] = None,
-    destructive: Option[Boolean] = None,
-    idempotent: Option[Boolean] = None,
-    openWorld: Option[Boolean] = None,
+    readOnly: OptBool = OptBool.Unset,
+    destructive: OptBool = OptBool.Unset,
+    idempotent: OptBool = OptBool.Unset,
+    openWorld: OptBool = OptBool.Unset,
   ): McpTool =
-    new McpTool(toolName, toolDescription, Some(ToolAnnotations(title, readOnly, destructive, idempotent, openWorld)))
+    new McpTool(toolName, toolDescription, Some(ToolAnnotations(title, readOnly.toOption, destructive.toOption, idempotent.toOption, openWorld.toOption)))
 
-  def handle[R, E: McpError, In: Schema, Out: Schema](f: In => ZIO[R, E, Out]): McpToolHandlerR[R] =
-    val inSchema  = summon[Schema[In]]
-    val outSchema = summon[Schema[Out]]
+  // --- handle: typed input/output ---
+
+  def handle[R, E: McpError, In: McpInput, Out: McpOutput](f: In => ZIO[R, E, Out]): McpToolHandlerR[R] =
+    handleWithContext[R, E, In, Out]((in, _) => f(in))
+
+  // No error
+  def handle[R, In: McpInput, Out: McpOutput](f: In => ZIO[R, Nothing, Out]): McpToolHandlerR[R] =
+    handleWithContext[R, Nothing, In, Out]((in, _) => f(in))
+
+  // No input
+  def handle[R, E: McpError, Out: McpOutput](f: ZIO[R, E, Out]): McpToolHandlerR[R] =
+    handleWithContext[R, E, Unit, Out]((_, _) => f)
+
+  // No input, no error
+  def handle[R, Out: McpOutput](f: ZIO[R, Nothing, Out]): McpToolHandlerR[R] =
+    handleWithContext[R, Nothing, Unit, Out]((_, _) => f)
+
+  // --- handleWithContext: typed input/output + McpToolContext ---
+
+  def handleWithContext[R, E: McpError, In: McpInput, Out: McpOutput](f: (In, McpToolContext) => ZIO[R, E, Out]): McpToolHandlerR[R] =
+    val mcpInput  = summon[McpInput[In]]
+    val mcpOutput = summon[McpOutput[Out]]
     val mcpError  = summon[McpError[E]]
-    val inDecoder = SchemaJsonCodec.jsonDecoder(inSchema)
-    val outEncoder = SchemaJsonCodec.jsonEncoder(outSchema)
-    val inputJsonSchema  = JsonSchemaGen.fromSchema(inSchema)
-    val outputJsonSchema = JsonSchemaGen.fromSchema(outSchema)
 
     val toolDef = ToolDefinition(
       name = toolName.value,
       description = toolDescription,
-      inputSchema = inputJsonSchema,
-      outputSchema = Some(outputJsonSchema),
+      inputSchema = mcpInput.jsonSchema,
+      outputSchema = mcpOutput.outputSchema,
       annotations = toolAnnotations,
     )
 
@@ -60,51 +148,10 @@ final class McpTool private (
       def definition: ToolDefinition = toolDef
 
       def call(args: Option[Json.Obj]): ZIO[R, Nothing, CallToolResult] =
-        val argsJson = args.getOrElse(Json.Obj()).toJson
-        inDecoder.decodeJson(argsJson) match
-          case Left(decodeError) =>
-            ZIO.succeed(CallToolResult(
-              content = Chunk(ToolContent.text(s"Invalid arguments: $decodeError")),
-              isError = Some(true),
-            ))
-          case Right(input) =>
-            f(input).fold(
-              error => CallToolResult(
-                content = Chunk(ToolContent.text(mcpError.message(error))),
-                isError = Some(true),
-              ),
-              output =>
-                val jsonStr = outEncoder.encodeJson(output, None).toString
-                val structured = jsonStr.fromJson[Json].toOption
-                CallToolResult(
-                  content = Chunk(ToolContent.text(jsonStr)),
-                  structuredContent = structured,
-                ),
-            )
-
-  def handleDirectWithContext[In: Schema](f: (In, McpToolContext) => ZIO[Any, Any, Chunk[ToolContent]]): McpToolHandler =
-    val inSchema  = summon[Schema[In]]
-    val inDecoder = SchemaJsonCodec.jsonDecoder(inSchema)
-    val inputJsonSchema = JsonSchemaGen.fromSchema(inSchema)
-
-    val toolDef = ToolDefinition(
-      name = toolName.value,
-      description = toolDescription,
-      inputSchema = inputJsonSchema,
-      annotations = toolAnnotations,
-    )
-
-    val capturedName = toolName
-    new McpToolHandlerR[Any]:
-      def name: ToolName = capturedName
-      def definition: ToolDefinition = toolDef
-
-      def call(args: Option[Json.Obj]): ZIO[Any, Nothing, CallToolResult] =
         callWithContext(args, McpToolContext.noop)
 
-      override def callWithContext(args: Option[Json.Obj], ctx: McpToolContext): ZIO[Any, Nothing, CallToolResult] =
-        val argsJson = args.getOrElse(Json.Obj()).toJson
-        inDecoder.decodeJson(argsJson) match
+      override def callWithContext(args: Option[Json.Obj], ctx: McpToolContext): ZIO[R, Nothing, CallToolResult] =
+        mcpInput.decode(args) match
           case Left(decodeError) =>
             ZIO.succeed(CallToolResult(
               content = Chunk(ToolContent.text(s"Invalid arguments: $decodeError")),
@@ -113,77 +160,27 @@ final class McpTool private (
           case Right(input) =>
             f(input, ctx).fold(
               error => CallToolResult(
-                content = Chunk(ToolContent.text(error.toString)),
+                content = Chunk(ToolContent.text(mcpError.message(error))),
                 isError = Some(true),
               ),
-              content => CallToolResult(content = content),
-            )
-
-  def withRawInputSchema(schema: Json.Obj): McpToolRaw =
-    McpToolRaw(toolName, toolDescription, toolAnnotations, schema)
-
-  def handleDirect[In: Schema](f: In => ZIO[Any, Any, Chunk[ToolContent]]): McpToolHandler =
-    val inSchema  = summon[Schema[In]]
-    val inDecoder = SchemaJsonCodec.jsonDecoder(inSchema)
-    val inputJsonSchema = JsonSchemaGen.fromSchema(inSchema)
-
-    val toolDef = ToolDefinition(
-      name = toolName.value,
-      description = toolDescription,
-      inputSchema = inputJsonSchema,
-      annotations = toolAnnotations,
-    )
-
-    val capturedName = toolName
-    new McpToolHandlerR[Any]:
-      def name: ToolName = capturedName
-      def definition: ToolDefinition = toolDef
-
-      def call(args: Option[Json.Obj]): ZIO[Any, Nothing, CallToolResult] =
-        val argsJson = args.getOrElse(Json.Obj()).toJson
-        inDecoder.decodeJson(argsJson) match
-          case Left(decodeError) =>
-            ZIO.succeed(CallToolResult(
-              content = Chunk(ToolContent.text(s"Invalid arguments: $decodeError")),
-              isError = Some(true),
-            ))
-          case Right(input) =>
-            f(input).fold(
-              error => CallToolResult(
-                content = Chunk(ToolContent.text(error.toString)),
+              output => mcpOutput.toResult(output),
+            ).catchAllDefect: defect =>
+              ZIO.succeed(CallToolResult(
+                content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
                 isError = Some(true),
-              ),
-              content => CallToolResult(content = content),
-            )
+              ))
 
-// --- Raw JSON Schema tool builder (for tools with hand-crafted JSON Schema) ---
+  // No error
+  def handleWithContext[R, In: McpInput, Out: McpOutput](f: (In, McpToolContext) => ZIO[R, Nothing, Out]): McpToolHandlerR[R] =
+    handleWithContext[R, Nothing, In, Out](f)
 
-final class McpToolRaw private[mcp] (
-  val toolName: ToolName,
-  val toolDescription: Option[String],
-  val toolAnnotations: Option[ToolAnnotations],
-  val rawInputSchema: Json.Obj,
-):
-  def handleDirect(f: Option[Json.Obj] => ZIO[Any, Any, Chunk[ToolContent]]): McpToolHandler =
-    val toolDef = ToolDefinition(
-      name = toolName.value,
-      description = toolDescription,
-      inputSchema = rawInputSchema,
-      annotations = toolAnnotations,
-    )
-    val capturedName = toolName
-    val handler = f
-    new McpToolHandlerR[Any]:
-      def name: ToolName = capturedName
-      def definition: ToolDefinition = toolDef
-      def call(args: Option[Json.Obj]): ZIO[Any, Nothing, CallToolResult] =
-        handler(args).fold(
-          error => CallToolResult(
-            content = Chunk(ToolContent.text(error.toString)),
-            isError = Some(true),
-          ),
-          content => CallToolResult(content = content),
-        )
+  // No input
+  def handleWithContext[R, E: McpError, Out: McpOutput](f: McpToolContext => ZIO[R, E, Out]): McpToolHandlerR[R] =
+    handleWithContext[R, E, Unit, Out]((_, ctx) => f(ctx))
+
+  // No input, no error
+  def handleWithContext[R, Out: McpOutput](f: McpToolContext => ZIO[R, Nothing, Out]): McpToolHandlerR[R] =
+    handleWithContext[R, Nothing, Unit, Out]((_, ctx) => f(ctx))
 
 object McpTool:
   def apply(name: String): McpTool =
