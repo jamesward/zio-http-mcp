@@ -33,7 +33,7 @@ val server = McpServer("my-server", "1.0.0")
 
 object Main extends ZIOAppDefault:
   def run =
-    Server.serve(server.routes).provide(Server.default)
+    Server.serve(server.routes).provide(Server.default, McpServer.State.default)
 ```
 
 ## Tools
@@ -150,9 +150,10 @@ val server = McpServer("my-server", "1.0.0")
   .tool(queryTool)   // needs Database
   .tool(cacheTool)   // needs Cache
 
-// server.routes: Routes[Database & Cache, Response]
+// server.routes: Routes[Database & Cache & McpServer.State, Response]
 Server.serve(server.routes).provide(
   Server.default,
+  McpServer.State.default,
   Database.live,
   Cache.live,
 )
@@ -319,6 +320,7 @@ object Main extends ZIOAppDefault:
   def run =
     Server.serve(server.routes).provide(
       Server.default,
+      McpServer.State.default,
       // ... your layers
     )
 ```
@@ -328,6 +330,7 @@ Or with a custom port:
 ```scala
 Server.serve(server.routes).provide(
   Server.defaultWith(_.binding("0.0.0.0", 8080)),
+  McpServer.State.default,
 )
 ```
 

@@ -36,10 +36,10 @@ final class McpServer[-R] private (
   def prompt(p: McpPromptHandler): McpServer[R] =
     new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p)
 
-  private val toolsByName: Map[String, McpToolHandlerR[R]] =
-    tools.map(t => t.name.value -> t).toMap
+  private val toolsByName: Map[ToolName, McpToolHandlerR[R]] =
+    tools.map(t => t.name -> t).toMap
 
-  private val promptsByName: Map[String, McpPromptHandler] =
+  private val promptsByName: Map[PromptName, McpPromptHandler] =
     prompts.map(p => p.definition.name -> p).toMap
 
   private val serverCapabilities: ServerCapabilities =
@@ -51,7 +51,7 @@ final class McpServer[-R] private (
       completions = Some(Json.Obj()),
     )
 
-  def routes: Routes[R, Response] =
+  def routes: Routes[R & McpServer.State, Response] =
     Routes(
       Method.POST / "mcp" -> handler(postHandler),
       Method.GET / "mcp"  -> handler(getHandler),
@@ -73,15 +73,14 @@ final class McpServer[-R] private (
       case None =>
         ZIO.unit
 
-  private def postHandler(request: Request): ZIO[R, Response, Response] =
+  private def postHandler(request: Request): ZIO[R & McpServer.State, Response, Response] =
     for
-      _              <- validateOrigin(request)
-      sessions       <- McpServer.sessions
-      pendingReqs    <- McpServer.pendingRequests
-      body           <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
-      bodyJson       <- ZIO.fromEither(body.fromJson[Json.Obj])
-                          .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
-      response       <- routeMessage(request, sessions, pendingReqs, bodyJson)
+      _        <- validateOrigin(request)
+      state    <- ZIO.service[McpServer.State]
+      body     <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
+      bodyJson <- ZIO.fromEither(body.fromJson[Json.Obj])
+                    .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
+      response <- routeMessage(request, state.sessions, state.pendingRequests, bodyJson)
     yield response
 
   private def statelessPostHandler(request: Request): ZIO[R, Response, Response] =
@@ -94,9 +93,11 @@ final class McpServer[-R] private (
                     .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
       response <- message match
         case JsonRpcMessage.Request(id, "initialize", params) =>
-          handleInitializeResult(id, params).map(jsonRpcResponse(id, _))
+          parseInitializeParams(id, params).flatMap(r => jsonRpcResponse(id, r))
         case JsonRpcMessage.Request(id, method, params) =>
-          dispatchMethod(id, method, params, statelessHandleToolsCall)
+          McpDispatchMethod.parse(method) match
+            case Some(dm) => dispatchMethod(id, dm, params, statelessHandleToolsCall)
+            case None     => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
         case JsonRpcMessage.Notification(_, _) =>
           ZIO.succeed(Response.ok)
     yield response
@@ -105,37 +106,35 @@ final class McpServer[-R] private (
 
   private def dispatchMethod[R1 <: R](
     id: RequestId,
-    method: String,
+    method: McpDispatchMethod,
     params: Option[Json.Obj],
     onToolsCall: (RequestId, Option[Json.Obj]) => ZIO[R1, Response, Response],
   ): ZIO[R1, Response, Response] =
     method match
-      case "ping" =>
-        ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
-      case "tools/list" =>
+      case McpDispatchMethod.Ping =>
+        jsonRpcResponse(id, Json.Obj())
+      case McpDispatchMethod.ToolsList =>
         handleToolsList(id, params)
-      case "tools/call" =>
+      case McpDispatchMethod.ToolsCall =>
         onToolsCall(id, params)
-      case "resources/list" =>
+      case McpDispatchMethod.ResourcesList =>
         handleResourcesList(id)
-      case "resources/templates/list" =>
+      case McpDispatchMethod.ResourceTemplatesList =>
         handleResourceTemplatesList(id)
-      case "resources/read" =>
+      case McpDispatchMethod.ResourcesRead =>
         handleResourceRead(id, params)
-      case "resources/subscribe" =>
-        ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
-      case "resources/unsubscribe" =>
-        ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
-      case "prompts/list" =>
+      case McpDispatchMethod.ResourcesSubscribe =>
+        jsonRpcResponse(id, Json.Obj())
+      case McpDispatchMethod.ResourcesUnsubscribe =>
+        jsonRpcResponse(id, Json.Obj())
+      case McpDispatchMethod.PromptsList =>
         handlePromptsList(id)
-      case "prompts/get" =>
+      case McpDispatchMethod.PromptsGet =>
         handlePromptsGet(id, params)
-      case "logging/setLevel" =>
-        ZIO.succeed(jsonRpcResponse(id, Json.Obj()))
-      case "completion/complete" =>
+      case McpDispatchMethod.LoggingSetLevel =>
+        jsonRpcResponse(id, Json.Obj())
+      case McpDispatchMethod.CompletionComplete =>
         handleCompletionComplete(id, params)
-      case _ =>
-        ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
 
   private def routeMessage(
     request: Request,
@@ -149,10 +148,8 @@ final class McpServer[-R] private (
     val hasMethod = bodyJson.get("method").isDefined
 
     if (hasResult || hasError) && !hasMethod then
-      // This is a JSON-RPC response from the client (replying to a server request)
       handleClientResponse(pendingReqs, bodyJson)
     else
-      // Parse as a normal JSON-RPC message (request or notification)
       val message = bodyJson.toJson.fromJson[JsonRpcMessage]
       ZIO.fromEither(message)
         .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
@@ -191,8 +188,12 @@ final class McpServer[-R] private (
       case "initialize" =>
         handleInitialize(sessions, id, params)
       case _ =>
-        withSession(request, sessions):
-          dispatchMethod(id, method, params, handleToolsCall(_, _, pendingReqs))
+        McpDispatchMethod.parse(method) match
+          case Some(dm) =>
+            withSession(request, sessions):
+              dispatchMethod(id, dm, params, handleToolsCall(_, _, pendingReqs))
+          case None =>
+            ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
 
   private def handleNotification(
     request: Request,
@@ -200,54 +201,51 @@ final class McpServer[-R] private (
     method: String,
     params: Option[Json.Obj],
   ): ZIO[Any, Response, Response] =
-    method match
-      case "notifications/initialized" =>
+    McpNotificationMethod.parse(method) match
+      case Some(McpNotificationMethod.Initialized) =>
         val sessionId = request.rawHeader("mcp-session-id").map(SessionId(_))
         sessionId match
           case Some(sid) =>
             sessions.update(_.updatedWith(sid):
               case Some(_) => Some(SessionState.Active)
-              case None => None
+              case None    => None
             ).as(Response.ok)
           case None =>
             ZIO.succeed(Response.ok)
-      case "notifications/cancelled" =>
+      case Some(McpNotificationMethod.Cancelled) =>
         ZIO.succeed(Response.ok)
-      case _ =>
+      case None =>
         ZIO.succeed(Response.ok)
 
-  private def handleInitializeResult(
+  private def parseInitializeParams(
     id: RequestId,
     params: Option[Json.Obj],
-  ): ZIO[Any, Response, Json] =
+  ): ZIO[Any, Response, InitializeResult] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
-    ZIO.fromEither(paramsJson.fromJson[InitializeParams]).mapBoth(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid initialize params: $e"), {
-      _ =>
+    ZIO.fromEither(paramsJson.fromJson[InitializeParams])
+      .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid initialize params: $e"))
+      .as:
         InitializeResult(
           protocolVersion = McpProtocol.Version,
           capabilities = serverCapabilities,
           serverInfo = serverInfo,
-        ).toJsonAST.toOption.get
-    })
+        )
 
   private def handleInitialize(
     sessions: Ref[Map[SessionId, SessionState]],
     id: RequestId,
     params: Option[Json.Obj],
   ): ZIO[Any, Response, Response] =
-    handleInitializeResult(id, params).flatMap: result =>
+    parseInitializeParams(id, params).flatMap: result =>
       val sessionId = SessionId.generate
-      sessions.update(_.updated(sessionId, SessionState.Initializing)).as:
-        jsonRpcResponse(id, result)
-          .addHeader("mcp-session-id", sessionId.value)
+      sessions.update(_.updated(sessionId, SessionState.Initializing)) *>
+        jsonRpcResponse(id, result).map(_.addHeader("mcp-session-id", sessionId.value))
 
   private def handleToolsList(
     id: RequestId,
     params: Option[Json.Obj],
-  ): ZIO[Any, Nothing, Response] =
-    val toolDefs = tools.map(_.definition)
-    val result = ToolsListResult(tools = toolDefs)
-    ZIO.succeed(jsonRpcResponse(id, result.toJsonAST.toOption.get))
+  ): ZIO[Any, Response, Response] =
+    jsonRpcResponse(id, ToolsListResult(tools = tools.map(_.definition)))
 
   private def resolveToolCall(
     id: RequestId,
@@ -259,7 +257,7 @@ final class McpServer[-R] private (
       .flatMap: callParams =>
         toolsByName.get(callParams.name) match
           case None =>
-            ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Unknown tool: ${callParams.name}"))
+            ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Unknown tool: ${callParams.name.value}"))
           case Some(tool) =>
             ZIO.succeed((tool, callParams))
 
@@ -299,16 +297,13 @@ final class McpServer[-R] private (
             content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
             isError = Some(true),
           ))
-        .map: result =>
-          jsonRpcResponse(id, result.toJsonAST.toOption.get)
+        .flatMap(result => jsonRpcResponse(id, result))
 
-  private def handleResourcesList(id: RequestId): ZIO[Any, Nothing, Response] =
-    val result = ResourcesListResult(resources = resources.map(_.definition))
-    ZIO.succeed(jsonRpcResponse(id, result.toJsonAST.toOption.get))
+  private def handleResourcesList(id: RequestId): ZIO[Any, Response, Response] =
+    jsonRpcResponse(id, ResourcesListResult(resources = resources.map(_.definition)))
 
-  private def handleResourceTemplatesList(id: RequestId): ZIO[Any, Nothing, Response] =
-    val result = ResourceTemplatesListResult(resourceTemplates = resourceTemplates.map(_.definition))
-    ZIO.succeed(jsonRpcResponse(id, result.toJsonAST.toOption.get))
+  private def handleResourceTemplatesList(id: RequestId): ZIO[Any, Response, Response] =
+    jsonRpcResponse(id, ResourceTemplatesListResult(resourceTemplates = resourceTemplates.map(_.definition)))
 
   private def handleResourceRead(id: RequestId, params: Option[Json.Obj]): ZIO[Any, Response, Response] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
@@ -325,11 +320,9 @@ final class McpServer[-R] private (
           case None =>
             ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.ResourceNotFound, s"Resource not found: $uri"))
           case Some(readFn) =>
-            readFn(uri).fold(
-              err => jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, err.message),
-              contents =>
-                val result = ResourceReadResult(contents = contents)
-                jsonRpcResponse(id, result.toJsonAST.toOption.get)
+            readFn(uri).foldZIO(
+              err => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, err.message)),
+              contents => jsonRpcResponse(id, ResourceReadResult(contents = contents)),
             )
 
   private def matchesTemplate(tmpl: McpResourceTemplateHandler, uri: String): Boolean =
@@ -337,9 +330,8 @@ final class McpServer[-R] private (
     val regex = pattern.replaceAll("\\{[^}]+}", "([^/]+)")
     uri.matches(regex)
 
-  private def handlePromptsList(id: RequestId): ZIO[Any, Nothing, Response] =
-    val result = PromptsListResult(prompts = prompts.map(_.definition))
-    ZIO.succeed(jsonRpcResponse(id, result.toJsonAST.toOption.get))
+  private def handlePromptsList(id: RequestId): ZIO[Any, Response, Response] =
+    jsonRpcResponse(id, PromptsListResult(prompts = prompts.map(_.definition)))
 
   private def handlePromptsGet(id: RequestId, params: Option[Json.Obj]): ZIO[Any, Response, Response] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
@@ -348,16 +340,15 @@ final class McpServer[-R] private (
       .flatMap: getParams =>
         promptsByName.get(getParams.name) match
           case None =>
-            ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Unknown prompt: ${getParams.name}"))
+            ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Unknown prompt: ${getParams.name.value}"))
           case Some(prompt) =>
-            prompt.get(getParams.arguments.getOrElse(Map.empty)).fold(
-              err => jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, err.message),
-              result => jsonRpcResponse(id, result.toJsonAST.toOption.get)
+            prompt.get(getParams.arguments.getOrElse(Map.empty)).foldZIO(
+              err => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, err.message)),
+              result => jsonRpcResponse(id, result),
             )
 
   private def handleCompletionComplete(id: RequestId, params: Option[Json.Obj]): ZIO[Any, Response, Response] =
-    val result = CompletionResult(completion = CompletionValues(values = Chunk.empty))
-    ZIO.succeed(jsonRpcResponse(id, result.toJsonAST.toOption.get))
+    jsonRpcResponse(id, CompletionResult(completion = CompletionValues(values = Chunk.empty)))
 
   private def withSession[R0](request: Request, sessions: Ref[Map[SessionId, SessionState]])(
     effect: ZIO[R0, Response, Response]
@@ -374,11 +365,11 @@ final class McpServer[-R] private (
             case Some(_) =>
               effect
 
-  private def getHandler(request: Request): ZIO[Any, Response, Response] =
+  private def getHandler(request: Request): ZIO[McpServer.State, Response, Response] =
     for
-      _        <- validateOrigin(request)
-      sessions <- McpServer.sessions
-      _        <- withSession(request, sessions)(ZIO.succeed(Response.ok))
+      _     <- validateOrigin(request)
+      state <- ZIO.service[McpServer.State]
+      _     <- withSession(request, state.sessions)(ZIO.succeed(Response.ok))
     yield
       Response(
         status = Status.Ok,
@@ -391,12 +382,12 @@ final class McpServer[-R] private (
         ),
       )
 
-  private def deleteHandler(request: Request): ZIO[Any, Response, Response] =
+  private def deleteHandler(request: Request): ZIO[McpServer.State, Response, Response] =
     for
-      _        <- validateOrigin(request)
-      sessions <- McpServer.sessions
-      _        <- request.rawHeader("mcp-session-id").map(SessionId(_)) match
-        case Some(sid) => sessions.update(_ - sid)
+      _     <- validateOrigin(request)
+      state <- ZIO.service[McpServer.State]
+      _     <- request.rawHeader("mcp-session-id").map(SessionId(_)) match
+        case Some(sid) => state.sessions.update(_ - sid)
         case None      => ZIO.unit
     yield Response.ok
 
@@ -411,8 +402,11 @@ final class McpServer[-R] private (
       sseEvent(msg.toJson)
 
     val resultStream = ZStream.fromZIO(resultPromise.await).map: result =>
-      val r = JsonRpcResponse(id, result.toJsonAST.toOption.get)
-      sseEvent(r.toJson)
+      val json = result.toJsonAST.getOrElse(
+        CallToolResult(content = Chunk(ToolContent.text("Internal error: failed to encode result")), isError = Some(true))
+          .toJsonAST.getOrElse(Json.Obj())
+      )
+      sseEvent(JsonRpcResponse(id, json).toJson)
 
     val keepalive = ZStream.tick(30.seconds).as(": keepalive\n\n")
 
@@ -432,9 +426,10 @@ final class McpServer[-R] private (
 
   // --- Response helpers ---
 
-  private def jsonRpcResponse(id: RequestId, result: Json): Response =
-    val r = JsonRpcResponse(id, result)
-    Response.json(r.toJson)
+  private def jsonRpcResponse[A: JsonEncoder](id: RequestId, result: A): ZIO[Any, Response, Response] =
+    ZIO.fromEither(result.toJsonAST)
+      .mapError(e => jsonRpcErrorResponse(None, ErrorCode.InternalError, s"JSON encoding failed: $e"))
+      .map(json => Response.json(JsonRpcResponse(id, json).toJson))
 
   private def jsonRpcErrorResponse(id: Option[RequestId], code: ErrorCode, message: String): Response =
     val e = JsonRpcError.fromCode(id, code, message)
@@ -449,26 +444,21 @@ object McpServer:
   def apply(name: String, version: String): McpServer[Any] =
     new McpServer(Implementation(name, version), Chunk.empty, Chunk.empty, Chunk.empty, Chunk.empty)
 
+  trait State:
+    def sessions: Ref[Map[SessionId, SessionState]]
+    def pendingRequests: Ref[Map[RequestId, Promise[Nothing, Json]]]
+
+  object State:
+    val default: ULayer[State] = ZLayer.fromZIO:
+      for
+        s <- Ref.make(Map.empty[SessionId, SessionState])
+        p <- Ref.make(Map.empty[RequestId, Promise[Nothing, Json]])
+      yield new State:
+        val sessions = s
+        val pendingRequests = p
+
   private val localhostPatterns = Set("localhost", "127.0.0.1", "[::1]", "::1")
 
   private[mcp] def isLocalhostHost(hostWithPort: String): Boolean =
     val host = hostWithPort.split(':').head
     localhostPatterns.contains(host)
-
-  private val sessionsRef: UIO[Ref[Map[SessionId, SessionState]]] =
-    Ref.make(Map.empty[SessionId, SessionState])
-
-  private lazy val sessionsMemo: Ref[Map[SessionId, SessionState]] =
-    Unsafe.unsafe(implicit u => Runtime.default.unsafe.run(sessionsRef).getOrThrow())
-
-  private[mcp] def sessions: UIO[Ref[Map[SessionId, SessionState]]] =
-    ZIO.succeed(sessionsMemo)
-
-  private val pendingRequestsRef: UIO[Ref[Map[RequestId, Promise[Nothing, Json]]]] =
-    Ref.make(Map.empty[RequestId, Promise[Nothing, Json]])
-
-  private lazy val pendingRequestsMemo: Ref[Map[RequestId, Promise[Nothing, Json]]] =
-    Unsafe.unsafe(implicit u => Runtime.default.unsafe.run(pendingRequestsRef).getOrThrow())
-
-  private[mcp] def pendingRequests: UIO[Ref[Map[RequestId, Promise[Nothing, Json]]]] =
-    ZIO.succeed(pendingRequestsMemo)

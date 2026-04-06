@@ -12,7 +12,7 @@ enum LogLevel:
 object LogLevel:
   given CanEqual[LogLevel, LogLevel] = CanEqual.derived
 
-  given JsonEncoder[LogLevel] = JsonEncoder.string.contramap:
+  extension (l: LogLevel) def asString: String = l match
     case LogLevel.Debug     => "debug"
     case LogLevel.Info      => "info"
     case LogLevel.Warning   => "warning"
@@ -20,6 +20,18 @@ object LogLevel:
     case LogLevel.Critical  => "critical"
     case LogLevel.Alert     => "alert"
     case LogLevel.Emergency => "emergency"
+
+  given JsonEncoder[LogLevel] = JsonEncoder.string.contramap(_.asString)
+
+  given JsonDecoder[LogLevel] = JsonDecoder.string.mapOrFail:
+    case "debug"     => Right(LogLevel.Debug)
+    case "info"      => Right(LogLevel.Info)
+    case "warning"   => Right(LogLevel.Warning)
+    case "error"     => Right(LogLevel.Error)
+    case "critical"  => Right(LogLevel.Critical)
+    case "alert"     => Right(LogLevel.Alert)
+    case "emergency" => Right(LogLevel.Emergency)
+    case other       => Left(s"Unknown log level: $other")
 
 // --- Sampling result ---
 
@@ -62,7 +74,7 @@ object McpToolContext:
     new McpToolContext:
       def log(level: LogLevel, message: String): UIO[Unit] =
         val params = Json.Obj(Chunk(
-          "level" -> Json.Str(level.toJson.fromJson[String].toOption.get),
+          "level" -> Json.Str(level.asString),
           "data" -> Json.Str(message),
         ))
         outQueue.offer(JsonRpcMessage.Notification("notifications/message", Some(params))).unit

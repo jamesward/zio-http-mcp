@@ -285,7 +285,7 @@ object ConformanceSpec extends ZIOSpecDefault:
     .get: _ =>
       ZIO.succeed(PromptGetResult(
         messages = Chunk(PromptMessage(
-          role = "user",
+          role = Role.User,
           content = ToolContent.text("This is a simple prompt for testing."),
         )),
       ))
@@ -299,7 +299,7 @@ object ConformanceSpec extends ZIOSpecDefault:
       val arg2 = args.getOrElse("arg2", "")
       ZIO.succeed(PromptGetResult(
         messages = Chunk(PromptMessage(
-          role = "user",
+          role = Role.User,
           content = ToolContent.text(s"Arguments received: arg1=$arg1, arg2=$arg2"),
         )),
       ))
@@ -312,7 +312,7 @@ object ConformanceSpec extends ZIOSpecDefault:
       ZIO.succeed(PromptGetResult(
         messages = Chunk(
           PromptMessage(
-            role = "user",
+            role = Role.User,
             content = ToolContent.embeddedResource(ResourceContents(
               uri = resourceUri,
               mimeType = Some("text/plain"),
@@ -320,7 +320,7 @@ object ConformanceSpec extends ZIOSpecDefault:
             )),
           ),
           PromptMessage(
-            role = "user",
+            role = Role.User,
             content = ToolContent.text("Please process the embedded resource above."),
           ),
         ),
@@ -332,11 +332,11 @@ object ConformanceSpec extends ZIOSpecDefault:
       ZIO.succeed(PromptGetResult(
         messages = Chunk(
           PromptMessage(
-            role = "user",
+            role = Role.User,
             content = ToolContent.image(minimalPng, "image/png"),
           ),
           PromptMessage(
-            role = "user",
+            role = Role.User,
             content = ToolContent.text("Please analyze the image above."),
           ),
         ),
@@ -433,7 +433,7 @@ object ConformanceSpec extends ZIOSpecDefault:
         yield assertTrue(
           output.contains("Baseline check passed") || exitCode == 0L,
         )
-    ).provide(Server.defaultWith(_.onAnyOpenPort)) @@
+    ).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@
       withLiveClock @@
       timeout(2.minutes) @@
       sequential

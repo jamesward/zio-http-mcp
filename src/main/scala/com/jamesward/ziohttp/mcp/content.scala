@@ -61,8 +61,22 @@ object ToolContent:
 
   given CanEqual[ToolContent, ToolContent] = CanEqual.derived
 
+  private def roleAsJson(r: Role): Json = r match
+    case Role.User      => Json.Str("user")
+    case Role.Assistant => Json.Str("assistant")
+
   private def annFields(ann: Option[ContentAnnotations]): Chunk[(String, Json)] =
-    ann.fold(Chunk.empty)(a => Chunk("annotations" -> a.toJsonAST.toOption.get))
+    ann.fold(Chunk.empty): a =>
+      val audFields = a.audience.fold(Chunk.empty[(String, Json)])(aud => Chunk("audience" -> Json.Arr(aud.map(roleAsJson))))
+      val priFields = a.priority.fold(Chunk.empty[(String, Json)])(p => Chunk("priority" -> Json.Num(p)))
+      Chunk("annotations" -> Json.Obj(audFields ++ priFields))
+
+  private def resourceContentsAsJson(r: ResourceContents): Json.Obj =
+    val base = Chunk("uri" -> Json.Str(r.uri))
+    val mime = r.mimeType.fold(Chunk.empty[(String, Json)])(m => Chunk("mimeType" -> Json.Str(m)))
+    val text = r.text.fold(Chunk.empty[(String, Json)])(t => Chunk("text" -> Json.Str(t)))
+    val blob = r.blob.fold(Chunk.empty[(String, Json)])(b => Chunk("blob" -> Json.Str(b)))
+    Json.Obj(base ++ mime ++ text ++ blob)
 
   given JsonEncoder[ToolContent] = JsonEncoder[Json.Obj].contramap:
     case ToolContent.Text(text, ann) =>
@@ -85,7 +99,7 @@ object ToolContent:
     case ToolContent.EmbeddedResource(resource, ann) =>
       Json.Obj(Chunk(
         "type" -> Json.Str("resource"),
-        "resource" -> resource.toJsonAST.toOption.get,
+        "resource" -> resourceContentsAsJson(resource),
       ) ++ annFields(ann))
 
   given JsonDecoder[ToolContent] = JsonDecoder[Json.Obj].mapOrFail: obj =>

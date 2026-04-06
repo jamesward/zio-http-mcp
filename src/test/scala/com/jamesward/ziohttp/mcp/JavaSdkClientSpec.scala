@@ -86,7 +86,7 @@ object JavaSdkClientSpec extends ZIOSpecDefault:
             text == """{"result":8}""",
           )
       ,
-    ).provide(Server.defaultWith(_.onAnyOpenPort)) @@
+    ).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@
       withLiveClock @@
       timeout(1.minute) @@
       sequential

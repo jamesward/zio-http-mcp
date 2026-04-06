@@ -29,7 +29,7 @@ object ToolAnnotations:
 // --- Tool Definition (wire format for tools/list) ---
 
 case class ToolDefinition(
-  name: String,
+  name: ToolName,
   description: Option[String] = None,
   inputSchema: Json.Obj,
   outputSchema: Option[Json.Obj] = None,
@@ -97,7 +97,7 @@ object ToolsListResult:
 // --- Tools Call ---
 
 case class ToolCallParams(
-  name: String,
+  name: ToolName,
   arguments: Option[Json.Obj] = None,
 )
 
@@ -188,7 +188,7 @@ object PromptArgument:
   given JsonCodec[PromptArgument] = DeriveJsonCodec.gen[PromptArgument]
 
 case class PromptDefinition(
-  name: String,
+  name: PromptName,
   description: Option[String] = None,
   arguments: Option[Chunk[PromptArgument]] = None,
 )
@@ -207,7 +207,7 @@ object PromptsListResult:
   given JsonCodec[PromptsListResult] = DeriveJsonCodec.gen[PromptsListResult]
 
 case class PromptGetParams(
-  name: String,
+  name: PromptName,
   arguments: Option[Map[String, String]] = None,
 )
 
@@ -216,7 +216,7 @@ object PromptGetParams:
   given JsonCodec[PromptGetParams] = DeriveJsonCodec.gen[PromptGetParams]
 
 case class PromptMessage(
-  role: String,
+  role: Role,
   content: ToolContent,
 )
 
@@ -253,7 +253,7 @@ object CompletionCompleteParams:
   given JsonCodec[CompletionCompleteParams] = DeriveJsonCodec.gen[CompletionCompleteParams]
 
 case class CompletionRef(
-  `type`: String,
+  `type`: CompletionRefType,
   name: Option[String] = None,
   uri: Option[String] = None,
 )

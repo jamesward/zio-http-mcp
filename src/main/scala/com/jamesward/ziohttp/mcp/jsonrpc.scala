@@ -33,7 +33,7 @@ object JsonRpcMessage:
     case JsonRpcMessage.Request(id, method, params) =>
       val fields = Chunk(
         "jsonrpc" -> Json.Str(McpProtocol.JsonRpcVersion),
-        "id"      -> id.toJsonAST.toOption.get,
+        "id"      -> id.asJson,
         "method"  -> Json.Str(method),
       ) ++ params.map(p => "params" -> (p: Json)).fold(Chunk.empty[(String, Json)])(v => Chunk(v))
       Json.Obj(fields)
@@ -54,7 +54,7 @@ object JsonRpcResponse:
   given JsonEncoder[JsonRpcResponse] = JsonEncoder[Json.Obj].contramap: r =>
     Json.Obj(Chunk(
       "jsonrpc" -> Json.Str(McpProtocol.JsonRpcVersion),
-      "id"      -> r.id.toJsonAST.toOption.get,
+      "id"      -> r.id.asJson,
       "result"  -> r.result,
     ))
 
@@ -75,11 +75,13 @@ object JsonRpcError:
     JsonRpcError(id, ErrorDetail(code.code, message))
 
   given JsonEncoder[JsonRpcError] = JsonEncoder[Json.Obj].contramap: e =>
-    val idJson: Json = e.id match
-      case Some(reqId) => reqId.toJsonAST.toOption.get
-      case None        => Json.Null
+    val idJson: Json = e.id.fold(Json.Null)(_.asJson)
+    val errorJson = Json.Obj(Chunk(
+      "code"    -> Json.Num(e.error.code),
+      "message" -> Json.Str(e.error.message),
+    ) ++ e.error.data.fold(Chunk.empty[(String, Json)])(d => Chunk("data" -> d)))
     Json.Obj(Chunk(
       "jsonrpc" -> Json.Str(McpProtocol.JsonRpcVersion),
       "id"      -> idJson,
-      "error"   -> e.error.toJsonAST.toOption.get,
+      "error"   -> errorJson,
     ))

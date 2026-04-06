@@ -11,7 +11,7 @@ trait McpPromptHandler:
 // --- Prompt Builder ---
 
 final class McpPrompt private (
-  val promptName: String,
+  val promptName: PromptName,
   val promptDescription: Option[String],
   val promptArguments: Chunk[PromptArgument],
 ):
@@ -34,4 +34,4 @@ final class McpPrompt private (
 
 object McpPrompt:
   def apply(name: String): McpPrompt =
-    new McpPrompt(name, None, Chunk.empty)
+    new McpPrompt(PromptName(name), None, Chunk.empty)

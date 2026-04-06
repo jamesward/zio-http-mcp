@@ -31,9 +31,11 @@ enum RequestId:
 object RequestId:
   given CanEqual[RequestId, RequestId] = CanEqual.derived
 
-  given JsonEncoder[RequestId] = JsonEncoder[Json].contramap:
+  extension (id: RequestId) def asJson: Json = id match
     case RequestId.Str(s) => Json.Str(s)
     case RequestId.Num(n) => Json.Num(n)
+
+  given JsonEncoder[RequestId] = JsonEncoder[Json].contramap(_.asJson)
 
   given JsonDecoder[RequestId] = JsonDecoder[Json].mapOrFail:
     case Json.Str(s) => Right(RequestId.Str(s))
@@ -93,6 +95,71 @@ enum OptBool:
 
 object OptBool:
   given CanEqual[OptBool, OptBool] = CanEqual.derived
+
+// --- PromptName ---
+
+opaque type PromptName = String
+object PromptName:
+  def apply(s: String): PromptName = s
+  extension (n: PromptName) def value: String = n
+  given CanEqual[PromptName, PromptName] = CanEqual.derived
+  given JsonEncoder[PromptName] = JsonEncoder.string
+  given JsonDecoder[PromptName] = JsonDecoder.string
+
+// --- CompletionRefType ---
+
+enum CompletionRefType:
+  case Prompt, Resource
+
+object CompletionRefType:
+  given CanEqual[CompletionRefType, CompletionRefType] = CanEqual.derived
+
+  given JsonEncoder[CompletionRefType] = JsonEncoder.string.contramap:
+    case CompletionRefType.Prompt   => "ref/prompt"
+    case CompletionRefType.Resource => "ref/resource"
+
+  given JsonDecoder[CompletionRefType] = JsonDecoder.string.mapOrFail:
+    case "ref/prompt"   => Right(CompletionRefType.Prompt)
+    case "ref/resource" => Right(CompletionRefType.Resource)
+    case other          => Left(s"Unknown completion ref type: $other")
+
+// --- McpDispatchMethod (request methods handled by shared dispatch) ---
+
+enum McpDispatchMethod:
+  case Ping, ToolsList, ToolsCall, ResourcesList, ResourceTemplatesList,
+       ResourcesRead, ResourcesSubscribe, ResourcesUnsubscribe, PromptsList,
+       PromptsGet, LoggingSetLevel, CompletionComplete
+
+object McpDispatchMethod:
+  given CanEqual[McpDispatchMethod, McpDispatchMethod] = CanEqual.derived
+
+  def parse(method: String): Option[McpDispatchMethod] = method match
+    case "ping"                      => Some(Ping)
+    case "tools/list"                => Some(ToolsList)
+    case "tools/call"                => Some(ToolsCall)
+    case "resources/list"            => Some(ResourcesList)
+    case "resources/templates/list"  => Some(ResourceTemplatesList)
+    case "resources/read"            => Some(ResourcesRead)
+    case "resources/subscribe"       => Some(ResourcesSubscribe)
+    case "resources/unsubscribe"     => Some(ResourcesUnsubscribe)
+    case "prompts/list"              => Some(PromptsList)
+    case "prompts/get"               => Some(PromptsGet)
+    case "logging/setLevel"          => Some(LoggingSetLevel)
+    case "completion/complete"       => Some(CompletionComplete)
+    case _                           => None
+
+// --- McpNotificationMethod ---
+
+enum McpNotificationMethod:
+  case Initialized, Cancelled
+
+object McpNotificationMethod:
+  given CanEqual[McpNotificationMethod, McpNotificationMethod] = CanEqual.derived
+
+  def parse(method: String): Option[McpNotificationMethod] = method match
+    case "notifications/initialized" => Some(Initialized)
+    case "notifications/cancelled"   => Some(Cancelled)
+    case _                           => None
 
 // --- Protocol Constants ---
 

@@ -262,7 +262,7 @@ val mcpServer = McpServer("my-server", "1.0.0")
   .tool(deleteTool)
 
 // Stateful: session tracking, SSE streaming, sampling/elicitation
-val routes: Routes[WeatherService & DeleteService, Nothing] = mcpServer.routes
+val routes: Routes[WeatherService & DeleteService & McpServer.State, Nothing] = mcpServer.routes
 
 // Stateless: no sessions, plain JSON responses, no SSE
 val statelessRoutes: Routes[WeatherService & DeleteService, Nothing] = mcpServer.statelessRoutes

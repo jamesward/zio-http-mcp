@@ -140,7 +140,7 @@ final class McpTool private (
     val mcpError  = summon[McpError[E]]
 
     val toolDef = ToolDefinition(
-      name = toolName.value,
+      name = toolName,
       description = toolDescription,
       inputSchema = mcpInput.jsonSchema,
       outputSchema = mcpOutput.outputSchema,

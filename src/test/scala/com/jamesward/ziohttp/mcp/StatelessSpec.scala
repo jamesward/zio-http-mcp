@@ -37,7 +37,7 @@ object StatelessSpec extends ZIOSpecDefault:
     .get: args =>
       ZIO.succeed(PromptGetResult(
         messages = Chunk(PromptMessage(
-          role = "user",
+          role = Role.User,
           content = ToolContent.text(s"Hello, ${args.getOrElse("name", "world")}!"),
         )),
       ))
