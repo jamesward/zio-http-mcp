@@ -55,6 +55,7 @@ final class McpServer[-R] private (
     Routes(
       Method.POST / "mcp" -> handler(postHandler),
       Method.GET / "mcp"  -> handler(getHandler),
+      Method.GET / "mcp" / trailing -> Handler.notFound,
       Method.DELETE / "mcp" -> handler(deleteHandler),
     ).sandbox
 
@@ -62,6 +63,7 @@ final class McpServer[-R] private (
     Routes(
       Method.POST / "mcp" -> handler(statelessPostHandler),
       Method.GET / "mcp"  -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
+      Method.GET / "mcp" / trailing -> Handler.notFound,
       Method.DELETE / "mcp" -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
     ).sandbox
 
