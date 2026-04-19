@@ -239,11 +239,11 @@ object StatelessSpec extends ZIOSpecDefault:
           )
       ,
 
-      test("notifications return 200 OK"):
+      test("notifications return 202 Accepted"):
         for
           port     <- Server.install(testServer.statelessRoutes)
           response <- post(port, jsonRpcNotification("notifications/initialized"))
-        yield assertTrue(response.status == Status.Ok)
+        yield assertTrue(response.status == Status.Accepted)
       ,
 
       test("unknown method returns error"):
