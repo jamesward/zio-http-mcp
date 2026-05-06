@@ -14,7 +14,7 @@ val zioVersion = "2.1.25"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                 % zioVersion,
-  "dev.zio" %% "zio-http"            % "3.11.0",
+  "dev.zio" %% "zio-http"            % "3.11.1",
   "dev.zio" %% "zio-schema-derivation" % "1.8.3",
   "dev.zio" %% "zio-schema-json"       % "1.8.3",
 
