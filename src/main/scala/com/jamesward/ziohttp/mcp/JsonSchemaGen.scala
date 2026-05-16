@@ -71,7 +71,7 @@ object JsonSchemaGen:
       field.name -> (fieldSchema: Json)
 
     val required = record.fields.collect:
-      case field if !field.schema.isInstanceOf[Schema.Optional[?]] =>
+      case field if !isOptional(field.schema) =>
         Json.Str(field.name)
 
     val fields = Chunk(
@@ -80,6 +80,12 @@ object JsonSchemaGen:
     ) ++ (if required.nonEmpty then Chunk("required" -> Json.Arr(required)) else Chunk.empty)
 
     Json.Obj(fields)
+
+  private def isOptional(schema: Schema[?]): Boolean = schema match
+    case _: Schema.Optional[?]               => true
+    case Schema.Lazy(s)                      => isOptional(s())
+    case Schema.Transform(schema = inner)    => isOptional(inner)
+    case _                                   => false
 
   private def enumSchema(enum0: Schema.Enum[?]): Json.Obj =
     val cases = enum0.cases

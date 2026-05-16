@@ -180,6 +180,37 @@ object McpToolSpec extends ZIOSpecDefault:
           result.content.size == 2,
         )
       ,
+      suite("optional fields")(
+        test("optional fields are not required in schema"):
+          case class InputWithOptional(name: String, age: Option[Int])
+              derives Schema
+          val tool = McpTool("optional_test")
+            .description("Test optional fields in schema")
+            .handle: (input: InputWithOptional) =>
+              ZIO.succeed(s"${input.name}: ${input.age.getOrElse(0)}")
+          val schema = tool.definition.inputSchema
+          val required =
+            schema.get("required").flatMap(_.asArray).getOrElse(Chunk.empty)
+          assertTrue(
+            required.contains(Json.Str("name")),
+            !required.contains(Json.Str("age"))
+          )
+        ,
+        test("tool with optional fields can be called without optional value"):
+          case class InputWithOptional(name: String, age: Option[Int])
+              derives Schema
+          val tool = McpTool("optional_call")
+            .description("Test optional call")
+            .handle: (input: InputWithOptional) =>
+              ZIO.succeed(s"${input.name}: ${input.age.getOrElse(0)}")
+          for result <- tool.call(
+              Some(Json.Obj(Chunk("name" -> Json.Str("Alice"))))
+            )
+          yield assertTrue(
+            resultText(result) == "Alice: 0"
+          )
+      ),
+
       test("returns structured output with schema"):
         val tool = McpTool("result")
           .description("Returns structured result")
