@@ -50,13 +50,19 @@ private[mcp] object AuthMiddleware:
    *
    * Audience is checked against the resolved-per-request resource URI (see
    * [[ResourceUriResolver]]).
+   *
+   * @param resourcePath path component used when [[McpAuth.resourceUri]] is `None` and
+   *                     the resource URI is derived from request headers. Owned by
+   *                     `McpServer` so the route mount path and the advertised
+   *                     resource URI cannot drift.
    */
   def authenticate[R](
     auth: McpAuth[R],
+    resourcePath: String,
     request: Request,
     additionalRequiredScopes: Set[OauthScope],
   ): ZIO[R, AuthError, Principal] =
-    val resourceUri = ResourceUriResolver.resolve(auth.resourceUri, auth.resourcePath, request)
+    val resourceUri = ResourceUriResolver.resolve(auth.resourceUri, resourcePath, request)
     val required    = auth.requiredScopes ++ additionalRequiredScopes
     for
       raw       <- ZIO.fromEither(extractBearerToken(request))
@@ -135,11 +141,12 @@ private[mcp] object AuthMiddleware:
   /** Build the HTTP response for an authorization failure. */
   def errorResponse(
     auth: McpAuth[?],
+    resourcePath: String,
     request: Request,
     error: AuthError,
     requiredScopes: Set[OauthScope],
   ): Response =
-    val resourceUri = ResourceUriResolver.resolve(auth.resourceUri, auth.resourcePath, request)
+    val resourceUri = ResourceUriResolver.resolve(auth.resourceUri, resourcePath, request)
     val status      = statusFor(error)
     val code        = errorCodeFor(error)
     val body =

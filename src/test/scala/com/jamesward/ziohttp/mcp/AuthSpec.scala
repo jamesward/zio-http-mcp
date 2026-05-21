@@ -85,19 +85,19 @@ object AuthSpec extends ZIOSpecDefault:
       .addHeader(Header.ContentType(MediaType.application.json))
     val withToken = token.fold(base)(t => base.addHeader("authorization", s"Bearer $t"))
     val withSession = sessionId.fold(withToken)(s => withToken.addHeader("mcp-session-id", s))
-    ZClient.request(withSession)
+    ZClient.batched(withSession)
 
   private def get(port: Int, path: String = "/mcp", token: Option[String] = None): ZIO[Client & Scope, Throwable, Response] =
     val url = URL.decode(s"http://localhost:$port$path").toOption.get
     val base = Request.get(url)
     val withToken = token.fold(base)(t => base.addHeader("authorization", s"Bearer $t"))
-    ZClient.request(withToken)
+    ZClient.batched(withToken)
 
   private def del(port: Int, token: Option[String] = None): ZIO[Client & Scope, Throwable, Response] =
     val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
     val base = Request.delete(url)
     val withToken = token.fold(base)(t => base.addHeader("authorization", s"Bearer $t"))
-    ZClient.request(withToken)
+    ZClient.batched(withToken)
 
   private def initRequest =
     """{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"""
@@ -193,7 +193,7 @@ object AuthSpec extends ZIOSpecDefault:
           port <- installStateful(McpServer("derive-test", "0.1.0").tool(whoamiTool).auth(derivedAuth))
           resp <- {
             val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
-            ZClient.request(
+            ZClient.batched(
               Request.post(url, Body.fromString(initRequest))
                 .addHeader(Header.ContentType(MediaType.application.json))
                 .addHeader("x-forwarded-proto", "https")
@@ -215,7 +215,7 @@ object AuthSpec extends ZIOSpecDefault:
           port <- installStateful(McpServer("derive-test", "0.1.0").tool(whoamiTool).auth(derivedAuth))
           resp <- {
             val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
-            ZClient.request(
+            ZClient.batched(
               Request.post(url, Body.fromString(initRequest))
                 .addHeader(Header.ContentType(MediaType.application.json))
                 .addHeader("forwarded", """proto=https;host="mcp.via-forwarded.example.com"""")
@@ -263,7 +263,7 @@ object AuthSpec extends ZIOSpecDefault:
             val req = Request.post(url, Body.fromString(initRequest))
               .addHeader(Header.ContentType(MediaType.application.json))
               .addHeader("authorization", "Basic dXNlcjpwYXNz")
-            ZClient.request(req)
+            ZClient.batched(req)
           }
         yield
           val www = resp.rawHeader("www-authenticate").getOrElse("")
@@ -392,7 +392,7 @@ object AuthSpec extends ZIOSpecDefault:
           port <- installStateful(serverWithAuth(authConfig(stubVerifier(testScope))))
           resp <- {
             val url = URL.decode(s"http://localhost:$port/mcp?access_token=valid-token").toOption.get
-            ZClient.request(
+            ZClient.batched(
               Request.post(url, Body.fromString(initRequest))
                 .addHeader(Header.ContentType(MediaType.application.json))
             )
@@ -413,4 +413,4 @@ object AuthSpec extends ZIOSpecDefault:
             !isError.contains(true),
           )
       ,
-    ).provideSome[Scope](Server.defaultWithPort(0), Client.default) @@ sequential @@ withLiveClock @@ timeout(30.seconds)
+    ).provide(Server.defaultWithPort(0), Client.default, Scope.default) @@ sequential @@ withLiveClock @@ timeout(30.seconds)

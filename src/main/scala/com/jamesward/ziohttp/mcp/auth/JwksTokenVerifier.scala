@@ -1,297 +1,168 @@
 package com.jamesward.ziohttp.mcp.auth
 
-import com.nimbusds.jose.{JOSEException, JWSAlgorithm}
-import com.nimbusds.jose.crypto.RSASSAVerifier
-import com.nimbusds.jose.jwk.{JWK, JWKSet, RSAKey}
-import com.nimbusds.jwt.{JWTClaimsSet, SignedJWT}
+import com.guizmaii.scalajwt.core.{InvalidToken, JwtToken, SupportedJWSAlgorithm}
+import com.guizmaii.scalajwt.zio.{JwksConfig, ZioJwtValidator}
+import com.nimbusds.jose.proc.SecurityContext
+import com.nimbusds.jwt.proc.{DefaultJWTClaimsVerifier, JWTClaimsSetVerifier}
+import com.nimbusds.jwt.JWTClaimsSet
 import zio.*
 import zio.http.*
 import zio.json.*
 import zio.json.ast.Json
+import zio.telemetry.opentelemetry.OpenTelemetry
 
-import java.security.PublicKey
-import java.text.ParseException
-import java.time.Instant
 import scala.jdk.CollectionConverters.*
 
 /**
- * Validates a JWT bearer token by:
+ * JWT bearer-token verifier built on top of [[com.guizmaii.scalajwt.zio.ZioJwtValidator]].
  *
- *   1. Parsing the JWT and extracting the (untrusted) `kid` from the header.
- *   2. Looking up the matching public key from a JWKS document fetched from the AS.
- *   3. Verifying the RSA signature with `nimbus-jose-jwt`.
- *   4. Validating `iss`, `exp`, `nbf` claims.
- *   5. Building a [[Principal]] from the claims.
+ * The library handles:
+ *   - Initial JWKS fetch (fail-fast at startup, with retries)
+ *   - Background refresh (default every 4 minutes)
+ *   - Lock-free, non-blocking JWT validation against the cached JWKS
+ *   - `iss`, `exp`, `nbf` claim validation via a `DefaultJWTClaimsVerifier`
  *
- * Audience validation is the responsibility of the auth middleware (so the resource URI can
- * be derived per-request rather than baked into the verifier at construction time).
+ * Audience binding (`aud`) is intentionally NOT validated here so that
+ * [[McpAuth.resourceUri]] can be derived per-request — the auth middleware does that check.
  *
- * The AS metadata document and JWKS are cached with a configurable TTL.
- *
- * RSA only in v1 (RS256/RS384/RS512). EC and EdDSA support is future work.
+ * RSA-only in v1 (RS256). EC and EdDSA support is future work.
  */
 final class JwksTokenVerifier private (
   expectedIssuer: String,
-  jwksProvider: JwksProvider,
-  clockSkew: Duration,
+  validator: ZioJwtValidator,
 ) extends TokenVerifier[Any]:
 
   def verify(rawToken: String): ZIO[Any, AuthError, Principal] =
-    for
-      signed    <- parseSigned(rawToken)
-      kid       <- ZIO.fromOption(Option(signed.getHeader.getKeyID))
-                     .orElseFail(AuthError.Invalid("JWT header missing 'kid'"))
-      _         <- requireRsa(signed.getHeader.getAlgorithm)
-      key       <- jwksProvider.lookup(kid)
-                     .orElse(jwksProvider.refreshAndLookup(kid))
-                     .orElseFail(AuthError.Invalid(s"No JWKS key found for kid '$kid'"))
-      _         <- verifySignature(signed, key)
-      claims    <- ZIO.fromTry(scala.util.Try(signed.getJWTClaimsSet))
-                     .mapError(t => AuthError.Invalid(s"Failed to read JWT claims: ${t.getMessage}"))
-      _         <- validateTiming(claims)
-      principal <- buildPrincipal(rawToken, claims)
-    yield principal
+    validator
+      .validate(JwtToken(rawToken))
+      .mapError(translateError)
+      .flatMap(claims => buildPrincipal(rawToken, claims))
 
-  private def parseSigned(rawToken: String): IO[AuthError, SignedJWT] =
-    ZIO.attempt(SignedJWT.parse(rawToken)).mapError {
-      case _: ParseException => AuthError.Invalid("Malformed JWT")
-      case t                 => AuthError.Invalid(s"Failed to parse JWT: ${t.getMessage}")
-    }
-
-  private def requireRsa(alg: JWSAlgorithm): IO[AuthError, Unit] =
-    val supported = Set(JWSAlgorithm.RS256, JWSAlgorithm.RS384, JWSAlgorithm.RS512)
-    ZIO.unless(supported.contains(alg))(
-      ZIO.fail(AuthError.Invalid(s"Unsupported JWT algorithm: $alg (only RS256/RS384/RS512 are supported in v1)"))
-    ).unit
-
-  private def verifySignature(signed: SignedJWT, key: PublicKey): IO[AuthError, Unit] =
-    key match
-      case rsa: java.security.interfaces.RSAPublicKey =>
-        val verifier = new RSASSAVerifier(rsa)
-        ZIO.attempt(signed.verify(verifier))
-          .mapError(t => AuthError.Invalid(s"Signature verification error: ${t.getMessage}"))
-          .flatMap(ok => ZIO.fail(AuthError.Invalid("Signature does not match")).when(!ok).unit)
-      case _ =>
-        ZIO.fail(AuthError.Invalid("Public key is not an RSA key"))
-
-  private def validateTiming(claims: JWTClaimsSet): IO[AuthError, Unit] =
-    val now = java.time.Instant.now()
-    val skewMs = clockSkew.toMillis
-    val exp = Option(claims.getExpirationTime).map(_.toInstant)
-    val nbf = Option(claims.getNotBeforeTime).map(_.toInstant)
-
-    val expired  = exp.exists(e => now.toEpochMilli > e.toEpochMilli + skewMs)
-    val notYet   = nbf.exists(n => now.toEpochMilli < n.toEpochMilli - skewMs)
-    if expired then ZIO.fail(AuthError.Expired)
-    else if notYet then ZIO.fail(AuthError.Invalid("Token not yet valid (nbf claim in future)"))
-    else ZIO.unit
+  /** Translate the underlying lib's [[InvalidToken]] into our [[AuthError]] taxonomy. */
+  private def translateError(err: InvalidToken): AuthError =
+    val msg = Option(err.message).getOrElse("Invalid token")
+    val lower = msg.toLowerCase
+    if lower.contains("expired") then AuthError.Expired
+    else if lower.contains("iss") && (lower.contains("claim") || lower.contains("issuer")) then
+      AuthError.IssuerMismatch(expectedIssuer, None)
+    else AuthError.Invalid(msg)
 
   private def buildPrincipal(rawToken: String, claims: JWTClaimsSet): IO[AuthError, Principal] =
     val issuer   = Option(claims.getIssuer)
     val audience = Option(claims.getAudience).map(_.asScala.toSet).getOrElse(Set.empty)
+    val claimsJson = jwtClaimsAsJsonObj(claims)
+    val scopeStr = claimsJson.get("scope") match
+      case Some(Json.Str(s))  => s
+      case Some(Json.Arr(xs)) => xs.collect { case Json.Str(s) => s }.mkString(" ")
+      case _                  => ""
+    val scopes   = scopeStr.split("\\s+").filter(_.nonEmpty).map(OauthScope(_)).toSet
+    val clientId = claimsJson.get("client_id").flatMap(_.asString)
+      .orElse(claimsJson.get("azp").flatMap(_.asString))
+    val subject  = Option(claims.getSubject)
+    val exp      = Option(claims.getExpirationTime).map(_.toInstant)
+    ZIO.succeed(Principal(
+      subject = subject,
+      clientId = clientId,
+      scopes = scopes,
+      audience = audience,
+      issuer = issuer,
+      expiresAt = exp,
+      raw = rawToken,
+      claims = claimsJson,
+    ))
 
-    if !issuer.contains(expectedIssuer) then
-      ZIO.fail(AuthError.IssuerMismatch(expectedIssuer, issuer))
-    else
-      val claimsJson = jwtClaimsAsJsonObj(claims)
-      val scopeStr   = claimsJson.get("scope") match
-        case Some(Json.Str(s))  => s
-        case Some(Json.Arr(xs)) => xs.collect { case Json.Str(s) => s }.mkString(" ")
-        case _                  => ""
-      val scopes   = scopeStr.split("\\s+").filter(_.nonEmpty).map(OauthScope(_)).toSet
-      val clientId = claimsJson.get("client_id").flatMap(_.asString)
-        .orElse(claimsJson.get("azp").flatMap(_.asString))
-      val subject  = Option(claims.getSubject)
-      val exp      = Option(claims.getExpirationTime).map(_.toInstant)
-      ZIO.succeed(Principal(
-        subject = subject,
-        clientId = clientId,
-        scopes = scopes,
-        audience = audience,
-        issuer = issuer,
-        expiresAt = exp,
-        raw = rawToken,
-        claims = claimsJson,
-      ))
-
-  /** Convert nimbus's JWTClaimsSet to a `zio-json` `Json.Obj` for `Principal.claims`. */
+  /** Convert nimbus's JWTClaimsSet to a `zio-json` `Json.Obj` for [[Principal.claims]]. */
   private def jwtClaimsAsJsonObj(claims: JWTClaimsSet): Json.Obj =
-    val raw = claims.toString  // nimbus serializes to JSON
-    raw.fromJson[Json.Obj].getOrElse(Json.Obj())
+    claims.toString.fromJson[Json.Obj].getOrElse(Json.Obj())
 
 object JwksTokenVerifier:
 
   /**
-   * Discover the JWKS URI from the issuer's RFC 8414 metadata (with OIDC fallback) and build
-   * a verifier. The JWKS document is fetched lazily on first verification and cached.
+   * Discover the JWKS URI from the issuer's RFC 8414 metadata (with OIDC fallback) and
+   * build a verifier. JWKS is fetched eagerly at startup (fail-fast) and refreshed every
+   * `refreshInterval` in a background fiber.
    *
-   * Audience binding (RFC 8707) is enforced by the auth middleware against
-   * [[McpAuth.resourceUri]] (or its per-request derivation), not here.
+   * The validator's lifetime is tied to the surrounding [[zio.Scope]] — when the scope
+   * closes, the background refresh fiber terminates. In a typical `ZIOAppDefault` app
+   * the scope lives for the lifetime of the app, which is what you want.
    */
   def discoverJwks(
     issuer: String,
-    cacheTtl: Duration = 1.hour,
-    clockSkew: Duration = 60.seconds,
-  ): ZIO[Client, Nothing, TokenVerifier[Any]] =
+    refreshInterval: Duration = 4.minutes,
+    fetchTimeout: Duration = 30.seconds,
+  ): ZIO[Client & Scope, Throwable, TokenVerifier[Any]] =
     for
-      client   <- ZIO.service[Client]
-      provider <- JwksProvider.discover(issuer, client, cacheTtl)
-    yield new JwksTokenVerifier(issuer, provider, clockSkew)
+      client  <- ZIO.service[Client]
+      jwksUri <- discoverJwksUri(issuer, client)
+      v       <- buildValidator(issuer, jwksUri, refreshInterval, fetchTimeout)
+    yield new JwksTokenVerifier(issuer, v)
 
-  /** Build a verifier that fetches its JWKS from a known URL (no metadata discovery). */
+  /** Build a verifier with a known JWKS URI (no metadata discovery). */
   def jwks(
     jwksUri: String,
     expectedIssuer: String,
-    cacheTtl: Duration = 1.hour,
-    clockSkew: Duration = 60.seconds,
-  ): ZIO[Client, Nothing, TokenVerifier[Any]] =
+    refreshInterval: Duration = 4.minutes,
+    fetchTimeout: Duration = 30.seconds,
+  ): ZIO[Client & Scope, Throwable, TokenVerifier[Any]] =
     for
-      client   <- ZIO.service[Client]
-      provider <- JwksProvider.fixed(jwksUri, client, cacheTtl)
-    yield new JwksTokenVerifier(expectedIssuer, provider, clockSkew)
+      url <- ZIO.fromEither(URL.decode(jwksUri))
+      v   <- buildValidator(expectedIssuer, url, refreshInterval, fetchTimeout)
+    yield new JwksTokenVerifier(expectedIssuer, v)
 
-  /** Test-visible re-export: parse a JWKS document into kid → PublicKey map. */
-  private[mcp] def parseJwks(body: String): Either[String, Map[String, PublicKey]] =
-    JwksProvider.parseJwks(body)
+  /**
+   * Build a [[ZioJwtValidator]] in the surrounding scope. We use a noop OpenTelemetry
+   * tracer because the library requires one but we don't expose telemetry through this
+   * layer (apps that want it can wire their own tracer at the layer level).
+   */
+  private def buildValidator(
+    expectedIssuer: String,
+    jwksUri: URL,
+    refreshInterval: Duration,
+    fetchTimeout: Duration,
+  ): ZIO[Client & Scope, Throwable, ZioJwtValidator] =
+    val claimsVerifier: JWTClaimsSetVerifier[SecurityContext] =
+      val exactMatch = new JWTClaimsSet.Builder().issuer(expectedIssuer).build()
+      // acceptedAudience = null means "accept any audience" (the audience check happens in
+      // the auth middleware against per-request resourceUri).
+      // requiredClaims includes "exp" so missing-exp tokens are rejected.
+      new DefaultJWTClaimsVerifier[SecurityContext](
+        null.asInstanceOf[java.util.Set[String]],
+        exactMatch,
+        java.util.Collections.singleton[String]("exp"),
+        java.util.Collections.emptySet[String](),
+      )
 
-// --- JWKS provider with caching ---
+    val configLayer = ZLayer.succeed(
+      JwksConfig(jwksUri = jwksUri, refreshInterval = refreshInterval, fetchTimeout = fetchTimeout)
+    )
+    val tracerLayer = (OpenTelemetry.noop() >>> OpenTelemetry.tracer("zio-http-mcp"))
+    val validatorLayer = ZioJwtValidator.configured(claimsVerifier, SupportedJWSAlgorithm.RS256)
 
-private[auth] trait JwksProvider:
-  /** Look up a key by kid from the cache. Fails with `Missing` if not present. */
-  def lookup(kid: String): IO[AuthError, PublicKey]
-  /** Force a refresh of the JWKS document and look up a key. */
-  def refreshAndLookup(kid: String): IO[AuthError, PublicKey]
+    val combined = (configLayer ++ tracerLayer ++ ZLayer.environment[Client]) >>> validatorLayer
+    combined.build.map(_.get[ZioJwtValidator])
 
-private[auth] object JwksProvider:
+  // --- AS metadata discovery (kept from the previous in-house impl) ---
 
-  /** Cached JWKS keyed by kid, with the time the keys were fetched. */
-  private case class Cache(keys: Map[String, PublicKey], fetchedAt: Instant):
-    def isFresh(now: Instant, ttl: Duration): Boolean =
-      java.time.Duration.between(fetchedAt, now).toMillis < ttl.toMillis
+  /**
+   * Fetch the AS metadata document at `<issuer>/.well-known/oauth-authorization-server`
+   * (with OIDC fallback) and extract the `jwks_uri`.
+   */
+  private def discoverJwksUri(issuer: String, client: Client): IO[Throwable, URL] =
+    val base = issuer.stripSuffix("/")
+    val oauthMeta = s"$base/.well-known/oauth-authorization-server"
+    val oidcMeta  = s"$base/.well-known/openid-configuration"
+    fetchJwksUri(oauthMeta, client).orElse(fetchJwksUri(oidcMeta, client))
 
-  /** Discover the jwks_uri via RFC 8414 / OIDC metadata, then fetch the JWKS. */
-  def discover(issuer: String, client: Client, cacheTtl: Duration): UIO[JwksProvider] =
-    Ref.make[Option[Cache]](None).flatMap { cache =>
-      Ref.make[Option[String]](None).map { jwksUriRef =>
-        new JwksProvider:
-          def lookup(kid: String): IO[AuthError, PublicKey] =
-            for
-              now    <- Clock.instant
-              cached <- cache.get
-              key    <- cached match
-                          case Some(c) if c.isFresh(now, cacheTtl) =>
-                            ZIO.fromOption(c.keys.get(kid)).orElseFail(AuthError.Missing)
-                          case _ =>
-                            ZIO.fail(AuthError.Missing)
-            yield key
-
-          def refreshAndLookup(kid: String): IO[AuthError, PublicKey] =
-            for
-              jwksUri <- resolveJwksUri(issuer, client, jwksUriRef)
-              keys    <- fetchAndParseJwks(jwksUri, client)
-              now     <- Clock.instant
-              _       <- cache.set(Some(Cache(keys, now)))
-              key     <- ZIO.fromOption(keys.get(kid))
-                           .orElseFail(AuthError.Invalid(s"No JWKS key found for kid '$kid'"))
-            yield key
-      }
-    }
-
-  /** Use a fixed jwks_uri without metadata discovery. */
-  def fixed(jwksUri: String, client: Client, cacheTtl: Duration): UIO[JwksProvider] =
-    Ref.make[Option[Cache]](None).map { cache =>
-      new JwksProvider:
-        def lookup(kid: String): IO[AuthError, PublicKey] =
-          for
-            now    <- Clock.instant
-            cached <- cache.get
-            key    <- cached match
-                        case Some(c) if c.isFresh(now, cacheTtl) =>
-                          ZIO.fromOption(c.keys.get(kid)).orElseFail(AuthError.Missing)
-                        case _ =>
-                          ZIO.fail(AuthError.Missing)
-          yield key
-
-        def refreshAndLookup(kid: String): IO[AuthError, PublicKey] =
-          for
-            keys <- fetchAndParseJwks(jwksUri, client)
-            now  <- Clock.instant
-            _    <- cache.set(Some(Cache(keys, now)))
-            key  <- ZIO.fromOption(keys.get(kid))
-                      .orElseFail(AuthError.Invalid(s"No JWKS key found for kid '$kid'"))
-          yield key
-    }
-
-  /** Fetch the AS metadata document at /.well-known/oauth-authorization-server (with OIDC
-   *  fallback) and extract the jwks_uri. Cached after first success. */
-  private def resolveJwksUri(
-    issuer: String,
-    client: Client,
-    jwksUriRef: Ref[Option[String]],
-  ): IO[AuthError, String] =
-    jwksUriRef.get.flatMap {
-      case Some(uri) => ZIO.succeed(uri)
-      case None =>
-        val base = issuer.stripSuffix("/")
-        val oauthMeta = s"$base/.well-known/oauth-authorization-server"
-        val oidcMeta  = s"$base/.well-known/openid-configuration"
-        fetchJwksUri(oauthMeta, client)
-          .orElse(fetchJwksUri(oidcMeta, client))
-          .tap(uri => jwksUriRef.set(Some(uri)))
-    }
-
-  private def fetchJwksUri(metadataUrl: String, client: Client): IO[AuthError, String] =
-    ZIO.scoped {
-      for
-        url    <- ZIO.fromEither(URL.decode(metadataUrl))
-                    .mapError(t => AuthError.UpstreamFailure(s"Bad metadata URL: ${t.getMessage}"))
-        resp   <- client.request(Request.get(url))
-                    .mapError(t => AuthError.UpstreamFailure(s"Failed to fetch AS metadata: ${t.getMessage}"))
-        _      <- ZIO.fail(AuthError.UpstreamFailure(s"AS metadata returned ${resp.status}"))
-                    .when(!resp.status.isSuccess)
-        body   <- resp.body.asString
-                    .mapError(t => AuthError.UpstreamFailure(s"Failed to read AS metadata body: ${t.getMessage}"))
-        json   <- ZIO.fromEither(body.fromJson[Json.Obj])
-                    .mapError(e => AuthError.UpstreamFailure(s"Invalid AS metadata JSON: $e"))
-        uri    <- ZIO.fromOption(json.get("jwks_uri").flatMap(_.asString))
-                    .orElseFail(AuthError.UpstreamFailure("AS metadata missing 'jwks_uri'"))
-      yield uri
-    }
-
-  private def fetchAndParseJwks(
-    jwksUri: String,
-    client: Client,
-  ): IO[AuthError, Map[String, PublicKey]] =
-    ZIO.scoped {
-      for
-        url  <- ZIO.fromEither(URL.decode(jwksUri))
-                  .mapError(t => AuthError.UpstreamFailure(s"Bad JWKS URL: ${t.getMessage}"))
-        resp <- client.request(Request.get(url))
-                  .mapError(t => AuthError.UpstreamFailure(s"Failed to fetch JWKS: ${t.getMessage}"))
-        _    <- ZIO.fail(AuthError.UpstreamFailure(s"JWKS endpoint returned ${resp.status}"))
-                  .when(!resp.status.isSuccess)
-        body <- resp.body.asString
-                  .mapError(t => AuthError.UpstreamFailure(s"Failed to read JWKS body: ${t.getMessage}"))
-        keys <- ZIO.fromEither(parseJwks(body))
-                  .mapError(e => AuthError.UpstreamFailure(s"Invalid JWKS document: $e"))
-      yield keys
-    }
-
-  /** Parse a JWKS document via nimbus-jose-jwt. Drops keys that aren't RSA or are missing kid. */
-  private[auth] def parseJwks(body: String): Either[String, Map[String, PublicKey]] =
-    scala.util.Try(JWKSet.parse(body)).toEither.left.map(t => s"Failed to parse JWKS: ${t.getMessage}").map { jwks =>
-      jwks.getKeys.asScala.iterator.flatMap { jwk =>
-        for
-          kid <- Option(jwk.getKeyID)
-          key <- toPublicKey(jwk).toOption
-        yield kid -> key
-      }.toMap
-    }
-
-  /** Reconstruct a `java.security.PublicKey` from a JWK. RSA only in v1. */
-  private[auth] def toPublicKey(jwk: JWK): Either[String, PublicKey] =
-    jwk match
-      case rsa: RSAKey =>
-        scala.util.Try(rsa.toRSAPublicKey).toEither.left.map(t => s"RSA key error: ${t.getMessage}")
-      case _ =>
-        Left(s"Unsupported key type: ${jwk.getKeyType} (only RSA is supported in v1)")
+  private def fetchJwksUri(metadataUrl: String, client: Client): IO[Throwable, URL] =
+    for
+      url  <- ZIO.fromEither(URL.decode(metadataUrl))
+      resp <- client.batched(Request.get(url))
+      _    <- ZIO.fail(RuntimeException(s"AS metadata returned ${resp.status}"))
+                .when(!resp.status.isSuccess)
+      body <- resp.body.asString
+      json <- ZIO.fromEither(body.fromJson[Json.Obj])
+                .mapError(e => RuntimeException(s"Invalid AS metadata JSON: $e"))
+      uriS <- ZIO.fromOption(json.get("jwks_uri").flatMap(_.asString))
+                .orElseFail(RuntimeException("AS metadata missing 'jwks_uri'"))
+      uri  <- ZIO.fromEither(URL.decode(uriS))
+    yield uri

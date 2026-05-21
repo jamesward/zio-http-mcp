@@ -60,22 +60,22 @@ object StatelessSpec extends ZIOSpecDefault:
     val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
     val request = Request.post(url, Body.fromString(body))
       .addHeader(Header.ContentType(MediaType.application.json))
-    ZClient.request(request)
+    ZClient.batched(request)
 
   private def postWithSession(port: Int, body: String, sessionId: String): ZIO[Client & Scope, Throwable, Response] =
     val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
     val request = Request.post(url, Body.fromString(body))
       .addHeader(Header.ContentType(MediaType.application.json))
       .addHeader("mcp-session-id", sessionId)
-    ZClient.request(request)
+    ZClient.batched(request)
 
   private def get(port: Int): ZIO[Client & Scope, Throwable, Response] =
     val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
-    ZClient.request(Request.get(url))
+    ZClient.batched(Request.get(url))
 
   private def delete(port: Int): ZIO[Client & Scope, Throwable, Response] =
     val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
-    ZClient.request(Request.delete(url))
+    ZClient.batched(Request.delete(url))
 
   private def bodyJson(response: Response): ZIO[Any, Throwable, Json.Obj] =
     response.body.asString.flatMap: s =>

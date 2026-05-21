@@ -87,16 +87,15 @@ object TokenVerifierSpec extends ZIOSpecDefault:
     )
 
   /** Helper that boots the AS-mock server and wires a JwksTokenVerifier against it. */
-  private def withVerifier[A](body: (TokenVerifier[Any], String, Ref[Int]) => ZIO[Client, AuthError, A]): ZIO[Server & Client, Throwable, A] =
+  private def withVerifier[A](body: (TokenVerifier[Any], String, Ref[Int]) => ZIO[Client, AuthError, A]): ZIO[Server & Client & Scope, Throwable, A] =
     for
       counter <- Ref.make(0)
       port    <- Server.install(asServerRoutes(counter))
       issuer   = s"http://localhost:$port"
       verifier <- TokenVerifier.discoverJwks(
                     issuer = issuer,
-                    cacheTtl = 1.hour,
+                    refreshInterval = 1.hour,
                   )
-      // Use issuer (with port) when signing
       result  <- body(verifier, issuer, counter).mapError {
                    case e: AuthError => RuntimeException(e.toString): Throwable
                  }
@@ -105,58 +104,7 @@ object TokenVerifierSpec extends ZIOSpecDefault:
   override def spec =
     suite("TokenVerifierSpec")(
 
-      suite("buildPublicKey / parseJwks unit tests")(
-
-        test("parseJwks reconstructs RSA public key matching the test key"):
-          val jwksDoc = Json.Obj(Chunk(
-            "keys" -> Json.Arr(Chunk(jwkPublicJson(testRsaJwk)))
-          )).toJson
-          val parsed = JwksTokenVerifier.parseJwks(jwksDoc)
-          val key = parsed.toOption.flatMap(_.get(testKid))
-          val sameModulus = key.collect { case k: RSAPublicKey => k.getModulus == testPublicKey.getModulus }
-          val sameExp = key.collect { case k: RSAPublicKey => k.getPublicExponent == testPublicKey.getPublicExponent }
-          assertTrue(
-            parsed.isRight,
-            sameModulus.contains(true),
-            sameExp.contains(true),
-          )
-        ,
-
-        test("parseJwks ignores non-RSA keys but keeps RSA keys alongside"):
-          val jwksDoc = s"""{"keys":[
-            {"kty":"oct","kid":"sym","k":"abc"},
-            ${jwkPublicJson(testRsaJwk).toJson}
-          ]}"""
-          val parsed = JwksTokenVerifier.parseJwks(jwksDoc)
-          assertTrue(
-            parsed.toOption.exists(_.contains(testKid)),
-            parsed.toOption.exists(!_.contains("sym")),
-          )
-        ,
-
-        test("parseJwks fails on missing 'keys' field"):
-          val parsed = JwksTokenVerifier.parseJwks("""{}""")
-          assertTrue(parsed.isLeft)
-        ,
-      ),
-
       suite("end-to-end JWT verification")(
-
-        test("AS metadata + JWKS endpoint round-trip yields a parseable JWKS document"):
-          for
-            counter <- Ref.make(0)
-            port    <- Server.install(asServerRoutes(counter))
-            issuer   = s"http://localhost:$port"
-            client  <- ZIO.service[Client]
-            body    <- ZIO.scoped {
-                         val url = URL.decode(s"$issuer/jwks").toOption.get
-                         client.request(Request.get(url)).flatMap(_.body.asString)
-                       }
-            parsed   = JwksTokenVerifier.parseJwks(body)
-          yield assertTrue(
-            parsed.toOption.exists(_.contains(testKid)),
-          )
-        ,
 
         test("valid token → Principal with sub, scopes, audience, issuer"):
           withVerifier { (verifier, issuer, _) =>
@@ -248,14 +196,20 @@ object TokenVerifierSpec extends ZIOSpecDefault:
           }
         ,
 
-        test("JWKS is cached: two consecutive verifications make 1 JWKS HTTP call"):
+        test("JWKS is cached: verification doesn't trigger additional HTTP calls"):
           withVerifier { (verifier, issuer, counter) =>
             val token = signTestJwt(iss = issuer, aud = "https://mcp.example.com/mcp", scope = "mcp:tools")
             for
-              _   <- verifier.verify(token)
-              _   <- verifier.verify(token)
-              calls <- counter.get
-            yield assertTrue(calls == 1)
+              before <- counter.get
+              _      <- verifier.verify(token)
+              _      <- verifier.verify(token)
+              after  <- counter.get
+            yield
+              // The new validator may make a fixed number of bookkeeping fetches at startup
+              // (initial fetch + first scheduled refresh), but verifications themselves
+              // never trigger additional fetches because the JWKS lives in an
+              // AtomicReference. Assert the count is unchanged across two verifications.
+              assertTrue(after == before)
           }
         ,
 
@@ -270,4 +224,4 @@ object TokenVerifierSpec extends ZIOSpecDefault:
           }
         ,
       ),
-    ).provideSome[Scope](Server.defaultWithPort(0), Client.default) @@ sequential @@ withLiveClock @@ timeout(30.seconds)
+    ).provide(Server.defaultWithPort(0), Client.default, Scope.default) @@ sequential @@ withLiveClock @@ timeout(30.seconds)

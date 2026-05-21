@@ -30,7 +30,7 @@ private[mcp] object AuthTestHelpers:
     val url = URL.decode(s"$asIssuer/oauth2/register").toOption.get
     for
       client <- ZIO.service[Client]
-      resp   <- client.request(
+      resp   <- client.batched(
                   Request.post(url, Body.fromString(body))
                     .addHeader(Header.ContentType(MediaType.application.json))
                 )
@@ -59,7 +59,7 @@ private[mcp] object AuthTestHelpers:
       s"&resource=${java.net.URLEncoder.encode(resource, "UTF-8")}"
     for
       client <- ZIO.service[Client]
-      resp   <- client.request(
+      resp   <- client.batched(
                   Request.post(url, Body.fromString(form))
                     .addHeader(Header.ContentType(MediaType.application.`x-www-form-urlencoded`))
                     .addHeader("authorization", s"Basic $basic")
@@ -94,7 +94,7 @@ private[mcp] object AuthTestHelpers:
   def buildAuthServer(
     boundPort: Int,
     tools: Chunk[McpToolHandlerR[Client]] = Chunk.empty,
-  ): URIO[Client, McpServer[Client]] =
+  ): ZIO[Client & Scope, Throwable, McpServer[Client]] =
     val resourceUri = ResourceUri.parse(s"http://localhost:$boundPort/mcp").toOption.get
     for
       verifier <- TokenVerifier.discoverJwks(issuer = asIssuer)
@@ -120,7 +120,7 @@ private[mcp] object AuthTestHelpers:
       port   <- findFreePort
       server <- buildAuthServer(port, tools)
       _      <- Server.serve(server.statelessRoutes)
-                  .provideSome[Client & Scope](Server.defaultWithPort(port))
+                  .provideSome[Client](Server.defaultWithPort(port))
                   .forkScoped
       _      <- waitForBind(port)
     yield port

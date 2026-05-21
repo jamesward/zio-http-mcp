@@ -18,9 +18,9 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-schema-derivation" % "1.8.5",
   "dev.zio" %% "zio-schema-json"       % "1.8.5",
 
-  "com.nimbusds" % "nimbus-jose-jwt" % "10.9",
+  "com.guizmaii" %% "scala-nimbus-jose-jwt-zio" % "4.1.2",
 
-  "org.slf4j" % "slf4j-simple" % "2.0.17" % Test,
+  "org.slf4j" % "slf4j-simple" % "2.0.18" % Test,
 
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,

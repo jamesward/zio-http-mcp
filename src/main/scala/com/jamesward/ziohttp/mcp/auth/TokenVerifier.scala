@@ -30,28 +30,33 @@ object TokenVerifier:
   /**
    * JWT validation against the JWKS published by the authorization server, with metadata
    * discovery (RFC 8414, with OIDC Discovery 1.0 fallback). Validates signature, `iss`,
-   * `exp`, `nbf`. The JWKS document is cached for `cacheTtl`.
+   * `exp`, `nbf`. JWKS is fetched eagerly at startup and refreshed every `refreshInterval`
+   * by a background fiber.
    *
    * Audience binding (RFC 8707) is enforced by the auth middleware against
    * [[McpAuth.resourceUri]] (or its per-request derivation), not here.
    *
-   * Supports RS256/RS384/RS512 in v1. EC and EdDSA support is future work.
+   * The validator's lifetime is tied to the surrounding [[zio.Scope]] — when the scope
+   * closes, the background refresh fiber terminates. In a typical `ZIOAppDefault` app
+   * the scope lives for the lifetime of the app, which is what you want.
+   *
+   * Supports RS256 in v1. EC and EdDSA support is future work.
    */
   def discoverJwks(
     issuer: String,
-    cacheTtl: Duration = 1.hour,
-    clockSkew: Duration = 60.seconds,
-  ): ZIO[Client, Nothing, TokenVerifier[Any]] =
-    JwksTokenVerifier.discoverJwks(issuer, cacheTtl, clockSkew)
+    refreshInterval: Duration = 4.minutes,
+    fetchTimeout: Duration = 30.seconds,
+  ): ZIO[Client & Scope, Throwable, TokenVerifier[Any]] =
+    JwksTokenVerifier.discoverJwks(issuer, refreshInterval, fetchTimeout)
 
   /** Build a JWT verifier with a fixed `jwks_uri` (no metadata discovery). */
   def jwks(
     jwksUri: String,
     expectedIssuer: String,
-    cacheTtl: Duration = 1.hour,
-    clockSkew: Duration = 60.seconds,
-  ): ZIO[Client, Nothing, TokenVerifier[Any]] =
-    JwksTokenVerifier.jwks(jwksUri, expectedIssuer, cacheTtl, clockSkew)
+    refreshInterval: Duration = 4.minutes,
+    fetchTimeout: Duration = 30.seconds,
+  ): ZIO[Client & Scope, Throwable, TokenVerifier[Any]] =
+    JwksTokenVerifier.jwks(jwksUri, expectedIssuer, refreshInterval, fetchTimeout)
 
   /**
    * RFC 7662 OAuth 2.0 Token Introspection. Posts the bearer token to the AS's introspection

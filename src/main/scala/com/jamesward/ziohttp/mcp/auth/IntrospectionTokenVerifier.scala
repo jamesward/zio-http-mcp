@@ -54,7 +54,7 @@ final class IntrospectionTokenVerifier private (
       .addHeader(Header.ContentType(MediaType.application.`x-www-form-urlencoded`))
       .addHeader(Header.Authorization.Basic(clientId, secret))
       .addHeader("accept", "application/json")
-    client.request(request)
+    client.batched(request)
       .mapError(t => AuthError.UpstreamFailure(s"Introspection request failed: ${t.getMessage}"))
 
   private def buildPrincipal(rawToken: String, body: Json.Obj): IO[AuthError, Principal] =

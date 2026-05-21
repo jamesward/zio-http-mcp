@@ -48,7 +48,7 @@ object LiveAuthSpec extends ZIOSpecDefault:
   }.orDie
 
   /** Build a server with auth configured for the given resource URI. */
-  private def buildServer(boundPort: Int): URIO[Client, McpServer[Client]] =
+  private def buildServer(boundPort: Int): ZIO[Client & Scope, Throwable, McpServer[Any]] =
     val resourceUri = ResourceUri.parse(s"http://localhost:$boundPort/mcp").toOption.get
     for
       verifier <- TokenVerifier.discoverJwks(issuer = asIssuer)
@@ -72,7 +72,7 @@ object LiveAuthSpec extends ZIOSpecDefault:
       port   <- findFreePort
       server <- buildServer(port)
       _      <- Server.serve(server.statelessRoutes)
-                  .provideSome[Client & Scope](Server.defaultWithPort(port))
+                  .provideSome[Client](Server.defaultWithPort(port))
                   .forkScoped
       _      <- waitForBind(port)
     yield port
@@ -104,7 +104,7 @@ object LiveAuthSpec extends ZIOSpecDefault:
     val url = URL.decode(s"$asIssuer/oauth2/register").toOption.get
     for
       client <- ZIO.service[Client]
-      resp   <- client.request(
+      resp   <- client.batched(
                   Request.post(url, Body.fromString(body))
                     .addHeader(Header.ContentType(MediaType.application.json))
                 )
@@ -131,7 +131,7 @@ object LiveAuthSpec extends ZIOSpecDefault:
       s"&resource=${java.net.URLEncoder.encode(resource, "UTF-8")}"
     for
       client <- ZIO.service[Client]
-      resp   <- client.request(
+      resp   <- client.batched(
                   Request.post(url, Body.fromString(form))
                     .addHeader(Header.ContentType(MediaType.application.`x-www-form-urlencoded`))
                     .addHeader("authorization", s"Basic $basic")
@@ -155,7 +155,7 @@ object LiveAuthSpec extends ZIOSpecDefault:
     val base = Request.post(url, Body.fromString(body))
       .addHeader(Header.ContentType(MediaType.application.json))
     val final0 = token.fold(base)(t => base.addHeader("authorization", s"Bearer $t"))
-    ZClient.request(final0)
+    ZClient.batched(final0)
 
   private val toolsCallAdd =
     """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}"""
@@ -187,7 +187,7 @@ object LiveAuthSpec extends ZIOSpecDefault:
             port <- serveScoped
             resp <- {
                       val url = URL.decode(s"http://localhost:$port/.well-known/oauth-protected-resource").toOption.get
-                      ZClient.request(Request.get(url)).flatMap(_.body.asString)
+                      ZClient.batched(Request.get(url)).flatMap(_.body.asString)
                     }
             json <- ZIO.fromEither(resp.fromJson[Json.Obj]).mapError(e => RuntimeException(e))
           yield assertTrue(
@@ -310,4 +310,4 @@ object LiveAuthSpec extends ZIOSpecDefault:
             )
         }
       ,
-    ).provideSome[Scope](Client.default) @@ tag("live-auth") @@ sequential @@ withLiveClock @@ timeout(60.seconds)
+    ).provide(Client.default) @@ tag("live-auth") @@ sequential @@ withLiveClock @@ timeout(60.seconds)

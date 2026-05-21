@@ -468,8 +468,8 @@ The library is AS-agnostic: any AS that publishes RFC 8414 metadata, supports RF
 
 ### New dependencies
 
-- `com.nimbusds % nimbus-jose-jwt % 10.9` — JWT/JOSE library. Most actively maintained Java JWT lib (Connect2id releases monthly; Spring Security itself uses it). For RSA-only v1 scope, all of the Bouncy Castle and Tink transitive deps are `<optional>true</optional>` and don't appear on the classpath. Provides `SignedJWT.parse`, `RSASSAVerifier`, and `RSAKey.parse`/`toRSAPublicKey()` for JWK handling.
-- JWKS fetching + caching is implemented in-house using `zio-http`'s `Client` (~150 lines in `JwksProvider`) so we control caching policy and refresh-on-miss behavior; `nimbus-jose-jwt` only handles the cryptographic primitives.
+- `com.guizmaii %% scala-nimbus-jose-jwt-zio % 4.1.2` — ZIO-native wrapper around `nimbus-jose-jwt`. Provides `ZioJwtValidator` with eager fail-fast JWKS fetch on startup, lock-free `AtomicReference` JWKS cache, background refresh fiber (default every 4 minutes), built-in ZIO Metrics + OpenTelemetry tracing, and graceful degradation with stale cache on refresh failures. The validator's `validate` method is non-blocking after construction (signature verification is pure CPU work). Pulls in `nimbus-jose-jwt` transitively as the cryptographic engine.
+- AS metadata discovery (`/.well-known/oauth-authorization-server` with OIDC fallback) is implemented in-house since the lib only handles JWKS fetching given a known `jwks_uri`.
 
 Test-only:
 - `org.testcontainers:testcontainers` is already present (used by `ConformanceSpec`); not currently needed for `LiveAuthSpec` but may be added later for the optional `KeycloakAuthSpec`.
@@ -671,11 +671,17 @@ Every code example added to the README's auth section gets a matching test in `M
 
 ## Resolved decisions
 
-1. **JWT library: [`com.nimbusds:nimbus-jose-jwt`](https://connect2id.com/products/nimbus-jose-jwt) `10.9`.** Most actively maintained Java JWT/JOSE library, used internally by Spring Security. Updated monthly. Supports the algorithms we care about (`RS256`/`384`/`512` in v1; `PS*`, `ES*`, `EdDSA` are available for future expansion) and provides one-liner JWK parsing via `RSAKey.parse(...)` + `toRSAPublicKey()`. For RSA-only usage, all Bouncy Castle and Tink transitive deps are marked `<optional>true</optional>` and don't appear on the classpath. Add to `build.sbt`:
+1. **JWT library: [`com.guizmaii %% scala-nimbus-jose-jwt-zio`](https://github.com/guizmaii-opensource/scala-nimbus-jose-jwt) `4.1.2`.** Scala 3 + ZIO-native wrapper around the [`com.nimbusds:nimbus-jose-jwt`](https://connect2id.com/products/nimbus-jose-jwt) cryptographic engine. Provides:
+   - Eager fail-fast JWKS fetch on startup with a configurable retry schedule
+   - Lock-free `AtomicReference` JWKS cache (instant non-blocking reads at validation time)
+   - Background refresh fiber that keeps the cache warm
+   - Health monitoring (`JwksHealth.Healthy` / `Degraded` with last-error)
+   - ZIO Metrics + OpenTelemetry tracing built in
+   - Graceful degradation: stale cache served if refresh fails
    ```scala
-   libraryDependencies += "com.nimbusds" % "nimbus-jose-jwt" % "10.9"
+   libraryDependencies += "com.guizmaii" %% "scala-nimbus-jose-jwt-zio" % "4.1.2"
    ```
-   We initially picked `com.github.jwt-scala:jwt-zio-json` for its zio-json integration, but that artifact still depends on zio-json 0.7.x while the rest of our stack runs on 0.9.x — forcing a `libraryDependencySchemes` eviction override that propagates to every downstream project. Switching to `nimbus-jose-jwt` removed that pain point and gives us a more actively maintained library. JWKS fetching/caching stays in-house in `JwksProvider` so we control refresh-on-miss and cache TTL policy independently of the JOSE library.
+   Earlier picks: we tried `com.github.jwt-scala:jwt-zio-json` (zio-json conflict, infrequent updates) and then `com.nimbusds:nimbus-jose-jwt` directly (forced us to maintain ~150 lines of JWKS fetch+cache code in-house). The guizmaii lib gives us the cryptographic correctness of nimbus plus a ZIO-idiomatic non-blocking interface and production-grade JWKS lifecycle management. Audience binding is configured to be a no-op at the validator (we pass `null` for `acceptedAudience` to `DefaultJWTClaimsVerifier`) so the auth middleware can do per-request audience validation against the resolved `resourceUri`. The validator's lifetime is tied to a [[zio.Scope]] — `TokenVerifier.discoverJwks` requires `Client & Scope`, with `Scope` typically supplied by `ZIOAppDefault.run`.
 
 2. **PRM path: serve both `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/<server-path>`.** The 2025-11-25 spec explicitly endorses the path-suffixed form (e.g. `https://example.com/public/mcp` → `https://example.com/.well-known/oauth-protected-resource/public/mcp`) for hosts with multiple resources. Both URLs serve identical content. Clients are required to support both discovery mechanisms and we want either to work.
 

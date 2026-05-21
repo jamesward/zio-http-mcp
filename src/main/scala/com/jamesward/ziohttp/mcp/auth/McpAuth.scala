@@ -90,8 +90,9 @@ object AuthorizationServer:
  *
  * @param resourceUri          Canonical URI of this MCP server (RFC 8707). When `None`,
  *                             the URI is derived per-request from the `Forwarded` /
- *                             `X-Forwarded-*` / `Host` headers, with [[resourcePath]]
- *                             appended. Set explicitly in production for stability.
+ *                             `X-Forwarded-*` / `Host` headers, with the server's mount
+ *                             path appended (see [[com.jamesward.ziohttp.mcp.McpServer.mountedAt]]).
+ *                             Set explicitly in production for stability.
  * @param authorizationServers At least one authorization server (issuer URL).
  *                             Listed in PRM `authorization_servers`.
  * @param scopesSupported      Scopes advertised in PRM `scopes_supported`. May be empty.
@@ -100,9 +101,6 @@ object AuthorizationServer:
  * @param verifier             Token verifier — typically `TokenVerifier.discoverJwks(...)`
  *                             or `TokenVerifier.introspection(...)`.
  * @param requiredScopes       Server-wide scope requirements. Per-tool scopes are additive.
- * @param resourcePath         Path component used when [[resourceUri]] is derived from
- *                             headers. Defaults to `/mcp`, matching where the MCP routes
- *                             are mounted.
  * @param realm                `WWW-Authenticate` realm parameter.
  */
 final case class McpAuth[-R](
@@ -113,7 +111,6 @@ final case class McpAuth[-R](
   resourceName: Option[String] = None,
   resourceDocumentation: Option[String] = None,
   requiredScopes: Set[OauthScope] = Set.empty,
-  resourcePath: String = "/mcp",
   realm: String = "mcp",
 ):
   def withResourceUri(uri: ResourceUri): McpAuth[R] =

@@ -25,18 +25,40 @@ final class McpServer[-R] private (
   val resourceTemplates: Chunk[McpResourceTemplateHandler],
   val prompts: Chunk[McpPromptHandler],
   val authConfig: Option[McpAuth[R]] = None,
+  val mountPath: String = "/mcp",
 ):
   def tool[R1](t: McpToolHandlerR[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig)
+    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig, mountPath)
 
   def resource(r: McpResourceHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig)
+    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig, mountPath)
 
   def resourceTemplate(rt: McpResourceTemplateHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig)
+    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig, mountPath)
 
   def prompt(p: McpPromptHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig, mountPath)
+
+  /**
+   * Mount the MCP HTTP routes at the given path. Defaults to `/mcp` (matching the
+   * convention recommended by the MCP specification). Use `/` to mount at the root
+   * — useful when the server only handles MCP and the path prefix is redundant.
+   *
+   * The same path is the source of truth for:
+   *   - where `routes` / `statelessRoutes` register POST/GET/DELETE handlers,
+   *   - the resource URI advertised in the RFC 9728 Protected Resource Metadata
+   *     document (when [[McpAuth.resourceUri]] is `None` and the URI is derived
+   *     from forwarded / host headers),
+   *   - the audience the auth middleware checks tokens against.
+   *
+   * Setting it once here keeps those three uses from drifting apart.
+   *
+   * Multi-segment paths like `/api/v1/mcp` are supported. A leading slash is
+   * implicit; `mountedAt("api/v1/mcp")` and `mountedAt("/api/v1/mcp")` are
+   * equivalent.
+   */
+  def mountedAt(path: String): McpServer[R] =
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, path)
 
   /**
    * Enable opt-in OAuth 2.1 authorization for this server.
@@ -52,7 +74,7 @@ final class McpServer[-R] private (
    * @see [[com.jamesward.ziohttp.mcp.auth.McpAuth]]
    */
   def auth[R1](a: McpAuth[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a))
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a), mountPath)
 
   private val toolsByName: Map[ToolName, McpToolHandlerR[R]] =
     tools.map(t => t.name -> t).toMap
@@ -70,22 +92,40 @@ final class McpServer[-R] private (
     )
 
   def routes: Routes[R & McpServer.State, Response] =
-    val mcpRoutes: Routes[R & McpServer.State, Response] = Routes(
-      Method.POST / "mcp" -> handler(postHandler),
-      Method.GET / "mcp"  -> handler(getHandler),
-      Method.GET / "mcp" / trailing -> Handler.notFound,
-      Method.DELETE / "mcp" -> handler(deleteHandler),
+    val baseRoutes: Routes[R & McpServer.State, Response] = Routes(
+      Method.POST   / mountPathCodec -> handler(postHandler),
+      Method.GET    / mountPathCodec -> handler(getHandler),
+      Method.DELETE / mountPathCodec -> handler(deleteHandler),
     )
+    val mcpRoutes =
+      if isRootMount then baseRoutes
+      else baseRoutes ++ Routes(Method.GET / mountPathCodec / trailing -> Handler.notFound)
     (prmRoutes ++ mcpRoutes).sandbox
 
   def statelessRoutes: Routes[R, Response] =
-    val mcpRoutes: Routes[R, Response] = Routes(
-      Method.POST / "mcp" -> handler(statelessPostHandler),
-      Method.GET / "mcp"  -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
-      Method.GET / "mcp" / trailing -> Handler.notFound,
-      Method.DELETE / "mcp" -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
+    val baseRoutes: Routes[R, Response] = Routes(
+      Method.POST   / mountPathCodec -> handler(statelessPostHandler),
+      Method.GET    / mountPathCodec -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
+      Method.DELETE / mountPathCodec -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
     )
+    val mcpRoutes =
+      if isRootMount then baseRoutes
+      else baseRoutes ++ Routes(Method.GET / mountPathCodec / trailing -> Handler.notFound)
     (prmRoutes ++ mcpRoutes).sandbox
+
+  /** PathCodec for the mount point. `PathCodec.apply` parses leading/trailing
+    * slashes the way you'd expect: `"/mcp"`, `"mcp"`, `"/mcp/"` all produce
+    * a single-segment codec; `"/"` and `""` produce the empty codec. */
+  private def mountPathCodec: zio.http.codec.PathCodec[Unit] =
+    zio.http.codec.PathCodec(mountPath)
+
+  /** True when the configured mount path is the server root (no segments).
+    * In that case, the trailing-notFound handler is skipped because it
+    * would otherwise catch every GET path including the `/.well-known/...`
+    * PRM endpoints. Composing apps mounting their own GET routes get
+    * default 404 behavior just like any other unmatched path. */
+  private def isRootMount: Boolean =
+    mountPath.split('/').forall(_.isEmpty)
 
   /**
    * Routes that serve the RFC 9728 Protected Resource Metadata document at both
@@ -101,7 +141,7 @@ final class McpServer[-R] private (
       case None => Routes.empty
       case Some(a) =>
         def respondPRM(request: Request): UIO[Response] =
-          val resourceUri = ResourceUriResolver.resolve(a.resourceUri, a.resourcePath, request)
+          val resourceUri = ResourceUriResolver.resolve(a.resourceUri, mountPath, request)
           val prm = ProtectedResourceMetadata.fromAuth(a, resourceUri)
           ZIO.log(s"PRM document requested: ${request.url.encode} (resource=${resourceUri.value})")
             .as(Response.json(prm.toJson).addHeader(Header.CacheControl.MaxAge(3600)))
@@ -123,13 +163,13 @@ final class McpServer[-R] private (
       case None => ZIO.succeed(None)
       case Some(a) =>
         AuthMiddleware
-          .authenticate(a, request, additionalRequiredScopes = Set.empty)
+          .authenticate(a, mountPath, request, additionalRequiredScopes = Set.empty)
           .tapBoth(
             err => ZIO.logWarning(s"Auth failed for ${request.method} ${request.url.encode}: ${err.description}"),
             principal => ZIO.logInfo(s"Auth ok for ${request.method} ${request.url.encode}: sub=${principal.subject.getOrElse("?")} client_id=${principal.clientId.getOrElse("?")} scopes=${principal.scopes.map(_.value).mkString(",")}"),
           )
           .mapBoth(
-            err => AuthMiddleware.errorResponse(a, request, err, a.requiredScopes),
+            err => AuthMiddleware.errorResponse(a, mountPath, request, err, a.requiredScopes),
             principal => Some(principal),
           )
 
@@ -147,7 +187,7 @@ final class McpServer[-R] private (
         val combined = a.requiredScopes ++ tool.requiredScopes
         val err = AuthError.InsufficientScope(combined, p.scopes)
         ZIO.logWarning(s"Per-tool scope check failed for ${tool.name.value}: required=${combined.map(_.value).mkString(",")} actual=${p.scopes.map(_.value).mkString(",")}") *>
-          ZIO.fail(AuthMiddleware.errorResponse(a, request, err, combined))
+          ZIO.fail(AuthMiddleware.errorResponse(a, mountPath, request, err, combined))
       case _ =>
         ZIO.unit
 
