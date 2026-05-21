@@ -20,7 +20,7 @@ libraryDependencies ++= Seq(
 
   "com.nimbusds" % "nimbus-jose-jwt" % "10.9",
 
-  "org.slf4j" % "slf4j-simple" % "2.0.17" % Test,
+  "org.slf4j" % "slf4j-simple" % "2.0.18" % Test,
 
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
