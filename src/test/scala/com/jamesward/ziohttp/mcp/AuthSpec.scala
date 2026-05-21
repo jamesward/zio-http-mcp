@@ -9,7 +9,7 @@ import zio.test.TestAspect.*
 
 import java.time.Instant
 
-given CanEqual[zio.http.Status, zio.http.Status] = CanEqual.derived
+given canEqualStatusAuth: CanEqual[zio.http.Status, zio.http.Status] = CanEqual.derived
 
 object AuthSpec extends ZIOSpecDefault:
 

@@ -8,8 +8,8 @@ import zio.schema.*
 import zio.test.*
 import zio.test.TestAspect.*
 
-given CanEqual[Status, Status] = CanEqual.derived
-given CanEqual[MediaType, MediaType] = CanEqual.derived
+given canEqualStatusStateless: CanEqual[Status, Status] = CanEqual.derived
+given canEqualMediaTypeStateless: CanEqual[MediaType, MediaType] = CanEqual.derived
 
 object StatelessSpec extends ZIOSpecDefault:
 
