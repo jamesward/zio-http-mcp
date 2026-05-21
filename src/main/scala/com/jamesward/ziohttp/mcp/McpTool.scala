@@ -1,5 +1,6 @@
 package com.jamesward.ziohttp.mcp
 
+import com.jamesward.ziohttp.mcp.auth.OauthScope
 import zio.*
 import zio.json.*
 import zio.json.ast.Json
@@ -89,6 +90,8 @@ object McpOutput:
 trait McpToolHandlerR[-R]:
   def name: ToolName
   def definition: ToolDefinition
+  /** Per-tool scope requirements. Empty for tools that don't restrict scopes. */
+  def requiredScopes: Set[OauthScope] = Set.empty
   def call(args: Option[Json.Obj]): ZIO[R, Nothing, CallToolResult]
   def callWithContext(args: Option[Json.Obj], ctx: McpToolContext): ZIO[R, Nothing, CallToolResult] =
     call(args)
@@ -102,9 +105,10 @@ final class McpTool private (
   val toolName: ToolName,
   val toolDescription: Option[String],
   val toolAnnotations: Option[ToolAnnotations],
+  val toolRequiredScopes: Set[OauthScope],
 ):
   def description(d: String): McpTool =
-    new McpTool(toolName, Some(d), toolAnnotations)
+    new McpTool(toolName, Some(d), toolAnnotations, toolRequiredScopes)
 
   def annotations(
     title: Option[String] = None,
@@ -113,7 +117,17 @@ final class McpTool private (
     idempotent: OptBool = OptBool.Unset,
     openWorld: OptBool = OptBool.Unset,
   ): McpTool =
-    new McpTool(toolName, toolDescription, Some(ToolAnnotations(title, readOnly.toOption, destructive.toOption, idempotent.toOption, openWorld.toOption)))
+    new McpTool(toolName, toolDescription, Some(ToolAnnotations(title, readOnly.toOption, destructive.toOption, idempotent.toOption, openWorld.toOption)), toolRequiredScopes)
+
+  /**
+   * Add OAuth scope requirements for this tool. Server-wide [[com.jamesward.ziohttp.mcp.auth.McpAuth.requiredScopes]]
+   * apply on top — per-tool scopes are additive.
+   *
+   * If the server has no `.auth(...)` configured, scope declarations are silently ignored,
+   * keeping authoring fully opt-in.
+   */
+  def requireScopes(scopes: OauthScope*): McpTool =
+    new McpTool(toolName, toolDescription, toolAnnotations, toolRequiredScopes ++ scopes)
 
   // --- handle: typed input/output ---
 
@@ -148,9 +162,11 @@ final class McpTool private (
     )
 
     val capturedName = toolName
+    val capturedScopes = toolRequiredScopes
     new McpToolHandlerR[R]:
       def name: ToolName = capturedName
       def definition: ToolDefinition = toolDef
+      override def requiredScopes: Set[OauthScope] = capturedScopes
 
       def call(args: Option[Json.Obj]): ZIO[R, Nothing, CallToolResult] =
         callWithContext(args, McpToolContext.noop)
@@ -189,4 +205,4 @@ final class McpTool private (
 
 object McpTool:
   def apply(name: String): McpTool =
-    new McpTool(ToolName(name), None, None)
+    new McpTool(ToolName(name), None, None, Set.empty)

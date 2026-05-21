@@ -52,6 +52,8 @@ enum ErrorCode(val code: Int):
   case InvalidParams     extends ErrorCode(-32602)
   case InternalError     extends ErrorCode(-32603)
   case ResourceNotFound  extends ErrorCode(-32002)
+  case Unauthorized      extends ErrorCode(-32001)
+  case Forbidden         extends ErrorCode(-32003)
 
 object ErrorCode:
   given CanEqual[ErrorCode, ErrorCode] = CanEqual.derived

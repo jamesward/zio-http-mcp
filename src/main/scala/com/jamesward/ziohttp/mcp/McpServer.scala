@@ -1,5 +1,6 @@
 package com.jamesward.ziohttp.mcp
 
+import com.jamesward.ziohttp.mcp.auth.{AuthError, AuthMiddleware, McpAuth, OauthScope, Principal, ProtectedResourceMetadata, ResourceUriResolver}
 import zio.*
 import zio.http.*
 import zio.json.*
@@ -23,18 +24,35 @@ final class McpServer[-R] private (
   val resources: Chunk[McpResourceHandler],
   val resourceTemplates: Chunk[McpResourceTemplateHandler],
   val prompts: Chunk[McpPromptHandler],
+  val authConfig: Option[McpAuth[R]] = None,
 ):
   def tool[R1](t: McpToolHandlerR[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts)
+    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig)
 
   def resource(r: McpResourceHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts)
+    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig)
 
   def resourceTemplate(rt: McpResourceTemplateHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts)
+    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig)
 
   def prompt(p: McpPromptHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig)
+
+  /**
+   * Enable opt-in OAuth 2.1 authorization for this server.
+   *
+   * When set:
+   *   - `/.well-known/oauth-protected-resource` (and the path-suffixed form) serve an
+   *     RFC 9728 Protected Resource Metadata document.
+   *   - All `/mcp` requests require a valid bearer token.
+   *   - Token verifier failures yield 401/403 with `WWW-Authenticate` challenges.
+   *   - Tool handlers can read the [[com.jamesward.ziohttp.mcp.auth.Principal]] via
+   *     `ctx.principal`.
+   *
+   * @see [[com.jamesward.ziohttp.mcp.auth.McpAuth]]
+   */
+  def auth[R1](a: McpAuth[R1]): McpServer[R & R1] =
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a))
 
   private val toolsByName: Map[ToolName, McpToolHandlerR[R]] =
     tools.map(t => t.name -> t).toMap
@@ -52,20 +70,86 @@ final class McpServer[-R] private (
     )
 
   def routes: Routes[R & McpServer.State, Response] =
-    Routes(
+    val mcpRoutes: Routes[R & McpServer.State, Response] = Routes(
       Method.POST / "mcp" -> handler(postHandler),
       Method.GET / "mcp"  -> handler(getHandler),
       Method.GET / "mcp" / trailing -> Handler.notFound,
       Method.DELETE / "mcp" -> handler(deleteHandler),
-    ).sandbox
+    )
+    (prmRoutes ++ mcpRoutes).sandbox
 
   def statelessRoutes: Routes[R, Response] =
-    Routes(
+    val mcpRoutes: Routes[R, Response] = Routes(
       Method.POST / "mcp" -> handler(statelessPostHandler),
       Method.GET / "mcp"  -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
       Method.GET / "mcp" / trailing -> Handler.notFound,
       Method.DELETE / "mcp" -> handler((_: Request) => ZIO.succeed(Response.status(Status.MethodNotAllowed))),
-    ).sandbox
+    )
+    (prmRoutes ++ mcpRoutes).sandbox
+
+  /**
+   * Routes that serve the RFC 9728 Protected Resource Metadata document at both
+   * `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/<path>`
+   * when [[auth]] is configured. The trailing-path form serves the same document at any
+   * sub-path so it always matches the URL we publish in the `WWW-Authenticate` header,
+   * regardless of where the MCP endpoint is mounted.
+   *
+   * Empty when auth is not configured.
+   */
+  private def prmRoutes: Routes[Any, Response] =
+    authConfig match
+      case None => Routes.empty
+      case Some(a) =>
+        def respondPRM(request: Request): UIO[Response] =
+          val resourceUri = ResourceUriResolver.resolve(a.resourceUri, a.resourcePath, request)
+          val prm = ProtectedResourceMetadata.fromAuth(a, resourceUri)
+          ZIO.log(s"PRM document requested: ${request.url.encode} (resource=${resourceUri.value})")
+            .as(Response.json(prm.toJson).addHeader(Header.CacheControl.MaxAge(3600)))
+
+        val handlerFn = handler { (req: Request) => respondPRM(req) }
+        val trailingHandler = handler { (_: zio.http.Path, req: Request) => respondPRM(req) }
+        Routes(
+          Method.GET / ".well-known" / "oauth-protected-resource" -> handlerFn,
+          Method.GET / ".well-known" / "oauth-protected-resource" / trailing -> trailingHandler,
+        )
+
+  /**
+   * Run the auth middleware if [[auth]] is configured, otherwise yield `None`.
+   *
+   * On auth failure, fails with a `Response` carrying the appropriate 401/403/503 + `WWW-Authenticate`.
+   */
+  private def authenticate(request: Request): ZIO[R, Response, Option[Principal]] =
+    authConfig match
+      case None => ZIO.succeed(None)
+      case Some(a) =>
+        AuthMiddleware
+          .authenticate(a, request, additionalRequiredScopes = Set.empty)
+          .tapBoth(
+            err => ZIO.logWarning(s"Auth failed for ${request.method} ${request.url.encode}: ${err.description}"),
+            principal => ZIO.logInfo(s"Auth ok for ${request.method} ${request.url.encode}: sub=${principal.subject.getOrElse("?")} client_id=${principal.clientId.getOrElse("?")} scopes=${principal.scopes.map(_.value).mkString(",")}"),
+          )
+          .mapBoth(
+            err => AuthMiddleware.errorResponse(a, request, err, a.requiredScopes),
+            principal => Some(principal),
+          )
+
+  /**
+   * Per-tool scope check. Called after a tool is resolved but before its handler runs.
+   * Fails with a 403 response if the principal lacks required scopes.
+   */
+  private def enforceToolScopes(
+    request: Request,
+    principal: Option[Principal],
+    tool: McpToolHandlerR[R],
+  ): ZIO[Any, Response, Unit] =
+    (authConfig, principal) match
+      case (Some(a), Some(p)) if !p.hasAllScopes(tool.requiredScopes) =>
+        val combined = a.requiredScopes ++ tool.requiredScopes
+        val err = AuthError.InsufficientScope(combined, p.scopes)
+        ZIO.logWarning(s"Per-tool scope check failed for ${tool.name.value}: required=${combined.map(_.value).mkString(",")} actual=${p.scopes.map(_.value).mkString(",")}") *>
+          ZIO.fail(AuthMiddleware.errorResponse(a, request, err, combined))
+      case _ =>
+        ZIO.unit
 
   private def validateOrigin(request: Request): ZIO[Any, Response, Unit] =
     request.rawHeader("origin") match
@@ -77,28 +161,30 @@ final class McpServer[-R] private (
 
   private def postHandler(request: Request): ZIO[R & McpServer.State, Response, Response] =
     for
-      _        <- validateOrigin(request)
-      state    <- ZIO.service[McpServer.State]
-      body     <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
-      bodyJson <- ZIO.fromEither(body.fromJson[Json.Obj])
-                    .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
-      response <- routeMessage(request, state.sessions, state.pendingRequests, bodyJson)
+      _         <- validateOrigin(request)
+      principal <- authenticate(request)
+      state     <- ZIO.service[McpServer.State]
+      body      <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
+      bodyJson  <- ZIO.fromEither(body.fromJson[Json.Obj])
+                     .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
+      response  <- routeMessage(request, state.sessions, state.pendingRequests, bodyJson, principal)
     yield response
 
   private def statelessPostHandler(request: Request): ZIO[R, Response, Response] =
     for
-      _        <- validateOrigin(request)
-      body     <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
-      bodyJson <- ZIO.fromEither(body.fromJson[Json.Obj])
-                    .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
-      message  <- ZIO.fromEither(bodyJson.toJson.fromJson[JsonRpcMessage])
-                    .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
-      response <- message match
+      _         <- validateOrigin(request)
+      principal <- authenticate(request)
+      body      <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
+      bodyJson  <- ZIO.fromEither(body.fromJson[Json.Obj])
+                     .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
+      message   <- ZIO.fromEither(bodyJson.toJson.fromJson[JsonRpcMessage])
+                     .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
+      response  <- message match
         case JsonRpcMessage.Request(id, "initialize", params) =>
           parseInitializeParams(id, params).flatMap(r => jsonRpcResponse(id, r))
         case JsonRpcMessage.Request(id, method, params) =>
           McpDispatchMethod.parse(method) match
-            case Some(dm) => dispatchMethod(id, dm, params, statelessHandleToolsCall)
+            case Some(dm) => dispatchMethod(id, dm, params, statelessHandleToolsCall(request, _, _, principal))
             case None     => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
         case JsonRpcMessage.Notification(method, params) =>
           ZIO.log(s"MCP Notification: $method $params").as(Response.status(Status.Accepted))
@@ -143,6 +229,7 @@ final class McpServer[-R] private (
     sessions: Ref[Map[SessionId, SessionState]],
     pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
     bodyJson: Json.Obj,
+    principal: Option[Principal],
   ): ZIO[R, Response, Response] =
     // Check if this is a JSON-RPC response (has "result" or "error", no "method")
     val hasResult = bodyJson.get("result").isDefined
@@ -157,7 +244,7 @@ final class McpServer[-R] private (
         .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
         .flatMap:
           case JsonRpcMessage.Request(id, method, params) =>
-            handleRequest(request, sessions, pendingReqs, id, method, params)
+            handleRequest(request, sessions, pendingReqs, id, method, params, principal)
           case JsonRpcMessage.Notification(method, params) =>
             handleNotification(request, sessions, method, params)
 
@@ -185,6 +272,7 @@ final class McpServer[-R] private (
     id: RequestId,
     method: String,
     params: Option[Json.Obj],
+    principal: Option[Principal],
   ): ZIO[R, Response, Response] =
     method match
       case "initialize" =>
@@ -193,7 +281,7 @@ final class McpServer[-R] private (
         McpDispatchMethod.parse(method) match
           case Some(dm) =>
             withSession(request, sessions):
-              dispatchMethod(id, dm, params, handleToolsCall(_, _, pendingReqs))
+              dispatchMethod(id, dm, params, handleToolsCall(request, _, _, pendingReqs, principal))
           case None =>
             ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
 
@@ -264,42 +352,49 @@ final class McpServer[-R] private (
             ZIO.succeed((tool, callParams))
 
   private def handleToolsCall(
+    request: Request,
     id: RequestId,
     params: Option[Json.Obj],
     pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
+    principal: Option[Principal],
   ): ZIO[R, Response, Response] =
     resolveToolCall(id, params).flatMap: (tool, callParams) =>
-      val progressToken = params.flatMap(_.get("_meta")).flatMap(_.asObject).flatMap(_.get("progressToken"))
-      Queue.unbounded[JsonRpcMessage].flatMap: queue =>
-        val ctx = McpToolContext.make(queue, pendingReqs, progressToken)
-        val toolEffect = tool.callWithContext(callParams.arguments, ctx)
+      enforceToolScopes(request, principal, tool) *> {
+        val progressToken = params.flatMap(_.get("_meta")).flatMap(_.asObject).flatMap(_.get("progressToken"))
+        Queue.unbounded[JsonRpcMessage].flatMap: queue =>
+          val ctx = McpToolContext.make(queue, pendingReqs, progressToken, principal)
+          val toolEffect = tool.callWithContext(callParams.arguments, ctx)
 
-        // Fork the tool, stream messages + result as SSE
-        Promise.make[Nothing, CallToolResult].flatMap: resultPromise =>
-          val runTool = toolEffect
-            .flatMap(resultPromise.succeed)
-            .catchAllDefect: defect =>
-              val errorResult = CallToolResult(
-                content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
-                isError = Some(true),
-              )
-              resultPromise.succeed(errorResult)
-            .ensuring(queue.shutdown)
-          runTool.fork.as:
-            sseToolCallResponse(id, queue, resultPromise)
+          // Fork the tool, stream messages + result as SSE
+          Promise.make[Nothing, CallToolResult].flatMap: resultPromise =>
+            val runTool = toolEffect
+              .flatMap(resultPromise.succeed)
+              .catchAllDefect: defect =>
+                val errorResult = CallToolResult(
+                  content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
+                  isError = Some(true),
+                )
+                resultPromise.succeed(errorResult)
+              .ensuring(queue.shutdown)
+            runTool.fork.as:
+              sseToolCallResponse(id, queue, resultPromise)
+      }
 
   private def statelessHandleToolsCall(
+    request: Request,
     id: RequestId,
     params: Option[Json.Obj],
+    principal: Option[Principal],
   ): ZIO[R, Response, Response] =
     resolveToolCall(id, params).flatMap: (tool, callParams) =>
-      tool.callWithContext(callParams.arguments, McpToolContext.noop)
-        .catchAllDefect: defect =>
-          ZIO.succeed(CallToolResult(
-            content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
-            isError = Some(true),
-          ))
-        .flatMap(result => jsonRpcResponse(id, result))
+      enforceToolScopes(request, principal, tool) *>
+        tool.callWithContext(callParams.arguments, McpToolContext.noopWith(principal))
+          .catchAllDefect: defect =>
+            ZIO.succeed(CallToolResult(
+              content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
+              isError = Some(true),
+            ))
+          .flatMap(result => jsonRpcResponse(id, result))
 
   private def handleResourcesList(id: RequestId): ZIO[Any, Response, Response] =
     jsonRpcResponse(id, ResourcesListResult(resources = resources.map(_.definition)))
@@ -367,9 +462,10 @@ final class McpServer[-R] private (
             case Some(_) =>
               effect
 
-  private def getHandler(request: Request): ZIO[McpServer.State, Response, Response] =
+  private def getHandler(request: Request): ZIO[R & McpServer.State, Response, Response] =
     for
       _     <- validateOrigin(request)
+      _     <- authenticate(request)
       state <- ZIO.service[McpServer.State]
       _     <- withSession(request, state.sessions)(ZIO.succeed(Response.ok))
     yield
@@ -384,9 +480,10 @@ final class McpServer[-R] private (
         ),
       )
 
-  private def deleteHandler(request: Request): ZIO[McpServer.State, Response, Response] =
+  private def deleteHandler(request: Request): ZIO[R & McpServer.State, Response, Response] =
     for
       _     <- validateOrigin(request)
+      _     <- authenticate(request)
       state <- ZIO.service[McpServer.State]
       _     <- request.rawHeader("mcp-session-id").map(SessionId(_)) match
         case Some(sid) => state.sessions.update(_ - sid)
@@ -444,7 +541,7 @@ final class McpServer[-R] private (
 
 object McpServer:
   def apply(name: String, version: String): McpServer[Any] =
-    new McpServer(Implementation(name, version), Chunk.empty, Chunk.empty, Chunk.empty, Chunk.empty)
+    new McpServer(Implementation(name, version), Chunk.empty, Chunk.empty, Chunk.empty, Chunk.empty, None)
 
   trait State:
     def sessions: Ref[Map[SessionId, SessionState]]

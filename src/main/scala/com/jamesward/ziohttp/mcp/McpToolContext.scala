@@ -1,5 +1,6 @@
 package com.jamesward.ziohttp.mcp
 
+import com.jamesward.ziohttp.mcp.auth.Principal
 import zio.*
 import zio.json.*
 import zio.json.ast.Json
@@ -62,6 +63,8 @@ trait McpToolContext:
   def progress(current: Double, total: Double, message: Option[String] = None): UIO[Unit]
   def sample(prompt: String, maxTokens: Int = 100): ZIO[Any, ToolError, SamplingResult]
   def elicit(message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult]
+  /** The authenticated principal for this request, if `.auth(...)` is configured. */
+  def principal: Option[Principal] = None
 
 object McpToolContext:
   private val requestIdCounter = new java.util.concurrent.atomic.AtomicInteger(0)
@@ -70,8 +73,11 @@ object McpToolContext:
     outQueue: Queue[JsonRpcMessage],
     pendingRequests: Ref[Map[RequestId, Promise[Nothing, Json]]],
     progressToken: Option[Json],
+    callerPrincipal: Option[Principal] = None,
   ): McpToolContext =
     new McpToolContext:
+      override val principal: Option[Principal] = callerPrincipal
+
       def log(level: LogLevel, message: String): UIO[Unit] =
         val params = Json.Obj(Chunk(
           "level" -> Json.Str(level.asString),
@@ -132,7 +138,10 @@ object McpToolContext:
           _       <- pendingRequests.update(_ - reqId)
         yield result
 
-  private[mcp] val noop: McpToolContext = new McpToolContext:
+  private[mcp] val noop: McpToolContext = noopWith(None)
+
+  private[mcp] def noopWith(callerPrincipal: Option[Principal]): McpToolContext = new McpToolContext:
+    override val principal: Option[Principal] = callerPrincipal
     def log(level: LogLevel, message: String): UIO[Unit] = ZIO.unit
     def progress(current: Double, total: Double, message: Option[String]): UIO[Unit] = ZIO.unit
     def sample(prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
