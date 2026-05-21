@@ -316,17 +316,23 @@ object AuthSpec extends ZIOSpecDefault:
           )
       ,
 
-      test("8 — valid token with required scopes → tools/list succeeds (stateless)"):
+      test("8 — valid token with required scopes → tools/list succeeds (stateless), filtered to tools the caller can call"):
         for
           port    <- installStateless(serverWithAuth(authConfig(stubVerifier(testScope), Set(testScope))))
           listRsp <- post(port, toolsListRequest, token = Some("valid-token"))
           body    <- listRsp.body.asString
         yield
           val json = body.fromJson[Json.Obj].toOption.get
-          val tools = json.get("result").flatMap(_.asObject).flatMap(_.get("tools")).flatMap(_.asArray)
+          val toolNames = json.get("result").flatMap(_.asObject).flatMap(_.get("tools")).flatMap(_.asArray)
+            .toList.flatten.flatMap(_.asObject).flatMap(_.get("name")).flatMap(_.asString).toSet
+          // The caller has `mcp:tools` (the server-wide required scope)
+          // but not `admin` (delete_user's per-tool requirement). The
+          // tools/list filter (see ToolsListFilterSpec) hides
+          // delete_user from the result. Pre-filter, this returned
+          // both tools.
           assertTrue(
             listRsp.status == Status.Ok,
-            tools.exists(_.size == 2),
+            toolNames == Set("whoami"),
           )
       ,
 

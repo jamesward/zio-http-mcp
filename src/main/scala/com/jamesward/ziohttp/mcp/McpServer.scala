@@ -224,7 +224,7 @@ final class McpServer[-R] private (
           parseInitializeParams(id, params).flatMap(r => jsonRpcResponse(id, r))
         case JsonRpcMessage.Request(id, method, params) =>
           McpDispatchMethod.parse(method) match
-            case Some(dm) => dispatchMethod(id, dm, params, statelessHandleToolsCall(request, _, _, principal))
+            case Some(dm) => dispatchMethod(id, dm, params, principal, statelessHandleToolsCall(request, _, _, principal))
             case None     => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
         case JsonRpcMessage.Notification(method, params) =>
           ZIO.log(s"MCP Notification: $method $params").as(Response.status(Status.Accepted))
@@ -236,13 +236,14 @@ final class McpServer[-R] private (
     id: RequestId,
     method: McpDispatchMethod,
     params: Option[Json.Obj],
+    principal: Option[Principal],
     onToolsCall: (RequestId, Option[Json.Obj]) => ZIO[R1, Response, Response],
   ): ZIO[R1, Response, Response] =
     method match
       case McpDispatchMethod.Ping =>
         jsonRpcResponse(id, Json.Obj())
       case McpDispatchMethod.ToolsList =>
-        handleToolsList(id, params)
+        handleToolsList(id, params, principal)
       case McpDispatchMethod.ToolsCall =>
         onToolsCall(id, params)
       case McpDispatchMethod.ResourcesList =>
@@ -321,7 +322,7 @@ final class McpServer[-R] private (
         McpDispatchMethod.parse(method) match
           case Some(dm) =>
             withSession(request, sessions):
-              dispatchMethod(id, dm, params, handleToolsCall(request, _, _, pendingReqs, principal))
+              dispatchMethod(id, dm, params, principal, handleToolsCall(request, _, _, pendingReqs, principal))
           case None =>
             ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
 
@@ -374,8 +375,28 @@ final class McpServer[-R] private (
   private def handleToolsList(
     id: RequestId,
     params: Option[Json.Obj],
+    principal: Option[Principal],
   ): ZIO[Any, Response, Response] =
-    jsonRpcResponse(id, ToolsListResult(tools = tools.map(_.definition)))
+    val visible = authConfig match
+      case None =>
+        // No server-wide auth configured — every tool is visible.
+        tools
+      case Some(a) =>
+        principal match
+          case Some(p) =>
+            // Hide tools whose combined (server-wide + per-tool)
+            // required scopes the caller doesn't have. Tools with no
+            // extra scope requirements (only the server-wide ones)
+            // remain visible because the caller already cleared
+            // server-wide auth to get here.
+            tools.filter(t => p.hasAllScopes(a.requiredScopes ++ t.requiredScopes))
+          case None =>
+            // Auth is configured but the request reached us without
+            // a Principal. Shouldn't happen — the auth middleware
+            // upstream should have rejected. Hide everything as a
+            // defensive default.
+            Chunk.empty
+    jsonRpcResponse(id, ToolsListResult(tools = visible.map(_.definition)))
 
   private def resolveToolCall(
     id: RequestId,
