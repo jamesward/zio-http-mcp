@@ -64,10 +64,19 @@ private[mcp] object ResourceUriResolver:
         case _                  => None
     }
 
-  /** Parse `X-Forwarded-Proto` + `X-Forwarded-Host` headers (most common convention). */
+  /**
+   * Parse `X-Forwarded-Proto` + `X-Forwarded-Host` headers (most common convention).
+   *
+   * `X-Forwarded-Host` is optional: many edge proxies (Heroku, NLB) send only
+   * `X-Forwarded-Proto` and leave the original `Host` header untouched, since
+   * they don't rewrite the host. When that's the case, fall back to `Host` for
+   * the host part — `X-Forwarded-Proto` alone tells us the scheme, and `Host`
+   * carries the canonical hostname the client used.
+   */
   private def parseXForwarded(request: Request): Option[String] =
     val proto = request.rawHeader("x-forwarded-proto").map(_.trim).filter(_.nonEmpty)
     val host  = request.rawHeader("x-forwarded-host").map(_.trim).filter(_.nonEmpty)
+      .orElse(request.rawHeader("host").map(_.trim).filter(_.nonEmpty))
     (proto, host) match
       case (Some(p), Some(h)) => Some(s"${firstOf(p)}://${firstOf(h)}")
       case _                  => None

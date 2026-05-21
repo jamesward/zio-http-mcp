@@ -72,7 +72,7 @@ object LiveAuthSpec extends ZIOSpecDefault:
       port   <- findFreePort
       server <- buildServer(port)
       _      <- Server.serve(server.statelessRoutes)
-                  .provideSome[Client](Server.defaultWithPort(port))
+                  .provide(Server.defaultWithPort(port))
                   .forkScoped
       _      <- waitForBind(port)
     yield port

@@ -209,6 +209,32 @@ object AuthSpec extends ZIOSpecDefault:
           )
       ,
 
+      test("3b2 — Heroku-style: X-Forwarded-Proto present, X-Forwarded-Host absent, Host preserved"):
+        // Heroku's router sets X-Forwarded-Proto=https on TLS-terminated
+        // requests but does NOT add X-Forwarded-Host — the original Host
+        // header reaches the dyno unchanged. The resolver must combine
+        // the proxy-supplied scheme with the client-supplied Host.
+        val derivedAuth = authConfig(stubVerifier(testScope)).copy(resourceUri = None)
+        for
+          port <- installStateful(McpServer("derive-test", "0.1.0").tool(whoamiTool).auth(derivedAuth))
+          resp <- {
+            val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
+            ZClient.batched(
+              Request.post(url, Body.fromString(initRequest))
+                .addHeader(Header.ContentType(MediaType.application.json))
+                .addHeader("x-forwarded-proto", "https")
+                .addHeader("host", "mcp.mytoolbook.ai")
+                // deliberately no x-forwarded-host
+            )
+          }
+        yield
+          val www = resp.rawHeader("www-authenticate").getOrElse("")
+          assertTrue(
+            resp.status == Status.Unauthorized,
+            www.contains("""resource_metadata="https://mcp.mytoolbook.ai/.well-known/oauth-protected-resource/mcp""""),
+          )
+      ,
+
       test("3c — when resourceUri is None, derives from RFC 7239 Forwarded header"):
         val derivedAuth = authConfig(stubVerifier(testScope)).copy(resourceUri = None)
         for
