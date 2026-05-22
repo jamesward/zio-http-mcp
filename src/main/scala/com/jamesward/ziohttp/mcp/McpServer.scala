@@ -47,8 +47,8 @@ final class McpServer[-R] private (
    * The same path is the source of truth for:
    *   - where `routes` / `statelessRoutes` register POST/GET/DELETE handlers,
    *   - the resource URI advertised in the RFC 9728 Protected Resource Metadata
-   *     document (when [[McpAuth.resourceUri]] is `None` and the URI is derived
-   *     from forwarded / host headers),
+   *     document (when the [[com.jamesward.ziohttp.mcp.auth.McpAuth]] config has no
+   *     explicit `resourceUri` and the URI is derived from forwarded / host headers),
    *   - the audience the auth middleware checks tokens against.
    *
    * Setting it once here keeps those three uses from drifting apart.
