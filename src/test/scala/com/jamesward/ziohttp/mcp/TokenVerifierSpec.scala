@@ -101,6 +101,20 @@ object TokenVerifierSpec extends ZIOSpecDefault:
                  }
     yield result
 
+  /**
+   * Wait for `counter` to stabilize (two consecutive reads return the same value),
+   * then return that value. The underlying validator does a fixed number of bookkeeping
+   * fetches at startup (initial fetch + the background fiber's first scheduled refresh,
+   * which fires immediately under `Schedule.spaced`). This helper drains those startup
+   * fetches before tests sample the counter.
+   */
+  private def waitForStableCount(counter: Ref[Int]): UIO[Int] =
+    def loop(prev: Int): UIO[Int] =
+      ZIO.sleep(50.millis) *> counter.get.flatMap { cur =>
+        if cur == prev then ZIO.succeed(cur) else loop(cur)
+      }
+    counter.get.flatMap(loop)
+
   override def spec =
     suite("TokenVerifierSpec")(
 
@@ -200,15 +214,17 @@ object TokenVerifierSpec extends ZIOSpecDefault:
           withVerifier { (verifier, issuer, counter) =>
             val token = signTestJwt(iss = issuer, aud = "https://mcp.example.com/mcp", scope = "mcp:tools")
             for
-              before <- counter.get
+              // The validator may make a fixed number of bookkeeping fetches at startup
+              // (initial fetch + the background fiber's first scheduled refresh, which
+              // fires immediately under Schedule.spaced). Wait for the count to stabilize
+              // before sampling so we're not racing those startup fetches.
+              before <- waitForStableCount(counter)
               _      <- verifier.verify(token)
               _      <- verifier.verify(token)
               after  <- counter.get
             yield
-              // The new validator may make a fixed number of bookkeeping fetches at startup
-              // (initial fetch + first scheduled refresh), but verifications themselves
-              // never trigger additional fetches because the JWKS lives in an
-              // AtomicReference. Assert the count is unchanged across two verifications.
+              // Verifications themselves never trigger fetches because the JWKS lives in
+              // an AtomicReference; the count must be unchanged across two verifications.
               assertTrue(after == before)
           }
         ,
