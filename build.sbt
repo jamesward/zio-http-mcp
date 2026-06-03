@@ -29,7 +29,7 @@ libraryDependencies ++= Seq(
   "org.testcontainers" % "testcontainers" % "2.0.5" % Test,
 
   "io.modelcontextprotocol.sdk" % "mcp-core"           % "1.1.3" % Test,
-  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "1.1.2" % Test,
+  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "1.1.3" % Test,
 )
 
 fork := true
