@@ -65,6 +65,12 @@ trait McpToolContext:
   def elicit(message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult]
   /** The authenticated principal for this request, if `.auth(...)` is configured. */
   def principal: Option[Principal] = None
+  /**
+   * Path parameters captured by a parameterised mount (see `McpServer.mountedAtParam`).
+   * Empty for a fixed-path mount. A dynamic source reads e.g. `pathParams("slug")` to
+   * learn which mount the request arrived on.
+   */
+  def pathParams: Map[String, String] = Map.empty
 
 object McpToolContext:
   private val requestIdCounter = new java.util.concurrent.atomic.AtomicInteger(0)
@@ -74,9 +80,11 @@ object McpToolContext:
     pendingRequests: Ref[Map[RequestId, Promise[Nothing, Json]]],
     progressToken: Option[Json],
     callerPrincipal: Option[Principal] = None,
+    callerPathParams: Map[String, String] = Map.empty,
   ): McpToolContext =
     new McpToolContext:
       override val principal: Option[Principal] = callerPrincipal
+      override val pathParams: Map[String, String] = callerPathParams
 
       def log(level: LogLevel, message: String): UIO[Unit] =
         val params = Json.Obj(Chunk(
@@ -140,8 +148,12 @@ object McpToolContext:
 
   private[mcp] val noop: McpToolContext = noopWith(None)
 
-  private[mcp] def noopWith(callerPrincipal: Option[Principal]): McpToolContext = new McpToolContext:
+  private[mcp] def noopWith(
+    callerPrincipal: Option[Principal],
+    callerPathParams: Map[String, String] = Map.empty,
+  ): McpToolContext = new McpToolContext:
     override val principal: Option[Principal] = callerPrincipal
+    override val pathParams: Map[String, String] = callerPathParams
     def log(level: LogLevel, message: String): UIO[Unit] = ZIO.unit
     def progress(current: Double, total: Double, message: Option[String]): UIO[Unit] = ZIO.unit
     def sample(prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =

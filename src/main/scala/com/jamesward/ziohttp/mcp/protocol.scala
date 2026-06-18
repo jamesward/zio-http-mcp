@@ -34,6 +34,9 @@ case class ToolDefinition(
   inputSchema: Json.Obj,
   outputSchema: Option[Json.Obj] = None,
   annotations: Option[ToolAnnotations] = None,
+  // Arbitrary `_meta` carried verbatim. Required for MCP Apps, whose
+  // `_meta.ui.*` (e.g. `ui.resourceUri`) must survive a proxy round-trip.
+  @jsonField("_meta") meta: Option[Json.Obj] = None,
 )
 
 object ToolDefinition:
@@ -122,6 +125,7 @@ case class ResourceDefinition(
   name: String,
   description: Option[String] = None,
   mimeType: Option[String] = None,
+  @jsonField("_meta") meta: Option[Json.Obj] = None,
 )
 
 object ResourceDefinition:
@@ -133,6 +137,7 @@ case class ResourceTemplateDefinition(
   name: String,
   description: Option[String] = None,
   mimeType: Option[String] = None,
+  @jsonField("_meta") meta: Option[Json.Obj] = None,
 )
 
 object ResourceTemplateDefinition:

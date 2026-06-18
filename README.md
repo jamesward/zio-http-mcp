@@ -1,9 +1,9 @@
 zio-http-mcp
 ------------
 
-An MCP (Model Context Protocol) server library for Scala 3, ZIO, and ZIO HTTP.
+An MCP (Model Context Protocol) server and client library for Scala 3, ZIO, and ZIO HTTP.
 
-Implements the [MCP 2025-11-25 specification](https://modelcontextprotocol.io) with Streamable HTTP transport, SSE streaming, tools, resources, prompts, sampling, elicitation, and progress notifications.
+Implements the [MCP 2025-11-25 specification](https://modelcontextprotocol.io) with Streamable HTTP transport, SSE streaming, tools, resources, prompts, sampling, elicitation, and progress notifications. The client supports the Streamable HTTP transport and OAuth 2.1 `client_credentials` authorization.
 
 ## Getting Started
 
@@ -516,3 +516,170 @@ Server.serve(server.routes).provide(
 )
 ```
 
+## Client
+
+The library also ships an MCP **client** for the Streamable HTTP transport. Connect to a server, and the client performs the `initialize` handshake, sends `notifications/initialized`, tracks the `Mcp-Session-Id`, and sends the negotiated `MCP-Protocol-Version` on every subsequent request. Responses are read whether the server replies with `application/json` or streams a `text/event-stream` (SSE).
+
+`McpClient.connect` requires a `Client` and a `Scope`. The connection — including any OAuth token and the server session — lives for the duration of the scope; on scope close the client issues a best-effort `DELETE` to release the session.
+
+```scala
+import com.jamesward.ziohttp.mcp.client.*
+import zio.*
+import zio.http.*
+import zio.json.ast.Json
+
+object Main extends ZIOAppDefault:
+  def run =
+    ZIO.scoped:
+      for
+        client <- McpClient.connect("https://www.javadocs.dev/mcp")
+        _      <- Console.printLine(s"Connected to ${client.serverInfo.name}")
+        tools  <- client.listTools
+        _      <- Console.printLine(s"Tools: ${tools.map(_.name.value).mkString(", ")}")
+        result <- client.callTool("search_artifacts", Json.Obj(Chunk("query" -> Json.Str("zio-http"))))
+        _      <- Console.printLine(result.content.mkString)
+      yield ()
+    .provide(Client.default)
+```
+
+The client exposes the core MCP operations:
+
+| Method | MCP request |
+|--------|-------------|
+| `client.ping` | `ping` |
+| `client.listTools` | `tools/list` |
+| `client.callTool(name, args)` / `client.callTool(name)` | `tools/call` |
+| `client.callTool(name, a)` (typed `a: A` via `Schema`) | `tools/call` |
+| `client.callToolAs[B](name, args)` / `callToolAs[A, B](name, a)` | `tools/call` (result decoded into `B`) |
+| `client.listResources` | `resources/list` |
+| `client.listResourceTemplates` | `resources/templates/list` |
+| `client.readResource(uri)` | `resources/read` |
+| `client.complete(ref, argument)` | `completion/complete` |
+| `client.listPrompts` | `prompts/list` |
+| `client.getPrompt(name, args)` / `client.getPrompt(name)` | `prompts/get` |
+
+Errors surface as a typed `McpClientError`:
+
+| Case | Meaning |
+|------|---------|
+| `Transport` | the HTTP request itself failed (connection, timeout, TLS, IO) |
+| `Protocol` | a Streamable HTTP / JSON-RPC framing violation (bad status, garbled body) |
+| `JsonRpc(code, message, data)` | the server returned a JSON-RPC error object |
+| `Decode` | the `result` payload didn't match the expected type |
+| `Auth` | the OAuth flow failed, or a 401 persisted after refreshing the token |
+| `ToolFailed` | a typed `callToolAs` call ran but the tool reported `isError: true` |
+
+### Typed tool calls
+
+`callTool`/`callToolAs` have `Schema`-based overloads that reuse the same `zio-schema` codecs the server uses to derive a tool's `inputSchema` and `outputSchema`. When you share the input/output types with the server (or model them yourself), a successful encode/decode round-trip *is* the schema-conformance check — there's no separate JSON Schema validation step, because the codec already enforces required fields, types, and structure.
+
+```scala
+import zio.schema.*
+
+case class AddInput(a: Int, b: Int) derives Schema
+case class AddOutput(result: Int) derives Schema
+
+// typed input — encoded with the tool's input Schema
+result <- client.callTool("add", AddInput(5, 3))
+
+// typed output — structuredContent decoded into AddOutput (decode = validation)
+out <- client.callToolAs[AddOutput]("add", Json.Obj(Chunk("a" -> Json.Num(5), "b" -> Json.Num(3))))
+
+// both ends typed
+out <- client.callToolAs[AddInput, AddOutput]("add", AddInput(4, 4))
+```
+
+`callToolAs` decodes the tool's `structuredContent` (falling back to its text content parsed as JSON). It fails with `McpClientError.ToolFailed` if the tool reported `isError`, or `McpClientError.Decode` if the payload doesn't conform to the expected type. The raw `callTool(name, json)` overload stays as the escape hatch for calling tools whose types you don't have locally — there the server remains the authority on argument validation.
+
+Note that decoding validates *shape, types, and required fields*, not JSON-Schema value constraints (`minimum`, `pattern`, an un-modeled `enum`, …); those are enforced server-side.
+
+### OAuth 2.1 (client_credentials)
+
+For servers that require authorization, supply `OAuthClientCredentials`. The client runs the machine-to-machine `client_credentials` flow with automatic discovery per the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization):
+
+1. Probe the MCP endpoint; on `401` read the `resource_metadata` URL from the `WWW-Authenticate` challenge (falling back to the well-known path under the server origin).
+2. Fetch the [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) Protected Resource Metadata to learn the canonical `resource` (audience) and the `authorization_servers`.
+3. Fetch the [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) Authorization Server Metadata (OIDC discovery fallback) to learn the `token_endpoint`.
+4. Request a token with `grant_type=client_credentials` (HTTP Basic client auth), binding it to the resource via the [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) `resource` parameter.
+
+The token is cached and reused until shortly before it expires; a `401` despite a valid-looking token triggers a single refresh-and-retry.
+
+```scala
+import com.jamesward.ziohttp.mcp.*
+import com.jamesward.ziohttp.mcp.client.*
+import zio.*
+import zio.http.*
+
+ZIO.scoped:
+  for
+    client <- McpClient.connect(McpClientConfig(
+                serverUrl = "https://mcp.example.com/mcp",
+                oauth = Some(OAuthClientCredentials(
+                  clientId = "my-client-id",
+                  clientSecret = Config.Secret("my-client-secret"),
+                  scopes = Set("mcp:tools"),
+                )),
+              ))
+    tools  <- client.listTools
+  yield tools
+.provide(Client.default)
+```
+
+Supply `tokenEndpoint` and/or `resource` on `OAuthClientCredentials` to pin those values and skip the corresponding discovery step. v1 supports `client_credentials` only; the spec's `authorization_code` + PKCE flow is future work.
+
+### Static auth headers
+
+For an upstream that authenticates with a pre-shared credential — a fixed bearer token or a custom header — rather than the OAuth flow, connect with `McpClient.streamableHttp` (or set `McpClientConfig.headers`). The supplied headers ride every request:
+
+```scala
+import zio.http.*
+
+ZIO.scoped:
+  for
+    url    <- ZIO.fromEither(URL.decode("https://upstream.example.com/mcp")).orDie
+    client <- McpClient.streamableHttp(url, Headers(Header.Authorization.Bearer("upstream-token")))
+    tools  <- client.listTools
+  yield tools
+.provide(Client.default)
+```
+
+## Dynamic tool & resource sources
+
+Static `.tool(...)` / `.resource(...)` capture a fixed set at construction. A **source** is instead consulted on every request, with the request's `McpToolContext` (the authenticated `ctx.principal` and any mount `ctx.pathParams`) in hand — so it can serve a different, access-scoped set per caller and per mount. This is what lets one server front tools/resources that live elsewhere and change over time (e.g. proxying upstream MCP servers).
+
+```scala
+val toolSource = new McpToolSource[Any]:
+  def listTools(ctx: McpToolContext): ZIO[Any, Nothing, Chunk[ToolDefinition]] =
+    ZIO.succeed(Chunk(ToolDefinition(
+      name = ToolName("echo"),
+      inputSchema = Json.Obj(Chunk("type" -> Json.Str("object"))),
+      // Arbitrary `_meta` is carried verbatim (e.g. MCP Apps `_meta.ui.*`).
+      meta = Some(Json.Obj(Chunk("ui" -> Json.Obj(Chunk("resourceUri" -> Json.Str("ui://echo")))))),
+    )))
+  def callTool(name: ToolName, args: Option[Json.Obj], ctx: McpToolContext): ZIO[Any, Nothing, CallToolResult] =
+    ZIO.succeed(CallToolResult(content = Chunk(ToolContent.text(s"called ${name.value}"))))
+
+val server = McpServer("proxy", "1.0.0").toolSource(toolSource)
+```
+
+Dispatch semantics with a source registered:
+
+- `tools/list` returns the static tools (scope-filtered as usual) **++** `toolSource.listTools(ctx)`; the source's result is assumed already access-scoped.
+- `tools/call` tries the static `.tool(...)` first, then falls through to `toolSource.callTool(...)` (an unknown/forbidden name returns an `isError` result rather than failing the channel).
+- `resources/list`, `resources/templates/list`, and `resources/read` combine static and `resourceSource` (read tries static/template matches first, then the source).
+- `completion/complete` delegates to `resourceSource.complete(...)`.
+
+`McpToolSource` / `McpResourceSource` are contravariant in their environment, like `.tool(...)`; registering one widens the server's `R`. `McpToolSource.empty` / `McpResourceSource.empty` are no-op defaults.
+
+### Parameterised mounts
+
+`mountedAtParam(name)` serves `/<value>` for any single path segment, exposing the captured value to sources as `ctx.pathParams(name)`. One server can then back many logical mounts (e.g. one per tenant/slug), switching behavior on the captured segment:
+
+```scala
+val server = McpServer("multi", "1.0.0")
+  .toolSource(toolSource)        // reads ctx.pathParams("slug")
+  .resourceSource(resourceSource)
+  .mountedAtParam("slug")        // serves /<slug> for any slug
+```
+
+When auth is configured, a parameterised mount derives its resource URI / audience from the host root (not the per-`<value>` path), keeping the audience host-wide. `mountedAt` and `mountedAtParam` are mutually exclusive — the last one called wins.

@@ -1,0 +1,82 @@
+package com.jamesward.ziohttp.mcp
+
+import zio.*
+import zio.json.ast.Json
+
+/**
+ * A dynamic source of tools, queried by [[McpServer]] at request time.
+ *
+ * Unlike a statically registered `.tool(...)`, a source is consulted on every
+ * `tools/list` / `tools/call` with the request's [[McpToolContext]] in hand — so it
+ * can return a different tool set per caller (`ctx.principal`) and per mount
+ * (`ctx.pathParams`, e.g. the `<slug>` of a path-parameterised mount). This is what
+ * lets a single server proxy a set of upstream tools that live elsewhere and change
+ * over time.
+ *
+ * Contravariant in `R` like [[McpToolHandlerR]] / `Routes`, so a source needing
+ * environment `R1` widens the server to `R & R1`.
+ */
+trait McpToolSource[-R]:
+  /**
+   * Tools to merge into `tools/list`, with their names unchanged. The server appends
+   * these to the statically registered tools; the result is assumed already
+   * access-scoped by the source, so the server does not filter it further.
+   *
+   * Returns `Nothing` in the error channel: a source that can't reach its backing data
+   * degrades to an empty (or partial) list rather than failing the whole listing.
+   */
+  def listTools(ctx: McpToolContext): ZIO[R, Nothing, Chunk[ToolDefinition]]
+
+  /**
+   * Handle a `tools/call` for a name not matched by any static `.tool(...)`. The source
+   * resolves and dispatches it. An unknown or forbidden name returns a
+   * [[CallToolResult]] with `isError = true` rather than failing the channel.
+   */
+  def callTool(name: ToolName, args: Option[Json.Obj], ctx: McpToolContext): ZIO[R, Nothing, CallToolResult]
+
+object McpToolSource:
+  /** A source contributing no tools; an unknown name yields an `isError` result. */
+  val empty: McpToolSource[Any] = new McpToolSource[Any]:
+    def listTools(ctx: McpToolContext): ZIO[Any, Nothing, Chunk[ToolDefinition]] =
+      ZIO.succeed(Chunk.empty)
+    def callTool(name: ToolName, args: Option[Json.Obj], ctx: McpToolContext): ZIO[Any, Nothing, CallToolResult] =
+      ZIO.succeed(CallToolResult(
+        content = Chunk(ToolContent.text(s"Unknown tool: ${name.value}")),
+        isError = Some(true),
+      ))
+
+/**
+ * A dynamic source of resources, resource templates, and completions, queried by
+ * [[McpServer]] at request time. The companion to [[McpToolSource]] for the
+ * resources side of the protocol.
+ */
+trait McpResourceSource[-R]:
+  /** Concrete resources to merge into `resources/list`, URIs unchanged. */
+  def listResources(ctx: McpToolContext): ZIO[R, Nothing, Chunk[ResourceDefinition]]
+
+  /** Resource templates to merge into `resources/templates/list`, URIs unchanged. */
+  def listResourceTemplates(ctx: McpToolContext): ZIO[R, Nothing, Chunk[ResourceTemplateDefinition]]
+
+  /**
+   * Read a resource the server's static resources/templates didn't match. A
+   * [[ToolError]] surfaces as a JSON-RPC error (e.g. resource-not-found).
+   */
+  def readResource(uri: String, ctx: McpToolContext): ZIO[R, ToolError, Chunk[ResourceContents]]
+
+  /**
+   * `completion/complete` for a source-provided ref (a resource-template URI or a
+   * prompt). Defaults to no candidates. The server delegates here when its own static
+   * completions have nothing to add.
+   */
+  def complete(ref: CompletionRef, argument: CompletionArgument, ctx: McpToolContext): ZIO[R, Nothing, CompletionResult] =
+    ZIO.succeed(CompletionResult(CompletionValues(values = Chunk.empty)))
+
+object McpResourceSource:
+  /** A source contributing no resources, templates, or completions. */
+  val empty: McpResourceSource[Any] = new McpResourceSource[Any]:
+    def listResources(ctx: McpToolContext): ZIO[Any, Nothing, Chunk[ResourceDefinition]] =
+      ZIO.succeed(Chunk.empty)
+    def listResourceTemplates(ctx: McpToolContext): ZIO[Any, Nothing, Chunk[ResourceTemplateDefinition]] =
+      ZIO.succeed(Chunk.empty)
+    def readResource(uri: String, ctx: McpToolContext): ZIO[Any, ToolError, Chunk[ResourceContents]] =
+      ZIO.fail(ToolError(s"Resource not found: $uri"))

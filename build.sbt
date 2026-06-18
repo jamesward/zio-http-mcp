@@ -38,7 +38,7 @@ javaOptions += "-Djava.net.preferIPv4Stack=true"
 
 licenses := Seq("MIT License" -> url("https://opensource.org/licenses/MIT"))
 
-homepage := Some(url("https://github.com/jamesward/zio-mavencentral"))
+homepage := Some(url("https://github.com/jamesward/zio-http-mcp"))
 
 developers := List(
   Developer(
