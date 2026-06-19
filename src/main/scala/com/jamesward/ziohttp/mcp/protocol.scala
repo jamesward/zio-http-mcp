@@ -61,6 +61,9 @@ case class ServerCapabilities(
   prompts: Option[Json.Obj] = None,
   logging: Option[Json.Obj] = None,
   completions: Option[Json.Obj] = None,
+  // Extension capabilities (SEP-2133), keyed by reverse-domain extension id,
+  // e.g. {"io.modelcontextprotocol/skills": {"directoryRead": true}}.
+  extensions: Option[Json.Obj] = None,
 )
 
 object ServerCapabilities:
@@ -167,6 +170,16 @@ case class ResourceReadParams(uri: String)
 object ResourceReadParams:
   given CanEqual[ResourceReadParams, ResourceReadParams] = CanEqual.derived
   given JsonCodec[ResourceReadParams] = DeriveJsonCodec.gen[ResourceReadParams]
+
+// resources/directory/read (SEP-2640): lists the direct children of a
+// directory resource. The result reuses ResourcesListResult (resources +
+// nextCursor) — children carry ordinary resource metadata; subdirectories
+// are marked with mimeType "inode/directory".
+case class ResourceDirectoryReadParams(uri: String, cursor: Option[String] = None)
+
+object ResourceDirectoryReadParams:
+  given CanEqual[ResourceDirectoryReadParams, ResourceDirectoryReadParams] = CanEqual.derived
+  given JsonCodec[ResourceDirectoryReadParams] = DeriveJsonCodec.gen[ResourceDirectoryReadParams]
 
 case class ResourceReadResult(contents: Chunk[ResourceContents])
 

@@ -129,7 +129,7 @@ object CompletionRefType:
 
 enum McpDispatchMethod:
   case Ping, ToolsList, ToolsCall, ResourcesList, ResourceTemplatesList,
-       ResourcesRead, ResourcesSubscribe, ResourcesUnsubscribe, PromptsList,
+       ResourcesRead, ResourcesDirectoryRead, ResourcesSubscribe, ResourcesUnsubscribe, PromptsList,
        PromptsGet, LoggingSetLevel, CompletionComplete
 
 object McpDispatchMethod:
@@ -142,6 +142,7 @@ object McpDispatchMethod:
     case "resources/list"            => Some(ResourcesList)
     case "resources/templates/list"  => Some(ResourceTemplatesList)
     case "resources/read"            => Some(ResourcesRead)
+    case "resources/directory/read"  => Some(ResourcesDirectoryRead)
     case "resources/subscribe"       => Some(ResourcesSubscribe)
     case "resources/unsubscribe"     => Some(ResourcesUnsubscribe)
     case "prompts/list"              => Some(PromptsList)

@@ -120,12 +120,14 @@ final class McpServer[-R] private (
     prompts.map(p => p.definition.name -> p).toMap
 
   private val serverCapabilities: ServerCapabilities =
+    val extensionMap = resourceSrc.map(_.capabilities).getOrElse(Map.empty)
     ServerCapabilities(
       tools = if tools.nonEmpty || toolSrc.isDefined then Some(Json.Obj()) else None,
       resources = if resources.nonEmpty || resourceTemplates.nonEmpty || resourceSrc.isDefined then Some(Json.Obj(Chunk("subscribe" -> Json.Bool(true)))) else None,
       prompts = if prompts.nonEmpty then Some(Json.Obj()) else None,
       logging = Some(Json.Obj()),
       completions = Some(Json.Obj()),
+      extensions = if extensionMap.nonEmpty then Some(Json.Obj(Chunk.fromIterable(extensionMap.toSeq.map((k, v) => k -> (v: Json))))) else None,
     )
 
   def routes: Routes[R & McpServer.State, Response] =
@@ -315,6 +317,8 @@ final class McpServer[-R] private (
         handleResourceTemplatesList(id, principal, pathParams)
       case McpDispatchMethod.ResourcesRead =>
         handleResourceRead(id, params, principal, pathParams)
+      case McpDispatchMethod.ResourcesDirectoryRead =>
+        handleResourceDirectoryRead(id, params, principal, pathParams)
       case McpDispatchMethod.ResourcesSubscribe =>
         jsonRpcResponse(id, Json.Obj())
       case McpDispatchMethod.ResourcesUnsubscribe =>
@@ -605,6 +609,26 @@ final class McpServer[-R] private (
     val pattern = tmpl.definition.uriTemplate
     val regex = pattern.replaceAll("\\{[^}]+}", "([^/]+)")
     uri.matches(regex)
+
+  private def handleResourceDirectoryRead(
+    id: RequestId,
+    params: Option[Json.Obj],
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Response, Response] =
+    val paramsJson = params.getOrElse(Json.Obj()).toJson
+    ZIO.fromEither(paramsJson.fromJson[ResourceDirectoryReadParams])
+      .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid directory read params: $e"))
+      .flatMap: rp =>
+        resourceSrc match
+          case None =>
+            // Per SEP-2640: an unknown / non-directory URI is InvalidParams.
+            ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Not a directory resource: ${rp.uri}"))
+          case Some(src) =>
+            src.readDirectory(rp.uri, McpToolContext.noopWith(principal, pathParams)).foldZIO(
+              err      => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, err.message)),
+              children => jsonRpcResponse(id, ResourcesListResult(resources = children)),
+            )
 
   private def handlePromptsList(id: RequestId): ZIO[Any, Response, Response] =
     jsonRpcResponse(id, PromptsListResult(prompts = prompts.map(_.definition)))

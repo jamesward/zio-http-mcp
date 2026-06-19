@@ -71,6 +71,25 @@ trait McpResourceSource[-R]:
   def complete(ref: CompletionRef, argument: CompletionArgument, ctx: McpToolContext): ZIO[R, Nothing, CompletionResult] =
     ZIO.succeed(CompletionResult(CompletionValues(values = Chunk.empty)))
 
+  /**
+   * `resources/directory/read` (SEP-2640): the direct children of a directory resource.
+   * Files carry ordinary resource metadata; subdirectories are marked with `mimeType`
+   * `inode/directory`. A [[ToolError]] (unknown URI / not a directory) surfaces as a
+   * JSON-RPC `InvalidParams` error. Defaults to unsupported; override + advertise via
+   * [[capabilities]] to enable.
+   */
+  def readDirectory(uri: String, ctx: McpToolContext): ZIO[R, ToolError, Chunk[ResourceDefinition]] =
+    ZIO.fail(ToolError(s"Directory read not supported: $uri"))
+
+  /**
+   * Extension capabilities this source contributes to the server's `initialize`
+   * response, keyed by reverse-domain extension id. For example, a source that
+   * implements [[readDirectory]] for skills declares
+   * `Map("io.modelcontextprotocol/skills" -> Json.Obj("directoryRead" -> Json.Bool(true)))`.
+   * Defaults to none.
+   */
+  def capabilities: Map[String, zio.json.ast.Json.Obj] = Map.empty
+
 object McpResourceSource:
   /** A source contributing no resources, templates, or completions. */
   val empty: McpResourceSource[Any] = new McpResourceSource[Any]:
