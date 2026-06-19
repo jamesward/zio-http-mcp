@@ -45,7 +45,7 @@ object JavaSdkClientSpec extends ZIOSpecDefault:
         .build()
       val client = McpClient.sync(transport)
         .requestTimeout(JDuration.ofSeconds(10))
-        .clientInfo(JMcpSchema.Implementation("test-client", "1.0.0"))
+        .clientInfo(JMcpSchema.Implementation.builder("test-client", "1.0.0").build())
         .build()
       try
         client.initialize()
@@ -67,7 +67,7 @@ object JavaSdkClientSpec extends ZIOSpecDefault:
             toolList.forall: tool =>
               val schema = tool.outputSchema()
               schema == null || schema.get("type").asInstanceOf[String] == "object",
-            toolList.forall(_.inputSchema().`type`() == "object"),
+            toolList.forall(_.inputSchema().get("type").asInstanceOf[String] == "object"),
           )
       ,
       test("tool call with parameters"):

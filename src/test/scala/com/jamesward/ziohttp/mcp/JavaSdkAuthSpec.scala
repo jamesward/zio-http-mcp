@@ -53,7 +53,7 @@ object JavaSdkAuthSpec extends ZIOSpecDefault:
         .build()
       val client = McpClient.sync(transport)
         .requestTimeout(JDuration.ofSeconds(10))
-        .clientInfo(JMcpSchema.Implementation("zio-http-mcp-test-client", "1.0.0"))
+        .clientInfo(JMcpSchema.Implementation.builder("zio-http-mcp-test-client", "1.0.0").build())
         .build()
       try
         client.initialize()
@@ -69,7 +69,7 @@ object JavaSdkAuthSpec extends ZIOSpecDefault:
         .build()
       val client = McpClient.sync(transport)
         .requestTimeout(JDuration.ofSeconds(10))
-        .clientInfo(JMcpSchema.Implementation("zio-http-mcp-test-client", "1.0.0"))
+        .clientInfo(JMcpSchema.Implementation.builder("zio-http-mcp-test-client", "1.0.0").build())
         .build()
       try
         client.initialize()
