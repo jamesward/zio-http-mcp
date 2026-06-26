@@ -39,6 +39,13 @@ trait McpClient:
   /** The protocol version the server negotiated. */
   def protocolVersion: String
 
+  /**
+   * The optional `instructions` string from the `initialize` result — a server-provided
+   * hint describing how to use the server, which clients may surface to the LLM. `None`
+   * when the server did not send one.
+   */
+  def instructions: Option[String]
+
   /** `ping` — round-trips an empty request to check liveness. */
   def ping: IO[McpClientError, Unit]
 
@@ -408,6 +415,7 @@ object McpClient:
     def serverInfo: Implementation = initResult.serverInfo
     def serverCapabilities: ServerCapabilities = initResult.capabilities
     def protocolVersion: String = initResult.protocolVersion
+    def instructions: Option[String] = initResult.instructions
 
     def ping: IO[McpClientError, Unit] =
       transport.rpc[Json.Obj]("ping", Json.Obj()).unit

@@ -48,6 +48,33 @@ object McpClientSpec extends ZIOSpecDefault:
     .tool(boomTool)
     .resource(configResource)
 
+  val instructedServer = McpServer("instructed-server", "0.1.0")
+    .instructions("Use the add tool to sum two integers.")
+    .tool(addTool)
+
+  // Dynamic provider — supplies instructions per request.
+  val dynamicInstructedServer = McpServer("dyn-server", "0.1.0")
+    .instructions(InstructionsSource(_ => ZIO.succeed(Some("dynamic instructions"))))
+    .tool(addTool)
+
+  // String then source: the source overload wins (mutually exclusive, last one wins).
+  val sourceWinsServer = McpServer("src-wins", "0.1.0")
+    .instructions("static value")
+    .instructions(InstructionsSource.const("source value"))
+    .tool(addTool)
+
+  // Source then String: the static overload wins.
+  val stringWinsServer = McpServer("str-wins", "0.1.0")
+    .instructions(InstructionsSource.const("source value"))
+    .instructions("static value")
+    .tool(addTool)
+
+  // Provider varies by mount: reads the captured `slug` path parameter.
+  val perMountInstructedServer = McpServer("mount-server", "0.1.0")
+    .instructions(InstructionsSource(ctx => ZIO.succeed(ctx.pathParams.get("slug").map(s => s"instructions for $s"))))
+    .tool(addTool)
+    .mountedAtParam("slug")
+
   private def addArgs(a: Int, b: Int): Json.Obj =
     Json.Obj(Chunk("a" -> Json.Num(a), "b" -> Json.Num(b)))
 
@@ -140,6 +167,54 @@ object McpClientSpec extends ZIOSpecDefault:
             // `greet` returns a plain string, which can't decode into AddOutput
             err    <- client.callToolAs[AddOutput]("greet", addArgs(1, 1)).flip
           yield assertTrue(err.isInstanceOf[McpClientError.Decode])
+      ,
+      test("server .instructions(...) round-trips to client.instructions"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(instructedServer.statelessRoutes)
+            client <- McpClient.connect(s"http://localhost:$port/mcp")
+          yield assertTrue(
+            client.instructions.contains("Use the add tool to sum two integers."),
+          )
+      ,
+      test("client.instructions is None when the server sets none"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(testServer.statelessRoutes)
+            client <- McpClient.connect(s"http://localhost:$port/mcp")
+          yield assertTrue(client.instructions.isEmpty)
+      ,
+      test("dynamic InstructionsSource supplies instructions per request"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(dynamicInstructedServer.statelessRoutes)
+            client <- McpClient.connect(s"http://localhost:$port/mcp")
+          yield assertTrue(client.instructions.contains("dynamic instructions"))
+      ,
+      test("instructions: source overload wins when called after a String"):
+        ZIO.scoped:
+          for
+            port    <- Server.install(sourceWinsServer.statelessRoutes)
+            client  <- McpClient.connect(s"http://localhost:$port/mcp")
+          yield assertTrue(client.instructions.contains("source value"))
+      ,
+      test("instructions: String overload wins when called after a source"):
+        ZIO.scoped:
+          for
+            port    <- Server.install(stringWinsServer.statelessRoutes)
+            client  <- McpClient.connect(s"http://localhost:$port/mcp")
+          yield assertTrue(client.instructions.contains("static value"))
+      ,
+      test("InstructionsSource varies by parameterised mount (ctx.pathParams)"):
+        ZIO.scoped:
+          for
+            port    <- Server.install(perMountInstructedServer.statelessRoutes)
+            acme    <- McpClient.connect(s"http://localhost:$port/acme")
+            globex  <- McpClient.connect(s"http://localhost:$port/globex")
+          yield assertTrue(
+            acme.instructions.contains("instructions for acme"),
+            globex.instructions.contains("instructions for globex"),
+          )
       ,
     ).provide(
       Server.defaultWith(_.onAnyOpenPort),

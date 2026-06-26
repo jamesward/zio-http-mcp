@@ -4,6 +4,36 @@ import zio.*
 import zio.json.ast.Json
 
 /**
+ * A dynamic provider of the `initialize` result's `instructions` string, consulted by
+ * [[McpServer]] on every `initialize` with the request's [[McpToolContext]] in hand — so
+ * the instructions can vary per caller (`ctx.principal`) and per mount (`ctx.pathParams`,
+ * e.g. the `<slug>` of a path-parameterised mount).
+ *
+ * Pass one to the [[McpServer.instructions]] overload (the dynamic analogue of passing a
+ * plain `String`). Setting one replaces any static instructions value, and vice versa —
+ * the two are mutually exclusive, last one wins, because `instructions` is a single value
+ * rather than a combinable collection like tools/resources.
+ *
+ * `instructions` runs in the `Nothing` error channel: a provider that can't reach its
+ * backing data should degrade to `None` rather than failing the handshake. Contravariant
+ * in `R`, so a provider needing environment `R1` widens the server to `R & R1`.
+ *
+ * It's a single-abstract-method trait, so a lambda works: `InstructionsSource(ctx => ...)`.
+ */
+trait InstructionsSource[-R]:
+  def instructions(ctx: McpToolContext): URIO[R, Option[String]]
+
+object InstructionsSource:
+  /** Build an [[InstructionsSource]] from a function. */
+  def apply[R](f: McpToolContext => URIO[R, Option[String]]): InstructionsSource[R] =
+    (ctx: McpToolContext) => f(ctx)
+
+  /** A provider that always supplies the same fixed instructions. */
+  def const(text: String): InstructionsSource[Any] =
+    (_: McpToolContext) => ZIO.succeed(Some(text))
+
+
+/**
  * A dynamic source of tools, queried by [[McpServer]] at request time.
  *
  * Unlike a statically registered `.tool(...)`, a source is consulted on every

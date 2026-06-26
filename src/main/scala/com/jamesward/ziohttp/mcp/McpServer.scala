@@ -29,18 +29,20 @@ final class McpServer[-R] private (
   toolSrc: Option[McpToolSource[R]] = None,
   resourceSrc: Option[McpResourceSource[R]] = None,
   pathParamName: Option[String] = None,
+  val instructions: Option[String] = None,
+  instructionsSrc: Option[InstructionsSource[R]] = None,
 ):
   def tool[R1](t: McpToolHandlerR[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName)
+    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
 
   def resource(r: McpResourceHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName)
+    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
 
   def resourceTemplate(rt: McpResourceTemplateHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName)
+    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
 
   def prompt(p: McpPromptHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig, mountPath, toolSrc, resourceSrc, pathParamName)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
 
   /**
    * Register a dynamic [[McpToolSource]] consulted at request time. Its tools are merged
@@ -49,7 +51,7 @@ final class McpServer[-R] private (
    * environment, like [[tool]].
    */
   def toolSource[R1](src: McpToolSource[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, Some(src), resourceSrc, pathParamName)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, Some(src), resourceSrc, pathParamName, instructions, instructionsSrc)
 
   /**
    * Register a dynamic [[McpResourceSource]] consulted at request time. Its resources and
@@ -57,7 +59,7 @@ final class McpServer[-R] private (
    * it when no static resource/template matched, and `completion/complete` delegates to it.
    */
   def resourceSource[R1](src: McpResourceSource[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, Some(src), pathParamName)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, Some(src), pathParamName, instructions, instructionsSrc)
 
   /**
    * Mount the MCP HTTP routes at the given path. Defaults to `/mcp` (matching the
@@ -80,7 +82,7 @@ final class McpServer[-R] private (
    * Mutually exclusive with [[mountedAtParam]]; the last one called wins.
    */
   def mountedAt(path: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, path, toolSrc, resourceSrc, None)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, path, toolSrc, resourceSrc, None, instructions, instructionsSrc)
 
   /**
    * Mount at a single path-parameter segment, so the server serves `/<value>` for any
@@ -95,7 +97,7 @@ final class McpServer[-R] private (
    * Mutually exclusive with [[mountedAt]]; the last one called wins.
    */
   def mountedAtParam(paramName: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, Some(paramName))
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, Some(paramName), instructions, instructionsSrc)
 
   /**
    * Enable opt-in OAuth 2.1 authorization for this server.
@@ -111,7 +113,35 @@ final class McpServer[-R] private (
    * @see [[com.jamesward.ziohttp.mcp.auth.McpAuth]]
    */
   def auth[R1](a: McpAuth[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a), mountPath, toolSrc, resourceSrc, pathParamName)
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a), mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
+
+  /**
+   * Set a static `instructions` string returned in the `initialize` result.
+   *
+   * Per the MCP specification this is a hint to the client (and, transitively, to
+   * the LLM) describing how to use the server and its capabilities — analogous to a
+   * system prompt. Clients may surface it to the model. Unset by default.
+   *
+   * For instructions that vary per caller or per mount, pass an [[InstructionsSource]]
+   * to the overload instead. The two forms are mutually exclusive — calling either
+   * clears the other, last one wins — because `instructions` is a single value rather
+   * than a combinable collection like tools/resources.
+   */
+  def instructions(text: String): McpServer[R] =
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, Some(text), None)
+
+  /**
+   * Set a dynamic [[InstructionsSource]] for the `initialize` result's `instructions`
+   * string, consulted on every `initialize` with the request's [[McpToolContext]] in
+   * hand — so the instructions can vary per caller (`ctx.principal`) and per mount
+   * (`ctx.pathParams`). The dynamic analogue of the `String` overload.
+   *
+   * Mutually exclusive with the static `String` overload (last one wins). Contravariant
+   * in the provider's environment, like [[tool]] / [[toolSource]]: registering one
+   * widens the server's `R`.
+   */
+  def instructions[R1](source: InstructionsSource[R1]): McpServer[R & R1] =
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, None, Some(source))
 
   private val toolsByName: Map[ToolName, McpToolHandlerR[R]] =
     tools.map(t => t.name -> t).toMap
@@ -285,7 +315,7 @@ final class McpServer[-R] private (
                      .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
       response  <- message match
         case JsonRpcMessage.Request(id, "initialize", params) =>
-          parseInitializeParams(id, params).flatMap(r => jsonRpcResponse(id, r))
+          parseInitializeParams(id, params, principal, pathParams).flatMap(r => jsonRpcResponse(id, r))
         case JsonRpcMessage.Request(id, method, params) =>
           McpDispatchMethod.parse(method) match
             case Some(dm) => dispatchMethod(id, dm, params, principal, pathParams, statelessHandleToolsCall(request, _, _, principal, pathParams))
@@ -386,7 +416,7 @@ final class McpServer[-R] private (
   ): ZIO[R, Response, Response] =
     method match
       case "initialize" =>
-        handleInitialize(sessions, id, params)
+        handleInitialize(sessions, id, params, principal, pathParams)
       case _ =>
         McpDispatchMethod.parse(method) match
           case Some(dm) =>
@@ -420,23 +450,43 @@ final class McpServer[-R] private (
   private def parseInitializeParams(
     id: RequestId,
     params: Option[Json.Obj],
-  ): ZIO[Any, Response, InitializeResult] =
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Response, InitializeResult] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
-    ZIO.fromEither(paramsJson.fromJson[InitializeParams])
-      .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid initialize params: $e"))
-      .as:
-        InitializeResult(
-          protocolVersion = McpProtocol.Version,
-          capabilities = serverCapabilities,
-          serverInfo = serverInfo,
-        )
+    for
+      _     <- ZIO.fromEither(paramsJson.fromJson[InitializeParams])
+                 .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid initialize params: $e"))
+      instr <- resolveInstructions(principal, pathParams)
+    yield
+      InitializeResult(
+        protocolVersion = McpProtocol.Version,
+        capabilities = serverCapabilities,
+        serverInfo = serverInfo,
+        instructions = instr,
+      )
+
+  /** Resolve the `initialize` instructions: either the dynamic [[InstructionsSource]]
+    * provider (with the request's principal/pathParams), or the static value — never
+    * both, since the two `instructions` overloads are mutually exclusive. */
+  private def resolveInstructions(
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Nothing, Option[String]] =
+    instructionsSrc match
+      case Some(source) =>
+        source.instructions(McpToolContext.noopWith(principal, pathParams))
+      case None =>
+        ZIO.succeed(instructions)
 
   private def handleInitialize(
     sessions: Ref[Map[SessionId, SessionState]],
     id: RequestId,
     params: Option[Json.Obj],
-  ): ZIO[Any, Response, Response] =
-    parseInitializeParams(id, params).flatMap: result =>
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Response, Response] =
+    parseInitializeParams(id, params, principal, pathParams).flatMap: result =>
       val sessionId = SessionId.generate
       sessions.update(_.updated(sessionId, SessionState.Initializing)) *>
         jsonRpcResponse(id, result).map(_.addHeader("mcp-session-id", sessionId.value))

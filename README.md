@@ -281,6 +281,32 @@ val server = McpServer("my-server", "1.0.0")
 
 The server auto-declares capabilities based on what's registered.
 
+### Instructions
+
+The MCP `initialize` result carries an optional `instructions` string — a hint describing how to use the server and its capabilities, analogous to a system prompt, which clients may surface to the LLM. Set it with `.instructions(...)`:
+
+```scala
+val server = McpServer("my-server", "1.0.0")
+  .instructions("Use the add tool to sum two integers.")
+  .tool(addTool)
+```
+
+It's unset by default. On the client side, `client.instructions` returns the `Option[String]` the server sent (`None` when the server set none).
+
+For instructions that vary per caller or per mount, pass an `InstructionsSource` to the same `.instructions(...)` — the dynamic analogue of the `String` form. It's consulted on every `initialize` with the request's `McpToolContext` (the authenticated `ctx.principal` and any `ctx.pathParams`), and returns `Option[String]`:
+
+```scala
+val server = McpServer("multi", "1.0.0")
+  .instructions(InstructionsSource: ctx =>
+    ZIO.succeed(ctx.pathParams.get("slug").map(slug => s"You are talking to $slug."))
+  )
+  .tool(addTool)
+  .mountedAtParam("slug")
+```
+
+Because `instructions` is a single value rather than a combinable collection like tools/resources, the `String` and `InstructionsSource` forms are **mutually exclusive** — calling either clears the other, last one wins. (This differs from `.tool` / `.toolSource`, which are additive.) `InstructionsSource.const("…")` wraps a fixed string as a source.
+
+
 ### HTTP Endpoints
 
 `server.routes` provides stateful Streamable HTTP with session tracking and SSE:
