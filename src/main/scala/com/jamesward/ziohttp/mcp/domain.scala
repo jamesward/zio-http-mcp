@@ -51,12 +51,28 @@ enum ErrorCode(val code: Int):
   case MethodNotFound    extends ErrorCode(-32601)
   case InvalidParams     extends ErrorCode(-32602)
   case InternalError     extends ErrorCode(-32603)
+  // Resource-not-found. 2025-11-25 used -32002; 2026-07-28 renumbered it to
+  // -32602 (InvalidParams) to align with JSON-RPC. The version-aware response
+  // layer maps this to the right wire code per negotiated version.
   case ResourceNotFound  extends ErrorCode(-32002)
   case Unauthorized      extends ErrorCode(-32001)
   case Forbidden         extends ErrorCode(-32003)
+  // MCP-specification error range (-32020..-32099), introduced in 2026-07-28
+  // (SEP-2575, renumbered under the error-code allocation policy).
+  case HeaderMismatch                  extends ErrorCode(-32020)
+  case MissingRequiredClientCapability extends ErrorCode(-32021)
+  case UnsupportedProtocolVersion      extends ErrorCode(-32022)
 
 object ErrorCode:
   given CanEqual[ErrorCode, ErrorCode] = CanEqual.derived
+
+  /**
+   * The wire code for a resource-not-found error under a given protocol version.
+   * 2026-07-28 renumbered it from `-32002` to `-32602` (Invalid Params); every
+   * other code is stable across the two revisions.
+   */
+  def resourceNotFound(version: ProtocolVersion): Int =
+    if version.isStateless then InvalidParams.code else ResourceNotFound.code
 
 // --- ToolError (business logic failure, maps to isError: true) ---
 
@@ -130,7 +146,9 @@ object CompletionRefType:
 enum McpDispatchMethod:
   case Ping, ToolsList, ToolsCall, ResourcesList, ResourceTemplatesList,
        ResourcesRead, ResourcesDirectoryRead, ResourcesSubscribe, ResourcesUnsubscribe, PromptsList,
-       PromptsGet, LoggingSetLevel, CompletionComplete
+       PromptsGet, LoggingSetLevel, CompletionComplete,
+       // 2026-07-28 additions
+       ServerDiscover, SubscriptionsListen, TasksGet, TasksUpdate, TasksCancel
 
 object McpDispatchMethod:
   given CanEqual[McpDispatchMethod, McpDispatchMethod] = CanEqual.derived
@@ -149,7 +167,27 @@ object McpDispatchMethod:
     case "prompts/get"               => Some(PromptsGet)
     case "logging/setLevel"          => Some(LoggingSetLevel)
     case "completion/complete"       => Some(CompletionComplete)
+    case "server/discover"           => Some(ServerDiscover)
+    case "subscriptions/listen"      => Some(SubscriptionsListen)
+    case "tasks/get"                 => Some(TasksGet)
+    case "tasks/update"              => Some(TasksUpdate)
+    case "tasks/cancel"              => Some(TasksCancel)
     case _                           => None
+
+  /**
+   * Whether a method is available under a given protocol revision. `ping` and
+   * `logging/setLevel` were removed in 2026-07-28 (log level is per-request via
+   * `_meta`); the discover, subscription, and task methods only exist from
+   * 2026-07-28. Everything else is common to both.
+   */
+  def isAvailable(method: McpDispatchMethod, version: ProtocolVersion): Boolean =
+    method match
+      case Ping | LoggingSetLevel | ResourcesSubscribe | ResourcesUnsubscribe =>
+        !version.isStateless
+      case ServerDiscover | SubscriptionsListen | TasksGet | TasksUpdate | TasksCancel =>
+        version.isStateless
+      case _ =>
+        true
 
 // --- McpNotificationMethod ---
 
@@ -167,5 +205,12 @@ object McpNotificationMethod:
 // --- Protocol Constants ---
 
 object McpProtocol:
-  val Version: String = "2025-11-25"
+  /** Default handshake version — the newest revision that still uses the
+    * `initialize` handshake and sessions ([[ProtocolVersion.default]]). Kept as
+    * the value a legacy (`initialize`-based) exchange defaults to. */
+  val Version: String = ProtocolVersion.default.wire
+
+  /** Newest supported revision ([[ProtocolVersion.latest]]). */
+  val LatestVersion: String = ProtocolVersion.latest.wire
+
   val JsonRpcVersion: String = "2.0"

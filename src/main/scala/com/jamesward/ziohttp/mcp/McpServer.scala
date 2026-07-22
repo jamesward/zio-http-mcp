@@ -314,53 +314,140 @@ final class McpServer[-R] private (
       message   <- ZIO.fromEither(bodyJson.toJson.fromJson[JsonRpcMessage])
                      .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
       response  <- message match
-        case JsonRpcMessage.Request(id, "initialize", params) =>
-          parseInitializeParams(id, params, principal, pathParams).flatMap(r => jsonRpcResponse(id, r))
         case JsonRpcMessage.Request(id, method, params) =>
-          McpDispatchMethod.parse(method) match
-            case Some(dm) => dispatchMethod(id, dm, params, principal, pathParams, statelessHandleToolsCall(request, _, _, principal, pathParams))
-            case None     => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
+          negotiateEra(request, Some(id), method, params) match
+            case Left(resp) =>
+              ZIO.succeed(resp)
+            case Right(ProtocolEra.Modern(version)) =>
+              dispatchModern(request, id, method, version, params, principal, pathParams)
+            case Right(ProtocolEra.Legacy) =>
+              method match
+                case "initialize" =>
+                  parseInitializeParams(id, params, principal, pathParams).flatMap(r => jsonRpcResponse(id, r))
+                case _ =>
+                  McpDispatchMethod.parse(method) match
+                    case Some(dm) =>
+                      dispatchMethod(id, dm, ProtocolVersion.default, params, principal, pathParams,
+                        statelessHandleToolsCall(request, ProtocolVersion.default, _, _, principal, pathParams))
+                    case None =>
+                      ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
         case JsonRpcMessage.Notification(method, params) =>
           ZIO.log(s"MCP Notification: $method $params").as(Response.status(Status.Accepted))
     yield response
+
+  /**
+   * Classify a Streamable HTTP request and, for modern requests, validate its
+   * routing headers and resolve the protocol version. Returns the negotiated
+   * [[ProtocolEra]], or a ready-made `400 Bad Request` response on a modern
+   * header/version failure.
+   */
+  private def negotiateEra(
+    request: Request,
+    id: Option[RequestId],
+    method: String,
+    params: Option[Json.Obj],
+  ): Either[Response, ProtocolEra] =
+    val protoHeader = request.rawHeader(Negotiation.ProtocolVersionHeader)
+    if Negotiation.isModernRequest(method, params, protoHeader) then
+      val methodHeader = request.rawHeader(Negotiation.MethodHeader)
+      val nameHeader   = request.rawHeader(Negotiation.NameHeader)
+      Negotiation.resolveModern(method, params, protoHeader, methodHeader, nameHeader) match
+        case Left(err)      => Left(negotiationErrorResponse(id, err))
+        case Right(version) => Right(ProtocolEra.Modern(version))
+    else
+      Right(ProtocolEra.Legacy)
+
+  /**
+   * Dispatch a modern (2026-07-28+) request statelessly: no session, no
+   * `initialize`. Unknown methods yield `404 Not Found` with `-32601`; tool
+   * calls are answered with a single augmented JSON result.
+   */
+  private def dispatchModern(
+    request: Request,
+    id: RequestId,
+    method: String,
+    version: ProtocolVersion,
+    params: Option[Json.Obj],
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Response, Response] =
+    McpDispatchMethod.parse(method) match
+      case Some(dm) =>
+        dispatchMethod(id, dm, version, params, principal, pathParams,
+          statelessHandleToolsCall(request, version, _, _, principal, pathParams))
+      case None =>
+        ZIO.fail(methodNotFoundResponse(id, version, method))
 
   // --- Shared method dispatch (used by both stateful and stateless) ---
 
   private def dispatchMethod[R1 <: R](
     id: RequestId,
     method: McpDispatchMethod,
+    version: ProtocolVersion,
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
     onToolsCall: (RequestId, Option[Json.Obj]) => ZIO[R1, Response, Response],
   ): ZIO[R1, Response, Response] =
-    method match
+    if !McpDispatchMethod.isAvailable(method, version) then
+      // e.g. `ping`/`logging/setLevel` on a modern request, or a modern-only
+      // method on a legacy request: the method does not exist in this revision.
+      ZIO.fail(methodNotFoundResponse(id, version, method.toString))
+    else method match
       case McpDispatchMethod.Ping =>
         jsonRpcResponse(id, Json.Obj())
+      case McpDispatchMethod.ServerDiscover =>
+        handleServerDiscover(id, principal, pathParams)
       case McpDispatchMethod.ToolsList =>
-        handleToolsList(id, params, principal, pathParams)
+        handleToolsList(id, version, params, principal, pathParams)
       case McpDispatchMethod.ToolsCall =>
         onToolsCall(id, params)
       case McpDispatchMethod.ResourcesList =>
-        handleResourcesList(id, principal, pathParams)
+        handleResourcesList(id, version, principal, pathParams)
       case McpDispatchMethod.ResourceTemplatesList =>
-        handleResourceTemplatesList(id, principal, pathParams)
+        handleResourceTemplatesList(id, version, principal, pathParams)
       case McpDispatchMethod.ResourcesRead =>
-        handleResourceRead(id, params, principal, pathParams)
+        handleResourceRead(id, version, params, principal, pathParams)
       case McpDispatchMethod.ResourcesDirectoryRead =>
-        handleResourceDirectoryRead(id, params, principal, pathParams)
+        handleResourceDirectoryRead(id, version, params, principal, pathParams)
       case McpDispatchMethod.ResourcesSubscribe =>
         jsonRpcResponse(id, Json.Obj())
       case McpDispatchMethod.ResourcesUnsubscribe =>
         jsonRpcResponse(id, Json.Obj())
       case McpDispatchMethod.PromptsList =>
-        handlePromptsList(id)
+        handlePromptsList(id, version)
       case McpDispatchMethod.PromptsGet =>
-        handlePromptsGet(id, params)
+        handlePromptsGet(id, version, params)
       case McpDispatchMethod.LoggingSetLevel =>
         jsonRpcResponse(id, Json.Obj())
       case McpDispatchMethod.CompletionComplete =>
-        handleCompletionComplete(id, params, principal, pathParams)
+        handleCompletionComplete(id, version, params, principal, pathParams)
+      case McpDispatchMethod.SubscriptionsListen =>
+        handleSubscriptionsListen(id, version, params)
+      case McpDispatchMethod.TasksGet | McpDispatchMethod.TasksUpdate | McpDispatchMethod.TasksCancel =>
+        // The Tasks extension is advertised but not yet implemented; report it
+        // as an unsupported capability rather than a hard method-not-found.
+        ZIO.fail(jsonRpcErrorResponseWith(
+          Some(id), ErrorCode.MissingRequiredClientCapability,
+          "Tasks extension is not supported by this server", Status.Ok))
+
+  /**
+   * `server/discover` (2026-07-28): advertise supported protocol versions,
+   * capabilities, and identity in one round-trip. Servers MUST implement this.
+   */
+  private def handleServerDiscover(
+    id: RequestId,
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Response, Response] =
+    resolveInstructions(principal, pathParams).map: instr =>
+      val result = DiscoverResult(
+        supportedVersions = ProtocolVersion.supportedWire,
+        capabilities = serverCapabilities,
+        serverInfo = serverInfo,
+        instructions = instr,
+      )
+      rawResultResponse(id, result.toResultJson)
 
   private def routeMessage(
     request: Request,
@@ -414,16 +501,25 @@ final class McpServer[-R] private (
     principal: Option[Principal],
     pathParams: Map[String, String],
   ): ZIO[R, Response, Response] =
-    method match
-      case "initialize" =>
-        handleInitialize(sessions, id, params, principal, pathParams)
-      case _ =>
-        McpDispatchMethod.parse(method) match
-          case Some(dm) =>
-            withSession(request, sessions):
-              dispatchMethod(id, dm, params, principal, pathParams, handleToolsCall(request, _, _, pendingReqs, principal, pathParams))
-          case None =>
-            ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
+    negotiateEra(request, Some(id), method, params) match
+      // A modern request is served statelessly on the same endpoint — no
+      // session lookup, no `initialize`. This is what makes the server dual-era.
+      case Left(resp) =>
+        ZIO.succeed(resp)
+      case Right(ProtocolEra.Modern(version)) =>
+        dispatchModern(request, id, method, version, params, principal, pathParams)
+      case Right(ProtocolEra.Legacy) =>
+        method match
+          case "initialize" =>
+            handleInitialize(sessions, id, params, principal, pathParams)
+          case _ =>
+            McpDispatchMethod.parse(method) match
+              case Some(dm) =>
+                withSession(request, sessions):
+                  dispatchMethod(id, dm, ProtocolVersion.default, params, principal, pathParams,
+                    handleToolsCall(request, _, _, pendingReqs, principal, pathParams))
+              case None =>
+                ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
 
   private def handleNotification(
     request: Request,
@@ -493,6 +589,7 @@ final class McpServer[-R] private (
 
   private def handleToolsList(
     id: RequestId,
+    version: ProtocolVersion,
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
@@ -521,7 +618,7 @@ final class McpServer[-R] private (
     val ctx = McpToolContext.noopWith(principal, pathParams)
     val dynamic = toolSrc.fold[ZIO[R, Nothing, Chunk[ToolDefinition]]](ZIO.succeed(Chunk.empty))(_.listTools(ctx))
     dynamic.flatMap: extra =>
-      jsonRpcResponse(id, ToolsListResult(tools = visible.map(_.definition) ++ extra))
+      resultResponse(id, version, ToolsListResult(tools = visible.map(_.definition) ++ extra), cacheable = true)
 
   private def parseToolCallParams(
     id: RequestId,
@@ -536,6 +633,7 @@ final class McpServer[-R] private (
     * the source returns the result (an `isError` result for unknown/forbidden names). */
   private def dispatchToSource(
     id: RequestId,
+    version: ProtocolVersion,
     callParams: ToolCallParams,
     principal: Option[Principal],
     pathParams: Map[String, String],
@@ -543,7 +641,7 @@ final class McpServer[-R] private (
     toolSrc match
       case Some(src) =>
         src.callTool(callParams.name, callParams.arguments, McpToolContext.noopWith(principal, pathParams))
-          .flatMap(result => jsonRpcResponse(id, result))
+          .flatMap(result => resultResponse(id, version, result))
       case None =>
         ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Unknown tool: ${callParams.name.value}"))
 
@@ -558,7 +656,7 @@ final class McpServer[-R] private (
     parseToolCallParams(id, params).flatMap: callParams =>
       toolsByName.get(callParams.name) match
         case None =>
-          dispatchToSource(id, callParams, principal, pathParams)
+          dispatchToSource(id, ProtocolVersion.default, callParams, principal, pathParams)
         case Some(tool) =>
           enforceToolScopes(request, principal, tool) *> {
             val progressToken = params.flatMap(_.get("_meta")).flatMap(_.asObject).flatMap(_.get("progressToken"))
@@ -583,6 +681,7 @@ final class McpServer[-R] private (
 
   private def statelessHandleToolsCall(
     request: Request,
+    version: ProtocolVersion,
     id: RequestId,
     params: Option[Json.Obj],
     principal: Option[Principal],
@@ -591,7 +690,7 @@ final class McpServer[-R] private (
     parseToolCallParams(id, params).flatMap: callParams =>
       toolsByName.get(callParams.name) match
         case None =>
-          dispatchToSource(id, callParams, principal, pathParams)
+          dispatchToSource(id, version, callParams, principal, pathParams)
         case Some(tool) =>
           enforceToolScopes(request, principal, tool) *>
             tool.callWithContext(callParams.arguments, McpToolContext.noopWith(principal, pathParams))
@@ -600,30 +699,39 @@ final class McpServer[-R] private (
                   content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
                   isError = Some(true),
                 ))
-              .flatMap(result => jsonRpcResponse(id, result))
+              .flatMap(result => resultResponse(id, version, result))
 
   private def handleResourcesList(
     id: RequestId,
+    version: ProtocolVersion,
     principal: Option[Principal],
     pathParams: Map[String, String],
   ): ZIO[R, Response, Response] =
     val ctx = McpToolContext.noopWith(principal, pathParams)
     val dynamic = resourceSrc.fold[ZIO[R, Nothing, Chunk[ResourceDefinition]]](ZIO.succeed(Chunk.empty))(_.listResources(ctx))
     dynamic.flatMap: extra =>
-      jsonRpcResponse(id, ResourcesListResult(resources = resources.map(_.definition) ++ extra))
+      resultResponse(id, version, ResourcesListResult(resources = resources.map(_.definition) ++ extra), cacheable = true)
 
   private def handleResourceTemplatesList(
     id: RequestId,
+    version: ProtocolVersion,
     principal: Option[Principal],
     pathParams: Map[String, String],
   ): ZIO[R, Response, Response] =
     val ctx = McpToolContext.noopWith(principal, pathParams)
     val dynamic = resourceSrc.fold[ZIO[R, Nothing, Chunk[ResourceTemplateDefinition]]](ZIO.succeed(Chunk.empty))(_.listResourceTemplates(ctx))
     dynamic.flatMap: extra =>
-      jsonRpcResponse(id, ResourceTemplatesListResult(resourceTemplates = resourceTemplates.map(_.definition) ++ extra))
+      resultResponse(id, version, ResourceTemplatesListResult(resourceTemplates = resourceTemplates.map(_.definition) ++ extra), cacheable = true)
+
+  /** Resource-not-found error, using the code appropriate to the negotiated
+    * version (`-32002` legacy, `-32602` modern). */
+  private def resourceNotFoundResponse(id: RequestId, version: ProtocolVersion, message: String): Response =
+    val code = ErrorCode.resourceNotFound(version)
+    Response.json(JsonRpcError(Some(id), ErrorDetail(code, message)).toJson)
 
   private def handleResourceRead(
     id: RequestId,
+    version: ProtocolVersion,
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
@@ -642,17 +750,17 @@ final class McpServer[-R] private (
           case Some(readFn) =>
             readFn(uri).foldZIO(
               err => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, err.message)),
-              contents => jsonRpcResponse(id, ResourceReadResult(contents = contents)),
+              contents => resultResponse(id, version, ResourceReadResult(contents = contents), cacheable = true),
             )
           case None =>
             // No static resource/template matched — fall through to the dynamic source.
             resourceSrc match
               case None =>
-                ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.ResourceNotFound, s"Resource not found: $uri"))
+                ZIO.fail(resourceNotFoundResponse(id, version, s"Resource not found: $uri"))
               case Some(src) =>
                 src.readResource(uri, McpToolContext.noopWith(principal, pathParams)).foldZIO(
-                  err => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.ResourceNotFound, err.message)),
-                  contents => jsonRpcResponse(id, ResourceReadResult(contents = contents)),
+                  err => ZIO.fail(resourceNotFoundResponse(id, version, err.message)),
+                  contents => resultResponse(id, version, ResourceReadResult(contents = contents), cacheable = true),
                 )
 
   private def matchesTemplate(tmpl: McpResourceTemplateHandler, uri: String): Boolean =
@@ -662,6 +770,7 @@ final class McpServer[-R] private (
 
   private def handleResourceDirectoryRead(
     id: RequestId,
+    version: ProtocolVersion,
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
@@ -677,13 +786,13 @@ final class McpServer[-R] private (
           case Some(src) =>
             src.readDirectory(rp.uri, McpToolContext.noopWith(principal, pathParams)).foldZIO(
               err      => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, err.message)),
-              children => jsonRpcResponse(id, ResourcesListResult(resources = children)),
+              children => resultResponse(id, version, ResourcesListResult(resources = children), cacheable = true),
             )
 
-  private def handlePromptsList(id: RequestId): ZIO[Any, Response, Response] =
-    jsonRpcResponse(id, PromptsListResult(prompts = prompts.map(_.definition)))
+  private def handlePromptsList(id: RequestId, version: ProtocolVersion): ZIO[Any, Response, Response] =
+    resultResponse(id, version, PromptsListResult(prompts = prompts.map(_.definition)), cacheable = true)
 
-  private def handlePromptsGet(id: RequestId, params: Option[Json.Obj]): ZIO[Any, Response, Response] =
+  private def handlePromptsGet(id: RequestId, version: ProtocolVersion, params: Option[Json.Obj]): ZIO[Any, Response, Response] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
     ZIO.fromEither(paramsJson.fromJson[PromptGetParams])
       .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid prompt get params: $e"))
@@ -694,25 +803,53 @@ final class McpServer[-R] private (
           case Some(prompt) =>
             prompt.get(getParams.arguments.getOrElse(Map.empty)).foldZIO(
               err => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, err.message)),
-              result => jsonRpcResponse(id, result),
+              result => resultResponse(id, version, result),
             )
 
   private def handleCompletionComplete(
     id: RequestId,
+    version: ProtocolVersion,
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
   ): ZIO[R, Response, Response] =
     resourceSrc match
       case None =>
-        jsonRpcResponse(id, CompletionResult(completion = CompletionValues(values = Chunk.empty)))
+        resultResponse(id, version, CompletionResult(completion = CompletionValues(values = Chunk.empty)))
       case Some(src) =>
         val paramsJson = params.getOrElse(Json.Obj()).toJson
         ZIO.fromEither(paramsJson.fromJson[CompletionCompleteParams])
           .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid completion params: $e"))
           .flatMap: cp =>
             src.complete(cp.ref, cp.argument, McpToolContext.noopWith(principal, pathParams))
-              .flatMap(result => jsonRpcResponse(id, result))
+              .flatMap(result => resultResponse(id, version, result))
+
+  /**
+   * `subscriptions/listen` (2026-07-28): a single long-lived SSE stream carrying
+   * the change-notification types the client opts into. This server currently
+   * emits no change notifications, so the stream acknowledges the subscription
+   * and stays open with keep-alives until the client disconnects.
+   */
+  private def handleSubscriptionsListen(
+    id: RequestId,
+    version: ProtocolVersion,
+    params: Option[Json.Obj],
+  ): ZIO[Any, Response, Response] =
+    val subscriptionId = SessionId.generate.value
+    val ackParams = Json.Obj(Chunk(
+      McpMeta.SubscriptionId -> Json.Str(subscriptionId),
+    ))
+    val ack = (JsonRpcMessage.Notification("notifications/subscriptions/acknowledged", Some(ackParams)): JsonRpcMessage).toJson
+    val ackEvent = ZStream.succeed(sseEvent(ack))
+    val keepalive = ZStream.tick(30.seconds).as(":\n\n")
+    ZIO.succeed(Response(
+      status = Status.Ok,
+      headers = Headers(
+        Header.ContentType(MediaType.text.`event-stream`),
+        Header.CacheControl.NoCache,
+      ),
+      body = Body.fromCharSequenceStreamChunked(ackEvent ++ keepalive),
+    ))
 
   private def withSession[R0](request: Request, sessions: Ref[Map[SessionId, SessionState]])(
     effect: ZIO[R0, Response, Response]
@@ -799,9 +936,66 @@ final class McpServer[-R] private (
       .mapError(e => jsonRpcErrorResponse(None, ErrorCode.InternalError, s"JSON encoding failed: $e"))
       .map(json => Response.json(JsonRpcResponse(id, json).toJson))
 
+  /**
+   * Version-aware result response. For a legacy version the result JSON is sent
+   * verbatim (byte-for-byte the same as [[jsonRpcResponse]]); for a modern
+   * (2026-07-28+) version it is wrapped in the modern envelope — `resultType`,
+   * `_meta.serverInfo`, and, for cacheable methods, `ttlMs` / `cacheScope`.
+   */
+  private def resultResponse[A: JsonEncoder](
+    id: RequestId,
+    version: ProtocolVersion,
+    result: A,
+    cacheable: Boolean = false,
+  ): ZIO[Any, Response, Response] =
+    ZIO.fromEither(result.toJsonAST)
+      .mapError(e => jsonRpcErrorResponse(None, ErrorCode.InternalError, s"JSON encoding failed: $e"))
+      .map: json =>
+        val obj = json.asObject.getOrElse(Json.Obj())
+        val finalObj =
+          if version.isStateless then ModernEnvelope.complete(obj, serverInfo, cacheable) else obj
+        Response.json(JsonRpcResponse(id, finalObj).toJson)
+
+  /** Response for a raw already-built result object (used by `server/discover`,
+    * whose result carries its own `_meta`/`resultType`). */
+  private def rawResultResponse(id: RequestId, resultObj: Json.Obj): Response =
+    Response.json(JsonRpcResponse(id, resultObj).toJson)
+
   private def jsonRpcErrorResponse(id: Option[RequestId], code: ErrorCode, message: String): Response =
     val e = JsonRpcError.fromCode(id, code, message)
     Response.json(e.toJson)
+
+  /** A JSON-RPC error carrying explicit `data`, at a specified HTTP status. */
+  private def jsonRpcErrorResponseWith(
+    id: Option[RequestId],
+    code: ErrorCode,
+    message: String,
+    status: Status,
+    data: Option[Json] = None,
+  ): Response =
+    val e = JsonRpcError(id, ErrorDetail(code.code, message, data))
+    Response.json(e.toJson).status(status)
+
+  /** Map a [[NegotiationError]] onto its HTTP response: `400` with a specific
+    * JSON-RPC error code (`-32020` header mismatch, `-32022` unsupported version). */
+  private def negotiationErrorResponse(id: Option[RequestId], err: NegotiationError): Response =
+    err match
+      case NegotiationError.HeaderMismatch(message) =>
+        jsonRpcErrorResponseWith(id, ErrorCode.HeaderMismatch, message, Status.BadRequest)
+      case NegotiationError.UnsupportedVersion(requested) =>
+        jsonRpcErrorResponseWith(
+          id,
+          ErrorCode.UnsupportedProtocolVersion,
+          "Unsupported protocol version",
+          Status.BadRequest,
+          Some(Negotiation.unsupportedVersionData(requested)),
+        )
+
+  /** Method-not-found response. Modern requests get HTTP `404` (per the
+    * Streamable HTTP spec); legacy requests keep the JSON-RPC-only `200`. */
+  private def methodNotFoundResponse(id: RequestId, version: ProtocolVersion, method: String): Response =
+    val base = jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method")
+    if version.isStateless then base.status(Status.NotFound) else base
 
   private def badRequest(message: String): Response =
     Response.json(
