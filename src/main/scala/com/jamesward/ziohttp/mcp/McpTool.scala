@@ -185,11 +185,17 @@ final class McpTool private (
                 isError = Some(true),
               ),
               output => mcpOutput.toResult(output),
-            ).catchAllDefect: defect =>
-              ZIO.succeed(CallToolResult(
-                content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
-                isError = Some(true),
-              ))
+            ).catchAllDefect:
+              // A modern (MRTR) input request is not a failure — let it
+              // propagate so the dispatcher can turn it into an
+              // InputRequiredResult and re-run the handler on the retry.
+              case signal: McpToolContext.InputRequiredSignal =>
+                ZIO.die(signal)
+              case defect =>
+                ZIO.succeed(CallToolResult(
+                  content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
+                  isError = Some(true),
+                ))
 
   // No error
   def handleWithContext[R, In: McpInput, Out: McpOutput](f: (In, McpToolContext) => ZIO[R, Nothing, Out]): McpToolHandlerR[R] =

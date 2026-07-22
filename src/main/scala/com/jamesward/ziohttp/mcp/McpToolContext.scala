@@ -146,6 +146,78 @@ object McpToolContext:
           _       <- pendingRequests.update(_ - reqId)
         yield result
 
+  /**
+   * Defect raised by a modern (2026-07-28) tool context when the handler needs
+   * input the client has not yet supplied. The dispatcher catches it and turns
+   * it into an [[InputRequiredResult]] (Multi Round-Trip Requests). The tool is
+   * re-executed on the client's retry with the answer available, so handlers
+   * must be safe to replay up to the point of each input request.
+   */
+  private[mcp] final case class InputRequiredSignal(request: InputRequest)
+    extends RuntimeException(s"MCP input required: ${request.method}")
+
+  /**
+   * A modern tool context. Server-initiated interactions do not stream as
+   * JSON-RPC requests; instead each `sample` / `elicit` call is answered from
+   * the `inputResponses` the client sent on its retry (matched by call order),
+   * or — when no answer is available yet — aborts the handler with an
+   * [[InputRequiredSignal]] so the server can ask for it via MRTR.
+   *
+   * `log` / `progress` are no-ops here: a modern tool call answered with a
+   * single JSON result carries no notification stream.
+   */
+  private[mcp] def modern(
+    inputResponses: Chunk[InputResponse],
+    callerPrincipal: Option[Principal] = None,
+    callerPathParams: Map[String, String] = Map.empty,
+  ): McpToolContext =
+    new McpToolContext:
+      private val counter = new java.util.concurrent.atomic.AtomicInteger(0)
+
+      override val principal: Option[Principal] = callerPrincipal
+      override val pathParams: Map[String, String] = callerPathParams
+
+      def log(level: LogLevel, message: String): UIO[Unit] = ZIO.unit
+      def progress(current: Double, total: Double, message: Option[String]): UIO[Unit] = ZIO.unit
+
+      def sample(prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
+        val params = Json.Obj(Chunk(
+          "messages" -> Json.Arr(Chunk(Json.Obj(Chunk(
+            "role" -> Json.Str("user"),
+            "content" -> Json.Obj(Chunk("type" -> Json.Str("text"), "text" -> Json.Str(prompt))),
+          )))),
+          "maxTokens" -> Json.Num(maxTokens),
+        ))
+        nextInput("sampling/createMessage", params).map: responseJson =>
+          val role = responseJson.asObject.flatMap(_.get("role")).flatMap(_.asString).getOrElse("assistant")
+          val model = responseJson.asObject.flatMap(_.get("model")).flatMap(_.asString).getOrElse("unknown")
+          val stopReason = responseJson.asObject.flatMap(_.get("stopReason")).flatMap(_.asString)
+          val content = responseJson.asObject.flatMap(_.get("content")) match
+            case Some(c) => c.as[ToolContent].toOption.getOrElse(ToolContent.text(""))
+            case None    => ToolContent.text("")
+          SamplingResult(role, content, model, stopReason)
+
+      def elicit(message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult] =
+        val params = Json.Obj(Chunk(
+          "message" -> Json.Str(message),
+          "requestedSchema" -> (schema: Json),
+        ))
+        nextInput("elicitation/create", params).map: responseJson =>
+          val action = responseJson.asObject.flatMap(_.get("action")).flatMap(_.asString).getOrElse("decline")
+          val content = responseJson.asObject.flatMap(_.get("content")).flatMap(_.asObject).map: obj =>
+            obj.fields.map((k, v) => k -> v).toMap
+          ElicitationResult(action, content)
+
+      /** Answer the next input request from the replayed responses, or abort
+        * with an [[InputRequiredSignal]] when the client has not provided it. */
+      private def nextInput(method: String, params: Json.Obj): ZIO[Any, ToolError, Json] =
+        val idx = counter.getAndIncrement()
+        val correlationId = s"input-$idx"
+        if idx < inputResponses.length then
+          ZIO.succeed(inputResponses(idx).result)
+        else
+          ZIO.die(InputRequiredSignal(InputRequest(correlationId, method, params)))
+
   private[mcp] val noop: McpToolContext = noopWith(None)
 
   private[mcp] def noopWith(

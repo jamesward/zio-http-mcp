@@ -335,4 +335,92 @@ object NegotiationSpec extends ZIOSpecDefault:
   ).provide(Server.defaultWith(_.onAnyOpenPort), Client.default, Scope.default, McpServer.State.default) @@
     withLiveClock @@ timeout(1.minute) @@ sequential
 
-  override def spec = suite("NegotiationSpec")(unitSuite, httpSuite)
+  // --- MRTR (Multi Round-Trip Requests) ---
+
+  val sampleTool: McpToolHandler = McpTool("summarize")
+    .description("Summarizes via sampling")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.sample("Summarize this", 100).map: result =>
+        val text = result.content match
+          case ToolContent.Text(t, _) => t
+          case _                       => ""
+        Chunk(ToolContent.text(s"summary: $text"))
+
+  val elicitTool: McpToolHandler = McpTool("ask_name")
+    .description("Asks the user for a name")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.elicit("What is your name?", Json.Obj("type" -> Json.Str("object"))).map: result =>
+        val name = result.content.flatMap(_.get("name")).flatMap(_.asString).getOrElse("?")
+        Chunk(ToolContent.text(s"hello $name (${result.action})"))
+
+  val mrtrServer = McpServer("mrtr-server", "1.0.0")
+    .tool(sampleTool)
+    .tool(elicitTool)
+
+  private val mrtrSuite = suite("MRTR (modern server-to-client input)")(
+
+    test("sampling tool first returns input_required, then completes on retry"):
+      val call1 = modernBody(1, "tools/call", Chunk("name" -> Json.Str("summarize"), "arguments" -> Json.Obj()))
+      for
+        port <- Server.install(mrtrServer.routes)
+        r1   <- postModern(port, call1, "tools/call", name = Some("summarize"))
+        b1   <- bodyJson(r1)
+        // Build the retry: echo back the requested input with a sampled message.
+        req   = resultOf(b1).flatMap(_.get("inputRequests")).flatMap(_.asArray).flatMap(_.headOption).flatMap(_.asObject)
+        reqId = req.flatMap(_.get("id")).flatMap(_.asString).getOrElse("")
+        sampled = Json.Obj(
+                    "role" -> Json.Str("assistant"),
+                    "model" -> Json.Str("test-model"),
+                    "content" -> Json.Obj("type" -> Json.Str("text"), "text" -> Json.Str("it is short")),
+                  )
+        inputResponses = Json.Arr(Json.Obj("id" -> Json.Str(reqId), "result" -> (sampled: Json)))
+        call2 = modernBody(2, "tools/call", Chunk(
+                  "name" -> Json.Str("summarize"),
+                  "arguments" -> Json.Obj(),
+                  "inputResponses" -> inputResponses,
+                ))
+        r2   <- postModern(port, call2, "tools/call", name = Some("summarize"))
+        b2   <- bodyJson(r2)
+      yield
+        val text = resultOf(b2).flatMap(_.get("content")).flatMap(_.asArray).flatMap(_.headOption)
+          .flatMap(_.asObject).flatMap(_.get("text")).flatMap(_.asString)
+        assertTrue(
+          r1.status == Status.Ok,
+          resultOf(b1).flatMap(_.get("resultType")).flatMap(_.asString).contains("input_required"),
+          req.flatMap(_.get("method")).flatMap(_.asString).contains("sampling/createMessage"),
+          reqId.nonEmpty,
+          resultOf(b2).flatMap(_.get("resultType")).flatMap(_.asString).contains("complete"),
+          text.contains("summary: it is short"),
+        )
+    ,
+
+    test("elicitation tool round-trips via input_required"):
+      val call1 = modernBody(1, "tools/call", Chunk("name" -> Json.Str("ask_name"), "arguments" -> Json.Obj()))
+      for
+        port <- Server.install(mrtrServer.routes)
+        r1   <- postModern(port, call1, "tools/call", name = Some("ask_name"))
+        b1   <- bodyJson(r1)
+        req   = resultOf(b1).flatMap(_.get("inputRequests")).flatMap(_.asArray).flatMap(_.headOption).flatMap(_.asObject)
+        reqId = req.flatMap(_.get("id")).flatMap(_.asString).getOrElse("")
+        elicited = Json.Obj("action" -> Json.Str("accept"), "content" -> Json.Obj("name" -> Json.Str("Ada")))
+        inputResponses = Json.Arr(Json.Obj("id" -> Json.Str(reqId), "result" -> (elicited: Json)))
+        call2 = modernBody(2, "tools/call", Chunk(
+                  "name" -> Json.Str("ask_name"),
+                  "arguments" -> Json.Obj(),
+                  "inputResponses" -> inputResponses,
+                ))
+        r2   <- postModern(port, call2, "tools/call", name = Some("ask_name"))
+        b2   <- bodyJson(r2)
+      yield
+        val text = resultOf(b2).flatMap(_.get("content")).flatMap(_.asArray).flatMap(_.headOption)
+          .flatMap(_.asObject).flatMap(_.get("text")).flatMap(_.asString)
+        assertTrue(
+          req.flatMap(_.get("method")).flatMap(_.asString).contains("elicitation/create"),
+          text.contains("hello Ada (accept)"),
+        )
+    ,
+
+  ).provide(Server.defaultWith(_.onAnyOpenPort), Client.default, Scope.default, McpServer.State.default) @@
+    withLiveClock @@ timeout(1.minute) @@ sequential
+
+  override def spec = suite("NegotiationSpec")(unitSuite, httpSuite, mrtrSuite)

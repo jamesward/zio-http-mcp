@@ -374,9 +374,53 @@ final class McpServer[-R] private (
     McpDispatchMethod.parse(method) match
       case Some(dm) =>
         dispatchMethod(id, dm, version, params, principal, pathParams,
-          statelessHandleToolsCall(request, version, _, _, principal, pathParams))
+          modernHandleToolsCall(request, version, _, _, principal, pathParams))
       case None =>
         ZIO.fail(methodNotFoundResponse(id, version, method))
+
+  /**
+   * Modern (2026-07-28) `tools/call`. The tool runs against a
+   * [[McpToolContext.modern]] context: any `sample` / `elicit` the handler
+   * performs is answered from the `inputResponses` the client sent on its retry,
+   * or — when an answer is not yet available — the handler aborts and the server
+   * returns an [[InputRequiredResult]] (Multi Round-Trip Requests). Answered in
+   * a single JSON result.
+   */
+  private def modernHandleToolsCall(
+    request: Request,
+    version: ProtocolVersion,
+    id: RequestId,
+    params: Option[Json.Obj],
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Response, Response] =
+    parseToolCallParams(id, params).flatMap: callParams =>
+      toolsByName.get(callParams.name) match
+        case None =>
+          // Dynamic tool sources do not participate in MRTR.
+          dispatchToSource(id, version, callParams, principal, pathParams)
+        case Some(tool) =>
+          val inputResponses = params
+            .flatMap(_.get("inputResponses")).flatMap(_.asArray)
+            .map(_.flatMap(_.as[InputResponse].toOption))
+            .getOrElse(Chunk.empty)
+          enforceToolScopes(request, principal, tool) *> {
+            val ctx = McpToolContext.modern(inputResponses, principal, pathParams)
+            tool.callWithContext(callParams.arguments, ctx)
+              .foldCauseZIO(
+                cause =>
+                  cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
+                    case Some(signal) =>
+                      val ir = InputRequiredResult(Chunk(signal.request))
+                      ZIO.succeed(rawResultResponse(id, ir.toResultJson(serverInfo)))
+                    case None =>
+                      resultResponse(id, version, CallToolResult(
+                        content = Chunk(ToolContent.text("Tool execution failed")),
+                        isError = Some(true),
+                      )),
+                result => resultResponse(id, version, result),
+              )
+          }
 
   // --- Shared method dispatch (used by both stateful and stateless) ---
 
