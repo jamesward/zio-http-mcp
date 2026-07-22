@@ -78,9 +78,21 @@ final case class DiscoverResult(
   instructions: Option[String] = None,
 ):
   def toResultJson: Json.Obj =
+    val serverInfoJson = Json.Obj(Chunk(
+      "name"    -> Json.Str(serverInfo.name),
+      "version" -> Json.Str(serverInfo.version),
+    ))
     val base = Chunk[(String, Json)](
       "supportedVersions" -> Json.Arr(supportedVersions.map(Json.Str(_))),
       "capabilities"      -> capabilities.toJsonAST.getOrElse(Json.Obj()),
+      // Emit `serverInfo` at the TOP LEVEL as well as in `_meta` (below). The
+      // current spec (and MCP SDK v2 beta.5+) reads server identity only from
+      // `_meta.io.modelcontextprotocol/serverInfo`, but MCP SDK v2 beta.1–beta.4
+      // clients require a top-level `serverInfo` object on the DiscoverResult and
+      // reject the response without it (silently falling back to legacy, which in
+      // a pinned client surfaces as "server did not offer <version>"). Sending
+      // both satisfies every client version.
+      "serverInfo"        -> serverInfoJson,
     ) ++ instructions.fold(Chunk.empty[(String, Json)])(i => Chunk("instructions" -> Json.Str(i)))
     ModernEnvelope.complete(Json.Obj(base), serverInfo, cacheable = true)
 

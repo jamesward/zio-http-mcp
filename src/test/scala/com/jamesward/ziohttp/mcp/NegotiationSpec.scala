@@ -201,12 +201,16 @@ object NegotiationSpec extends ZIOSpecDefault:
         val serverInfoName = r.flatMap(_.get("_meta")).flatMap(_.asObject)
           .flatMap(_.get(McpMeta.ServerInfo)).flatMap(_.asObject)
           .flatMap(_.get("name")).flatMap(_.asString)
+        val topLevelServerInfo = r.flatMap(_.get("serverInfo")).flatMap(_.asObject)
+          .flatMap(_.get("name")).flatMap(_.asString)
         assertTrue(
           resp.status == Status.Ok,
           supported.contains(Modern) && supported.contains(Legacy),
           r.flatMap(_.get("resultType")).flatMap(_.asString).contains("complete"),
           r.flatMap(_.get("capabilities")).flatMap(_.asObject).isDefined,
           serverInfoName.contains("neg-server"),
+          // serverInfo is also emitted at the top level for MCP SDK v2 beta.1–beta.4 clients
+          topLevelServerInfo.contains("neg-server"),
           r.flatMap(_.get("instructions")).flatMap(_.asString).contains("be helpful"),
           r.flatMap(_.get("ttlMs")).isDefined,
           r.flatMap(_.get("cacheScope")).flatMap(_.asString).contains("public"),
