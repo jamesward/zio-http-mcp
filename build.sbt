@@ -8,6 +8,11 @@ scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
   "-language:strictEquality",
   // "-Xfatal-warnings", // not sure where it went
+  // Pin the emitted bytecode to Java 17 regardless of the JDK running the
+  // build, so CI can run on a newer JDK (e.g. Java 25, needed to load the
+  // Java 21 tachyon interop dependency at test time) while the published
+  // artifacts stay JDK 17 compatible.
+  "-release", "17",
 )
 
 val zioVersion = "2.1.26"

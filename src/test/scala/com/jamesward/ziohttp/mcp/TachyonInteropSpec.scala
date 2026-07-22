@@ -62,6 +62,11 @@ object TachyonInteropSpec extends ZIOSpecDefault:
     ZClient.batched(req).flatMap: resp =>
       resp.body.asString.flatMap(s => ZIO.fromEither(s.fromJson[Json.Obj]).mapError(e => RuntimeException(s"$e: $s")))
 
+  // Tachyon is compiled for Java 21+ (class file version 65); on an older JVM the
+  // classes cannot be loaded at runtime, so skip the suite there (e.g. the Java 17
+  // CI). It still runs on any Java 21+ environment.
+  private val javaSupportsTachyon: Boolean = java.lang.Runtime.version().feature() >= 21
+
   override def spec =
     suite("Tachyon interop (third-party MCP server)")(
 
@@ -142,4 +147,5 @@ object TachyonInteropSpec extends ZIOSpecDefault:
       ,
 
     ).provide(Client.default, Scope.default) @@
-      withLiveClock @@ timeout(2.minutes) @@ sequential @@ TestAspect.withLiveEnvironment
+      withLiveClock @@ timeout(2.minutes) @@ sequential @@ TestAspect.withLiveEnvironment @@
+      (if javaSupportsTachyon then TestAspect.identity else TestAspect.ignore)
