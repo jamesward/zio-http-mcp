@@ -372,16 +372,25 @@ object ConformanceSpec extends ZIOSpecDefault:
       |  - dns-rebinding-protection
       |""".stripMargin
 
-  val conformanceImage: ImageFromDockerfile =
-    ImageFromDockerfile("mcp-conformance", false)
+  // The `latest` conformance kit (0.1.x) drives the 2025-11-25 protocol; the
+  // `0.2.0-alpha` line drives the modern 2026-07-28 protocol. Our server is
+  // dual-era, so each kit exercises a different negotiated path against it.
+  private val LegacyKitVersion = "@modelcontextprotocol/[email protected]"
+  private val ModernKitVersion = "@modelcontextprotocol/[email protected]"
+
+  def conformanceImage(kit: String, tag: String): ImageFromDockerfile =
+    ImageFromDockerfile(s"mcp-conformance-$tag", false)
       .withDockerfileFromBuilder: builder =>
         builder
           .from("node:22-slim")
-          .run("npm install -g @modelcontextprotocol/conformance")
+          .run(s"npm install -g $kit")
           .entryPoint("npx", "@modelcontextprotocol/conformance")
           .build()
 
-  def runConformance(port: Int, scenario: Option[String] = None): Task[(Long, String)] =
+  val legacyImage: ImageFromDockerfile = conformanceImage(LegacyKitVersion, "legacy")
+  val modernImage: ImageFromDockerfile = conformanceImage(ModernKitVersion, "modern")
+
+  def runConformance(image: ImageFromDockerfile, port: Int, scenario: Option[String] = None): Task[(Long, String)] =
     ZIO.attemptBlocking:
       TC.exposeHostPorts(port)
 
@@ -391,7 +400,7 @@ object ConformanceSpec extends ZIOSpecDefault:
       java.nio.file.Files.writeString(tmpFile.toPath, expectedFailuresYaml)
 
       val stdout = ToStringConsumer()
-      val container = GenericContainer(conformanceImage)
+      val container = GenericContainer(image)
       container.withAccessToHost(true)
       container.withFileSystemBind(tmpFile.getAbsolutePath, "/tmp/expected-failures.yaml",
         org.testcontainers.containers.BindMode.READ_ONLY)
@@ -423,17 +432,29 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   override def spec =
     suite("MCP Conformance")(
-      test("conformance test suite passes"):
+      test("2025-11-25 (legacy) conformance suite passes"):
         for
           port              <- Server.install(testServer.routes)
           _                 <- ZIO.logInfo(s"MCP server started on port $port")
-          (exitCode, output) <- runConformance(port)
-          _                 <- ZIO.logInfo(s"Conformance exit code: $exitCode")
-          _                 <- ZIO.logInfo(s"Conformance output:\n$output")
+          (exitCode, output) <- runConformance(legacyImage, port)
+          _                 <- ZIO.logInfo(s"Legacy conformance exit code: $exitCode")
+          _                 <- ZIO.logInfo(s"Legacy conformance output:\n$output")
         yield assertTrue(
           output.contains("Baseline check passed") || exitCode == 0L,
         )
+      ,
+      // The 2026-07-28 kit is still at alpha and the spec is an RC; this run is
+      // informational — it exercises the modern (server/discover + per-request
+      // _meta) path against our server and surfaces the result in CI without
+      // failing the build on RC-stage gaps in either the kit or the server.
+      test("2026-07-28 (modern) conformance suite runs (informational)"):
+        for
+          port              <- Server.install(testServer.routes)
+          (exitCode, output) <- runConformance(modernImage, port)
+          _                 <- ZIO.logInfo(s"Modern conformance exit code: $exitCode")
+          _                 <- ZIO.logInfo(s"Modern conformance output:\n$output")
+        yield assertTrue(output.nonEmpty)
     ).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@
       withLiveClock @@
-      timeout(2.minutes) @@
+      timeout(4.minutes) @@
       sequential
