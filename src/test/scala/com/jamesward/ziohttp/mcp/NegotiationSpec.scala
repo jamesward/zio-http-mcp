@@ -111,10 +111,10 @@ object NegotiationSpec extends ZIOSpecDefault:
       assertTrue(r == Right(ProtocolVersion.V2026_07_28))
     ,
 
-    test("resolveModern: missing Mcp-Method is a header mismatch"):
+    test("resolveModern: missing Mcp-Method is accepted (lenient about absence)"):
       val params = Some(Json.Obj("_meta" -> meta(Modern)))
       val r = Negotiation.resolveModern("tools/list", params, Some(Modern), None, None)
-      assertTrue(r.left.exists { case NegotiationError.HeaderMismatch(_) => true; case _ => false })
+      assertTrue(r == Right(ProtocolVersion.V2026_07_28))
     ,
 
     test("resolveModern: Mcp-Method disagreeing with body is a header mismatch"):
@@ -129,22 +129,30 @@ object NegotiationSpec extends ZIOSpecDefault:
       assertTrue(r.left.exists { case NegotiationError.HeaderMismatch(_) => true; case _ => false })
     ,
 
-    test("resolveModern: missing MCP-Protocol-Version header is a header mismatch"):
+    test("resolveModern: missing MCP-Protocol-Version header is accepted (body is source of truth)"):
       val params = Some(Json.Obj("_meta" -> meta(Modern)))
       val r = Negotiation.resolveModern("tools/list", params, None, Some("tools/list"), None)
-      assertTrue(r.left.exists { case NegotiationError.HeaderMismatch(_) => true; case _ => false })
+      assertTrue(r == Right(ProtocolVersion.V2026_07_28))
     ,
 
-    test("resolveModern: tools/call requires a matching Mcp-Name"):
+    test("resolveModern: tools/call validates a present Mcp-Name but accepts a missing one"):
       val params = Some(Json.Obj("name" -> Json.Str("add"), "_meta" -> meta(Modern)))
       val missing = Negotiation.resolveModern("tools/call", params, Some(Modern), Some("tools/call"), None)
       val wrong   = Negotiation.resolveModern("tools/call", params, Some(Modern), Some("tools/call"), Some("subtract"))
       val ok      = Negotiation.resolveModern("tools/call", params, Some(Modern), Some("tools/call"), Some("add"))
       assertTrue(
-        missing.left.exists { case NegotiationError.HeaderMismatch(_) => true; case _ => false },
+        // absent → accepted (lenient)
+        missing == Right(ProtocolVersion.V2026_07_28),
+        // present but wrong → rejected
         wrong.left.exists { case NegotiationError.HeaderMismatch(_) => true; case _ => false },
         ok == Right(ProtocolVersion.V2026_07_28),
       )
+    ,
+
+    test("resolveModern: a request with no routing headers at all is accepted"):
+      val params = Some(Json.Obj("_meta" -> meta(Modern)))
+      val r = Negotiation.resolveModern("server/discover", params, None, None, None)
+      assertTrue(r == Right(ProtocolVersion.V2026_07_28))
     ,
 
     test("resolveModern: resources/read Mcp-Name mirrors params.uri"):
@@ -278,11 +286,23 @@ object NegotiationSpec extends ZIOSpecDefault:
       )
     ,
 
-    test("missing Mcp-Name on modern tools/call -> 400 with -32020"):
+    test("missing Mcp-Name on modern tools/call is accepted (lenient about absent headers)"):
       val extra = Chunk[(String, Json)]("name" -> Json.Str("add"), "arguments" -> Json.Obj("a" -> Json.Num(1), "b" -> Json.Num(1)))
       for
         port <- Server.install(testServer.routes)
         resp <- postModern(port, modernBody(1, "tools/call", extra), "tools/call", name = None)
+        b    <- bodyJson(resp)
+      yield
+        val text = resultOf(b).flatMap(_.get("content")).flatMap(_.asArray).flatMap(_.headOption)
+          .flatMap(_.asObject).flatMap(_.get("text")).flatMap(_.asString)
+        assertTrue(resp.status == Status.Ok, text.contains("2"))
+    ,
+
+    test("present-but-wrong Mcp-Name on modern tools/call -> 400 with -32020"):
+      val extra = Chunk[(String, Json)]("name" -> Json.Str("add"), "arguments" -> Json.Obj("a" -> Json.Num(1), "b" -> Json.Num(1)))
+      for
+        port <- Server.install(testServer.routes)
+        resp <- postModern(port, modernBody(1, "tools/call", extra), "tools/call", name = Some("wrong"))
         b    <- bodyJson(resp)
       yield assertTrue(
         resp.status == Status.BadRequest,

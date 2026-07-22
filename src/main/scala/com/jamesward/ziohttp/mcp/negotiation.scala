@@ -89,12 +89,22 @@ object Negotiation:
    * Validate a modern request's routing headers against its body and resolve
    * the negotiated protocol version.
    *
-   *   - `MCP-Protocol-Version` MUST be present and equal the body's
-   *     `_meta` protocol version (when the body declares one).
-   *   - `Mcp-Method` MUST be present and equal the JSON-RPC `method`.
-   *   - `Mcp-Name` MUST be present and equal `params.name` / `params.uri` for
+   * Validation is deliberately lenient about *absence*: the standard routing
+   * headers (`Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version`) exist so that
+   * intermediaries can route/inspect a request without parsing its body, and
+   * the security property they protect is header↔body *agreement* — not their
+   * mere presence. The request body is always the source of truth, so a header
+   * that is simply missing is accepted, while a header that is *present and
+   * disagrees* with the body is rejected (`HeaderMismatch`). This keeps the
+   * server interoperable with the many real clients that do not yet emit the
+   * 2026-07-28 routing headers, without weakening the anti-spoofing guarantee.
+   *
+   *   - `Mcp-Method`, when present, must equal the JSON-RPC `method`.
+   *   - `MCP-Protocol-Version`, when present, must equal the body's `_meta`
+   *     protocol version (when the body declares one).
+   *   - `Mcp-Name`, when present, must equal `params.name` / `params.uri` for
    *     the data methods, decoding the Base64 sentinel form first.
-   *   - the resolved version MUST be one the server supports.
+   *   - the resolved version must be one the server supports.
    */
   def resolveModern(
     method: String,
@@ -105,35 +115,29 @@ object Negotiation:
   ): Either[NegotiationError, ProtocolVersion] =
     val bodyVersion = bodyProtocolVersion(params)
 
-    // Mcp-Method must be present and match the JSON-RPC method.
+    // Mcp-Method, when present, must match the JSON-RPC method.
     val methodCheck: Either[NegotiationError, Unit] = methodHeader match
-      case None => Left(NegotiationError.HeaderMismatch("Missing required Mcp-Method header"))
       case Some(h) if h != method =>
         Left(NegotiationError.HeaderMismatch(s"Mcp-Method header '$h' does not match body method '$method'"))
-      case Some(_) => Right(())
+      case _ => Right(())
 
-    // MCP-Protocol-Version must be present and, when the body declares one, agree.
-    val versionHeaderCheck: Either[NegotiationError, Unit] = protocolHeader match
-      case None => Left(NegotiationError.HeaderMismatch("Missing required MCP-Protocol-Version header"))
-      case Some(h) =>
-        bodyVersion match
-          case Some(b) if b != h =>
-            Left(NegotiationError.HeaderMismatch(
-              s"MCP-Protocol-Version header '$h' does not match body _meta protocolVersion '$b'"))
-          case _ => Right(())
+    // MCP-Protocol-Version, when present and the body declares one, must agree.
+    val versionHeaderCheck: Either[NegotiationError, Unit] = (protocolHeader, bodyVersion) match
+      case (Some(h), Some(b)) if b != h =>
+        Left(NegotiationError.HeaderMismatch(
+          s"MCP-Protocol-Version header '$h' does not match body _meta protocolVersion '$b'"))
+      case _ => Right(())
 
-    // Mcp-Name must be present and match the body field for the data methods.
+    // Mcp-Name, when present, must match the body field for the data methods.
     val nameCheck: Either[NegotiationError, Unit] = nameSourceField.get(method) match
       case None => Right(())
       case Some(field) =>
         val bodyValue = params.flatMap(_.get(field)).flatMap(_.asString)
         (nameHeader, bodyValue) match
-          case (None, _) =>
-            Left(NegotiationError.HeaderMismatch(s"Missing required Mcp-Name header for $method"))
           case (Some(h), Some(b)) if decodeHeaderValue(h) != b =>
             Left(NegotiationError.HeaderMismatch(
               s"Mcp-Name header '${decodeHeaderValue(h)}' does not match body '$field' value '$b'"))
-          case (Some(_), _) => Right(())
+          case _ => Right(())
 
     for
       _       <- methodCheck
