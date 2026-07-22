@@ -30,6 +30,10 @@ libraryDependencies ++= Seq(
 
   "io.modelcontextprotocol.sdk" % "mcp-core"           % "2.0.0" % Test,
   "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "2.0.0" % Test,
+
+  // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
+  // third-party interop target for cross-version negotiation tests.
+  "dev.tachyonmcp" % "tachyon-server" % "1.0.0-beta.12" % Test,
 )
 
 fork := true
