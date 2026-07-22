@@ -278,13 +278,13 @@ object McpClient:
               val supported = data.flatMap(_.asObject).flatMap(_.get("supported")).flatMap(_.asArray)
                 .map(_.flatMap(_.asString)).getOrElse(Chunk.empty)
               chooseModern(supported) match
-                case Some(v) => discover(v).map(finishModern)
+                case Some(v) => discover(v).flatMap(finishModern)
                 case None    => legacyInit
             case _ =>
               // Not a recognized modern error → treat the server as legacy.
               legacyInit
           },
-          d => ZIO.succeed(finishModern(d)),
+          d => finishModern(d),
         )
       else legacyInit
 
@@ -292,10 +292,19 @@ object McpClient:
     private def chooseModern(supported: Chunk[String]): Option[ProtocolVersion] =
       ProtocolVersion.all.filter(_.isStateless).find(v => supported.contains(v.wire))
 
-    /** Commit modern-era state from a discovery result and produce [[Negotiated]]. */
-    private def finishModern(d: DiscoverInfo): Negotiated =
+    /**
+     * Commit modern-era state from a discovery result and produce [[Negotiated]].
+     * The chosen version — the highest one both peers support — is written back
+     * to the client state so every subsequent request carries the *negotiated*
+     * version in its `_meta` / `MCP-Protocol-Version` header, not the one we
+     * probed with. (Sending the probed/requested version instead of the
+     * negotiated one is a known real-world interop bug.)
+     */
+    private def finishModern(d: DiscoverInfo): UIO[Negotiated] =
       val chosen = chooseModern(d.supportedVersions).getOrElse(config.preferredVersion)
-      Negotiated(chosen, modern = true, d.serverInfo, d.capabilities, d.instructions)
+      stateRef
+        .update(_.copy(protocolVersion = Some(chosen.wire)))
+        .as(Negotiated(chosen, modern = true, d.serverInfo, d.capabilities, d.instructions))
 
     /** Probe / query `server/discover` and parse its result. Marks the client
       * modern for the duration so the request carries modern metadata/headers. */
