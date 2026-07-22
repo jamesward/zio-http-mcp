@@ -28,17 +28,28 @@ import zio.json.ast.Json
 enum ProtocolVersion(val wire: String):
   case V2026_07_28 extends ProtocolVersion("2026-07-28")
   case V2025_11_25 extends ProtocolVersion("2025-11-25")
+  case V2025_06_18 extends ProtocolVersion("2025-06-18")
+  case V2025_03_26 extends ProtocolVersion("2025-03-26")
 
 object ProtocolVersion:
   given CanEqual[ProtocolVersion, ProtocolVersion] = CanEqual.derived
 
-  /** Every version this library supports, newest first. The head is what we
-    * advertise as preferred during negotiation. */
-  val all: Chunk[ProtocolVersion] = Chunk(V2026_07_28, V2025_11_25)
+  /**
+   * Every version this library supports over the Streamable HTTP transport,
+   * newest first. All but [[V2026_07_28]] are legacy (handshake + session)
+   * revisions; `2025-03-26` is the oldest that used Streamable HTTP (the earlier
+   * `2024-11-05` used the now-deprecated HTTP+SSE transport and is not modelled).
+   * The head is what we advertise as preferred during negotiation.
+   */
+  val all: Chunk[ProtocolVersion] = Chunk(V2026_07_28, V2025_11_25, V2025_06_18, V2025_03_26)
 
   /** The newest supported revision — the version a fresh client prefers and the
     * version a server falls back to when a client asks for something newer. */
   val latest: ProtocolVersion = V2026_07_28
+
+  /** The newest supported *legacy* (handshake-based) revision. An `initialize`
+    * negotiation never resolves above this — the handshake implies legacy. */
+  val latestLegacy: ProtocolVersion = V2025_11_25
 
   /**
    * The revision assumed when a Streamable HTTP request carries no version
@@ -53,6 +64,18 @@ object ProtocolVersion:
   val supportedWire: Chunk[String] = all.map(_.wire)
 
   def parse(s: String): Option[ProtocolVersion] = all.find(_.wire == s)
+
+  /**
+   * Resolve the version a server returns from an `initialize` handshake for a
+   * client's requested `protocolVersion`. Per the MCP lifecycle, echo the
+   * requested version when it is a supported legacy revision; otherwise (an
+   * unknown/older version, or a modern version mistakenly sent via `initialize`)
+   * respond with the newest legacy revision the server supports.
+   */
+  def negotiateLegacy(requestedWire: String): ProtocolVersion =
+    parse(requestedWire) match
+      case Some(v) if !v.isStateless => v
+      case _                         => latestLegacy
 
   given JsonEncoder[ProtocolVersion] = JsonEncoder.string.contramap(_.wire)
 

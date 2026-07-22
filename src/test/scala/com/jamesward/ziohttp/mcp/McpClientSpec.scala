@@ -102,6 +102,37 @@ object McpClientSpec extends ZIOSpecDefault:
               result.structuredContent.contains(Json.Obj(Chunk("result" -> Json.Num(8)))),
             )
       ,
+      test("client pinned to an early protocol version (2025-06-18) negotiates and calls tools"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(testServer.statelessRoutes)
+            client <- McpClient.connect(McpClientConfig(
+                        s"http://localhost:$port/mcp",
+                        preferredVersion = ProtocolVersion.V2025_06_18,
+                      ))
+            tools  <- client.listTools
+            result <- client.callToolAs[AddOutput]("add", addArgs(5, 3))
+          yield assertTrue(
+            // the server echoed the older version the client requested
+            client.protocolVersion == "2025-06-18",
+            tools.map(_.name.value).contains("add"),
+            result.result == 8,
+          )
+      ,
+      test("client pinned to 2025-03-26 also works end-to-end"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(testServer.statelessRoutes)
+            client <- McpClient.connect(McpClientConfig(
+                        s"http://localhost:$port/mcp",
+                        preferredVersion = ProtocolVersion.V2025_03_26,
+                      ))
+            result <- client.callToolAs[AddOutput]("add", addArgs(1, 2))
+          yield assertTrue(
+            client.protocolVersion == "2025-03-26",
+            result.result == 3,
+          )
+      ,
       test("stateful: SSE tool call + session handshake"):
         ZIO.scoped:
           for

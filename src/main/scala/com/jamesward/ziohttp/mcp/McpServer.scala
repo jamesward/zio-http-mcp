@@ -697,12 +697,15 @@ final class McpServer[-R] private (
   ): ZIO[R, Response, InitializeResult] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
     for
-      _     <- ZIO.fromEither(paramsJson.fromJson[InitializeParams])
+      init  <- ZIO.fromEither(paramsJson.fromJson[InitializeParams])
                  .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid initialize params: $e"))
       instr <- resolveInstructions(principal, pathParams)
     yield
       InitializeResult(
-        protocolVersion = McpProtocol.Version,
+        // Echo the client's requested version when it is a supported legacy
+        // revision (2025-03-26 … 2025-11-25); otherwise fall back to our newest
+        // legacy revision so older/unknown clients still get a usable session.
+        protocolVersion = ProtocolVersion.negotiateLegacy(init.protocolVersion).wire,
         capabilities = serverCapabilities,
         serverInfo = serverInfo,
         instructions = instr,

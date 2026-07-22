@@ -335,6 +335,92 @@ object NegotiationSpec extends ZIOSpecDefault:
   ).provide(Server.defaultWith(_.onAnyOpenPort), Client.default, Scope.default, McpServer.State.default) @@
     withLiveClock @@ timeout(1.minute) @@ sequential
 
+  // --- Older (pre-2025-11-25) legacy version negotiation ---
+
+  /** POST a legacy request (no modern `_meta`), optionally with a session id and
+    * an `MCP-Protocol-Version` header, the way an older client would. */
+  private def postLegacy(
+    port: Int,
+    body: String,
+    sessionId: Option[String] = None,
+    protocolHeader: Option[String] = None,
+  ): ZIO[Client & Scope, Throwable, Response] =
+    val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
+    var req = Request.post(url, Body.fromString(body))
+      .addHeader(Header.ContentType(MediaType.application.json))
+      .addHeader("accept", "application/json, text/event-stream")
+    sessionId.foreach(s => req = req.addHeader("mcp-session-id", s))
+    protocolHeader.foreach(v => req = req.addHeader("mcp-protocol-version", v))
+    ZClient.batched(req)
+
+  private def initBody(id: Int, version: String): String =
+    s"""{"jsonrpc":"2.0","id":$id,"method":"initialize","params":{"protocolVersion":"$version","capabilities":{},"clientInfo":{"name":"old-client","version":"1"}}}"""
+
+  private val legacySuite = suite("Legacy version negotiation (older clients)")(
+
+    test("initialize echoes a supported older version (2025-06-18) and no modern envelope"):
+      for
+        port <- Server.install(testServer.routes)
+        resp <- postLegacy(port, initBody(1, "2025-06-18"))
+        b    <- bodyJson(resp)
+      yield
+        val r = resultOf(b)
+        assertTrue(
+          resp.status == Status.Ok,
+          resp.rawHeader("mcp-session-id").isDefined,
+          r.flatMap(_.get("protocolVersion")).flatMap(_.asString).contains("2025-06-18"),
+          r.flatMap(_.get("resultType")).isEmpty,
+        )
+    ,
+
+    test("initialize echoes the 2025-03-26 revision"):
+      for
+        port <- Server.install(testServer.routes)
+        resp <- postLegacy(port, initBody(1, "2025-03-26"))
+        b    <- bodyJson(resp)
+      yield assertTrue(
+        resultOf(b).flatMap(_.get("protocolVersion")).flatMap(_.asString).contains("2025-03-26"),
+      )
+    ,
+
+    test("initialize with an unknown/older version falls back to the newest legacy revision"):
+      for
+        port <- Server.install(testServer.routes)
+        resp <- postLegacy(port, initBody(1, "2024-11-05"))
+        b    <- bodyJson(resp)
+      yield assertTrue(
+        resultOf(b).flatMap(_.get("protocolVersion")).flatMap(_.asString).contains(ProtocolVersion.latestLegacy.wire),
+      )
+    ,
+
+    test("an older client completes an initialize + session + follow-up round trip"):
+      for
+        port    <- Server.install(testServer.routes)
+        initR   <- postLegacy(port, initBody(1, "2025-06-18"))
+        session  = initR.rawHeader("mcp-session-id").getOrElse("")
+        // follow-up requests carry the negotiated older version header + session
+        listR   <- postLegacy(port, """{"jsonrpc":"2.0","id":2,"method":"tools/list"}""",
+                     sessionId = Some(session), protocolHeader = Some("2025-06-18"))
+        listB   <- bodyJson(listR)
+        pingR   <- postLegacy(port, """{"jsonrpc":"2.0","id":3,"method":"ping"}""",
+                     sessionId = Some(session), protocolHeader = Some("2025-06-18"))
+        pingB   <- bodyJson(pingR)
+      yield assertTrue(
+        initR.status == Status.Ok,
+        session.nonEmpty,
+        listR.status == Status.Ok,
+        listB.get("result").flatMap(_.asObject).flatMap(_.get("tools")).flatMap(_.asArray).exists(_.size == 1),
+        // legacy follow-ups are NOT wrapped in the modern envelope
+        listB.get("result").flatMap(_.asObject).flatMap(_.get("resultType")).isEmpty,
+        // `ping` still exists in the legacy era and round-trips over the session
+        pingR.status == Status.Ok,
+        pingB.get("result").isDefined,
+      )
+    ,
+
+  ).provide(Server.defaultWith(_.onAnyOpenPort), Client.default, Scope.default, McpServer.State.default) @@
+    withLiveClock @@ timeout(1.minute) @@ sequential
+
   // --- MRTR (Multi Round-Trip Requests) ---
 
   val sampleTool: McpToolHandler = McpTool("summarize")
@@ -423,4 +509,4 @@ object NegotiationSpec extends ZIOSpecDefault:
   ).provide(Server.defaultWith(_.onAnyOpenPort), Client.default, Scope.default, McpServer.State.default) @@
     withLiveClock @@ timeout(1.minute) @@ sequential
 
-  override def spec = suite("NegotiationSpec")(unitSuite, httpSuite, mrtrSuite)
+  override def spec = suite("NegotiationSpec")(unitSuite, httpSuite, legacySuite, mrtrSuite)

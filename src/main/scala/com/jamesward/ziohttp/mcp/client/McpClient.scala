@@ -315,9 +315,14 @@ object McpClient:
 
     /** Legacy `initialize` handshake (2025-11-25 and earlier). */
     private def legacyInit: IO[McpClientError, Negotiated] =
+      // Request the client's preferred version when it is itself a legacy
+      // revision (e.g. pinned to 2025-06-18); when the preference is a modern
+      // version but we fell back to the handshake, request our newest legacy one.
+      val requestedVersion =
+        if config.preferredVersion.isStateless then McpProtocol.Version else config.preferredVersion.wire
       for
         _      <- stateRef.update(_.copy(modern = false, sessionId = None))
-        params  = asObj(InitializeParams(McpProtocol.Version, Json.Obj(), config.clientInfo))
+        params  = asObj(InitializeParams(requestedVersion, Json.Obj(), config.clientInfo))
         result <- rpc[InitializeResult]("initialize", params)
         _      <- stateRef.update(_.copy(protocolVersion = Some(result.protocolVersion)))
         _      <- notifyInitialized
