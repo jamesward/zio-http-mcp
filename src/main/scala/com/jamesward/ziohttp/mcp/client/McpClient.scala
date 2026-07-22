@@ -128,6 +128,23 @@ final case class McpClientConfig(
   clientInfo: Implementation = Implementation("zio-http-mcp-client", "0.1.0"),
   oauth: Option[OAuthClientCredentials] = None,
   headers: Headers = Headers.empty,
+  /**
+   * The protocol version the client prefers. Defaults to the newest supported
+   * revision ([[ProtocolVersion.latest]], `2026-07-28`). When it is a modern
+   * (stateless) version the client probes the server with `server/discover` and
+   * negotiates the highest mutually supported version, falling back to the
+   * `2025-11-25` `initialize` handshake if the server is legacy. Pin this to
+   * [[ProtocolVersion.V2025_11_25]] to force the legacy handshake.
+   */
+  preferredVersion: ProtocolVersion = ProtocolVersion.latest,
+  /**
+   * Handler invoked to satisfy a modern server's Multi Round-Trip Request: given
+   * an [[InputRequest]] (a `sampling/createMessage` or `elicitation/create` the
+   * server needs answered), it returns the result JSON to send back in
+   * `inputResponses`. When unset, a server that asks for input fails the call
+   * with [[McpClientError.Protocol]].
+   */
+  onInputRequest: Option[InputRequest => IO[McpClientError, Json]] = None,
 )
 
 object McpClient:
@@ -139,10 +156,9 @@ object McpClient:
       stateRef   <- Ref.make(ClientState.initial)
       idRef      <- Ref.make(0L)
       transport   = Transport(config, zclient, stateRef, idRef)
-      initResult <- transport.initialize
-      _          <- transport.notifyInitialized
+      negotiated <- transport.negotiate
       _          <- ZIO.addFinalizer(transport.close.ignore)
-    yield Live(transport, initResult)
+    yield Live(transport, negotiated)
 
   /** Connect to an MCP server at `serverUrl` with no authorization. */
   def connect(serverUrl: String): ZIO[Client & Scope, McpClientError, McpClient] =
@@ -166,10 +182,40 @@ object McpClient:
     protocolVersion: Option[String],
     resolvedOAuth: Option[ResolvedOAuth],
     token: Option[CachedToken],
+    // True once negotiation settles on a modern (2026-07-28+) server: requests
+    // then carry per-request `_meta` + routing headers and no session.
+    modern: Boolean = false,
   )
 
   private object ClientState:
     val initial: ClientState = ClientState(None, None, None, None)
+
+  /** The outcome of version negotiation: the connected server's identity plus
+    * whether the client is operating in the modern or legacy era. */
+  private final case class Negotiated(
+    version: ProtocolVersion,
+    modern: Boolean,
+    serverInfo: Implementation,
+    capabilities: ServerCapabilities,
+    instructions: Option[String],
+  )
+
+  /** Parsed `server/discover` result. */
+  private final case class DiscoverInfo(
+    supportedVersions: Chunk[String],
+    capabilities: ServerCapabilities,
+    serverInfo: Implementation,
+    instructions: Option[String],
+  )
+
+  /** An outgoing request body plus the transport decisions for it: correlation
+    * id, extra (modern routing) headers, and whether to attach the session. */
+  private final case class Outgoing(
+    body: String,
+    id: RequestId,
+    extraHeaders: Headers,
+    sendSession: Boolean,
+  )
 
   private enum Attempt:
     case Ok(result: Json)
@@ -214,25 +260,126 @@ object McpClient:
   ):
     private val clientLayer: ULayer[Client] = ZLayer.succeed(zclient)
 
-    def initialize: IO[McpClientError, InitializeResult] =
-      val params = asObj(InitializeParams(McpProtocol.Version, Json.Obj(), config.clientInfo))
+    /**
+     * Negotiate the protocol era with the server. When the client prefers a
+     * modern version it probes with `server/discover`: a success (or a
+     * recognized `UnsupportedProtocolVersionError`) means a modern server and the
+     * client stays stateless; anything else means a legacy server and the client
+     * falls back to the `initialize` handshake.
+     */
+    def negotiate: IO[McpClientError, Negotiated] =
+      if config.preferredVersion.isStateless then
+        discover(config.preferredVersion).foldZIO(
+          {
+            case McpClientError.JsonRpc(code, _, data)
+                if code == ErrorCode.UnsupportedProtocolVersion.code =>
+              // Modern server that doesn't support our preferred version: pick
+              // the highest one it lists and re-discover, else fall back.
+              val supported = data.flatMap(_.asObject).flatMap(_.get("supported")).flatMap(_.asArray)
+                .map(_.flatMap(_.asString)).getOrElse(Chunk.empty)
+              chooseModern(supported) match
+                case Some(v) => discover(v).map(finishModern)
+                case None    => legacyInit
+            case _ =>
+              // Not a recognized modern error → treat the server as legacy.
+              legacyInit
+          },
+          d => ZIO.succeed(finishModern(d)),
+        )
+      else legacyInit
+
+    /** Highest modern version both the client and `supported` (server) accept. */
+    private def chooseModern(supported: Chunk[String]): Option[ProtocolVersion] =
+      ProtocolVersion.all.filter(_.isStateless).find(v => supported.contains(v.wire))
+
+    /** Commit modern-era state from a discovery result and produce [[Negotiated]]. */
+    private def finishModern(d: DiscoverInfo): Negotiated =
+      val chosen = chooseModern(d.supportedVersions).getOrElse(config.preferredVersion)
+      Negotiated(chosen, modern = true, d.serverInfo, d.capabilities, d.instructions)
+
+    /** Probe / query `server/discover` and parse its result. Marks the client
+      * modern for the duration so the request carries modern metadata/headers. */
+    private def discover(version: ProtocolVersion): IO[McpClientError, DiscoverInfo] =
       for
+        _      <- stateRef.update(_.copy(modern = true, protocolVersion = Some(version.wire)))
+        result <- rpcRaw("server/discover", Json.Obj())
+      yield
+        val obj = result.asObject.getOrElse(Json.Obj())
+        val supported = obj.get("supportedVersions").flatMap(_.asArray)
+          .map(_.flatMap(_.asString)).getOrElse(Chunk(version.wire))
+        val caps = obj.get("capabilities").flatMap(_.as[ServerCapabilities].toOption).getOrElse(ServerCapabilities())
+        val serverInfo = obj.get("_meta").flatMap(_.asObject).flatMap(_.get(McpMeta.ServerInfo))
+          .flatMap(_.as[Implementation].toOption).getOrElse(Implementation("unknown", "0"))
+        val instructions = obj.get("instructions").flatMap(_.asString)
+        DiscoverInfo(supported, caps, serverInfo, instructions)
+
+    /** Legacy `initialize` handshake (2025-11-25 and earlier). */
+    private def legacyInit: IO[McpClientError, Negotiated] =
+      for
+        _      <- stateRef.update(_.copy(modern = false, sessionId = None))
+        params  = asObj(InitializeParams(McpProtocol.Version, Json.Obj(), config.clientInfo))
         result <- rpc[InitializeResult]("initialize", params)
         _      <- stateRef.update(_.copy(protocolVersion = Some(result.protocolVersion)))
-      yield result
+        _      <- notifyInitialized
+      yield Negotiated(
+        ProtocolVersion.parse(result.protocolVersion).getOrElse(ProtocolVersion.default),
+        modern = false, result.serverInfo, result.capabilities, result.instructions,
+      )
 
     def notifyInitialized: IO[McpClientError, Unit] =
       notification("notifications/initialized", Json.Obj())
 
     def rpc[A: JsonDecoder](method: String, params: Json.Obj): IO[McpClientError, A] =
+      rpcRaw(method, params).flatMap: result =>
+        ZIO.fromEither(result.as[A])
+          .mapError(e => McpClientError.Decode(s"Failed to decode result of '$method': $e"))
+
+    /** Send a request and return its raw `result` JSON, applying modern
+      * metadata/headers when the negotiated era is modern. */
+    def rpcRaw(method: String, params: Json.Obj): IO[McpClientError, Json] =
       for
+        st     <- stateRef.get
         n      <- idRef.updateAndGet(_ + 1)
         id      = RequestId.Num(n.toInt)
-        body    = (JsonRpcMessage.Request(id, method, Some(params)): JsonRpcMessage).toJson
-        result <- withAuthRetry(body, id)
-        a      <- ZIO.fromEither(result.as[A])
-                    .mapError(e => McpClientError.Decode(s"Failed to decode result of '$method': $e"))
-      yield a
+        version = st.protocolVersion.flatMap(ProtocolVersion.parse).getOrElse(config.preferredVersion)
+        effParams = if st.modern then withModernMeta(params, version) else params
+        body    = (JsonRpcMessage.Request(id, method, Some(effParams)): JsonRpcMessage).toJson
+        extra   = if st.modern then modernHeaders(version, method, effParams) else Headers.empty
+        result <- withAuthRetry(Outgoing(body, id, extra, sendSession = !st.modern))
+      yield result
+
+    /**
+     * Modern `tools/call` with Multi Round-Trip Request handling. If the server
+     * answers `input_required`, the configured `onInputRequest` handler fulfils
+     * each request and the call is retried with `inputResponses` until it
+     * completes. Legacy servers never return `input_required`, so this returns
+     * their result on the first pass.
+     */
+    def toolsCall(params: Json.Obj): IO[McpClientError, CallToolResult] =
+      def loop(prior: Chunk[InputResponse], depth: Int): IO[McpClientError, CallToolResult] =
+        val callParams =
+          if prior.isEmpty then params
+          else Json.Obj(params.fields.filterNot(_._1 == "inputResponses") :+
+            ("inputResponses" -> (Json.Arr(prior.map(_.toJsonAST.getOrElse(Json.Obj()))): Json)))
+        rpcRaw("tools/call", callParams).flatMap: result =>
+          val resultType = result.asObject.flatMap(_.get("resultType")).flatMap(_.asString)
+          if resultType.contains(ModernEnvelope.ResultTypeInputRequired) then
+            config.onInputRequest match
+              case None =>
+                ZIO.fail(McpClientError.Protocol("Server requested input (MRTR) but no onInputRequest handler is configured"))
+              case Some(handler) if depth >= 32 =>
+                ZIO.fail(McpClientError.Protocol("MRTR exceeded the maximum number of round trips"))
+              case Some(handler) =>
+                val requests = result.asObject.flatMap(_.get("inputRequests")).flatMap(_.asArray)
+                  .map(_.flatMap(_.as[InputRequest].toOption)).getOrElse(Chunk.empty)
+                for
+                  answers <- ZIO.foreach(requests)(req => handler(req).map(r => InputResponse(req.id, r)))
+                  out     <- loop(prior ++ answers, depth + 1)
+                yield out
+          else
+            ZIO.fromEither(result.as[CallToolResult])
+              .mapError(e => McpClientError.Decode(s"Failed to decode tool result: $e"))
+      loop(Chunk.empty, 0)
 
     def close: IO[McpClientError, Unit] =
       stateRef.get.flatMap: st =>
@@ -250,11 +397,14 @@ object McpClient:
 
     private def notification(method: String, params: Json.Obj): IO[McpClientError, Unit] =
       val body = (JsonRpcMessage.Notification(method, Some(params)): JsonRpcMessage).toJson
+      // Notifications (only `notifications/initialized`, on the legacy path)
+      // carry the session and legacy protocol-version header.
+      val out = Outgoing(body, RequestId.Num(0), Headers.empty, sendSession = true)
       for
         token <- ensureToken(forceRefresh = false)
         _     <- ZIO.scoped:
                    for
-                     req  <- buildRequest(body, token)
+                     req  <- buildRequest(out, token)
                      resp <- streaming(req)
                      _    <- captureSession(resp)
                      _    <- ZIO.unless(resp.status.code == 202 || resp.status.isSuccess)(
@@ -263,10 +413,10 @@ object McpClient:
                    yield ()
       yield ()
 
-    private def withAuthRetry(body: String, id: RequestId): IO[McpClientError, Json] =
+    private def withAuthRetry(o: Outgoing): IO[McpClientError, Json] =
       for
         token <- ensureToken(forceRefresh = false)
-        res1  <- attempt(body, id, token)
+        res1  <- attempt(o, token)
         out   <- res1 match
                    case Attempt.Ok(json) => ZIO.succeed(json)
                    case Attempt.Unauthorized(b) =>
@@ -275,27 +425,40 @@ object McpClient:
                        case Some(_) =>
                          for
                            token2 <- ensureToken(forceRefresh = true)
-                           res2   <- attempt(body, id, token2)
+                           res2   <- attempt(o, token2)
                            json   <- res2 match
                                        case Attempt.Ok(json)         => ZIO.succeed(json)
                                        case Attempt.Unauthorized(b2) => ZIO.fail(McpClientError.Auth(s"401 after refreshing token: $b2"))
                          yield json
       yield out
 
-    private def attempt(body: String, id: RequestId, token: Option[String]): IO[McpClientError, Attempt] =
+    private def attempt(o: Outgoing, token: Option[String]): IO[McpClientError, Attempt] =
       ZIO.scoped:
         for
-          req  <- buildRequest(body, token)
+          req  <- buildRequest(o, token)
           resp <- streaming(req)
           _    <- captureSession(resp)
-          out  <- interpret(resp, id)
+          out  <- interpret(resp, o.id)
         yield out
 
     private def interpret(resp: Response, id: RequestId): ZIO[Scope, McpClientError, Attempt] =
       if resp.status.code == 401 then
         resp.body.asString.orElseSucceed("").map(Attempt.Unauthorized.apply)
       else if !resp.status.isSuccess then
-        failStatus(resp, "Request")
+        // A modern server signals negotiation failures with a non-2xx status and
+        // a JSON-RPC error body (UnsupportedProtocolVersion -32022, HeaderMismatch
+        // -32020, method-not-found -32601). Surface those as McpClientError.JsonRpc
+        // so negotiation can recognize a modern server; otherwise it is a
+        // transport-level failure that identifies a legacy server.
+        resp.body.asString.orElseSucceed("").flatMap: b =>
+          b.fromJson[Json.Obj].toOption.flatMap(o => o.get("error").flatMap(_.asObject)) match
+            case Some(errObj) =>
+              val code = errObj.get("code").flatMap(_.asNumber).map(_.value.intValue).getOrElse(0)
+              val msg  = errObj.get("message").flatMap(_.asString).getOrElse("Unknown error")
+              val data = errObj.get("data")
+              ZIO.fail(McpClientError.JsonRpc(code, msg, data))
+            case None =>
+              ZIO.fail(McpClientError.Protocol(s"Request returned ${resp.status.code}: $b"))
       else
         parseResponse(resp, id).map(Attempt.Ok.apply)
 
@@ -318,18 +481,61 @@ object McpClient:
                               .tap(t => stateRef.update(_.copy(token = Some(t))))
           yield Some(token.value)
 
-    private def buildRequest(body: String, token: Option[String]): IO[McpClientError, Request] =
+    private def buildRequest(o: Outgoing, token: Option[String]): IO[McpClientError, Request] =
       for
         url <- decodeUrl(config.serverUrl)
         st  <- stateRef.get
       yield
-        val base = Request.post(url, Body.fromString(body))
+        val base = Request.post(url, Body.fromString(o.body))
           .addHeader(Header.ContentType(MediaType.application.json))
           .addHeader("accept", "application/json, text/event-stream")
           .addHeaders(config.headers)
-        val wSession = st.sessionId.fold(base)(sid => base.addHeader("mcp-session-id", sid))
-        val wProto   = st.protocolVersion.fold(wSession)(v => wSession.addHeader("mcp-protocol-version", v))
+          .addHeaders(o.extraHeaders)
+        // Modern requests are stateless (no `Mcp-Session-Id`) and carry their
+        // `MCP-Protocol-Version` in `o.extraHeaders`; legacy requests echo the
+        // negotiated session id and protocol-version header here.
+        val wSession =
+          if o.sendSession then st.sessionId.fold(base)(sid => base.addHeader("mcp-session-id", sid)) else base
+        val wProto =
+          if o.sendSession then st.protocolVersion.fold(wSession)(v => wSession.addHeader("mcp-protocol-version", v)) else wSession
         token.fold(wProto)(t => wProto.addHeader(Header.Authorization.Bearer(t)))
+
+    /** Modern per-request routing headers: `MCP-Protocol-Version`, `Mcp-Method`,
+      * and `Mcp-Name` (mirroring `params.name` / `params.uri`). */
+    private def modernHeaders(version: ProtocolVersion, method: String, params: Json.Obj): Headers =
+      val nameValue = method match
+        case "tools/call" | "prompts/get" => params.get("name").flatMap(_.asString)
+        case "resources/read"             => params.get("uri").flatMap(_.asString)
+        case _                            => None
+      val base = Headers(Negotiation.ProtocolVersionHeader, version.wire) ++
+        Headers(Negotiation.MethodHeader, method)
+      nameValue.fold(base)(n => base ++ Headers(Negotiation.NameHeader, encodeHeaderValue(n)))
+
+    /** Merge the modern `_meta` (protocol version, client info, client
+      * capabilities) into a request's params, preserving any existing `_meta`. */
+    private def withModernMeta(params: Json.Obj, version: ProtocolVersion): Json.Obj =
+      val modernMeta = Chunk[(String, Json)](
+        McpMeta.ProtocolVersion -> Json.Str(version.wire),
+        McpMeta.ClientInfo -> Json.Obj(
+          "name" -> Json.Str(config.clientInfo.name),
+          "version" -> Json.Str(config.clientInfo.version),
+        ),
+        McpMeta.ClientCapabilities -> Json.Obj(),
+      )
+      val existing = params.get("_meta").flatMap(_.asObject).map(_.fields).getOrElse(Chunk.empty)
+      val merged = modernMeta.foldLeft(existing): (acc, kv) =>
+        if acc.exists(_._1 == kv._1) then acc else acc :+ kv
+      Json.Obj(params.fields.filterNot(_._1 == "_meta") :+ ("_meta" -> (Json.Obj(merged): Json)))
+
+    /** Encode a header value using the Base64 sentinel form when it is not a
+      * safe plain-ASCII value (per the Streamable HTTP value-encoding rules). */
+    private def encodeHeaderValue(value: String): String =
+      val plainSafe = value.nonEmpty
+        && value.forall(c => c >= 0x21 && c <= 0x7e)
+        && !(value.startsWith("=?base64?") && value.endsWith("?="))
+      if plainSafe then value
+      else "=?base64?" + java.util.Base64.getEncoder.encodeToString(
+        value.getBytes(java.nio.charset.StandardCharsets.UTF_8)) + "?="
 
     @nowarn("msg=deprecated")
     private def streaming(req: Request): ZIO[Scope, McpClientError, Response] =
@@ -411,11 +617,11 @@ object McpClient:
 
   // --- high-level client backed by the transport ---
 
-  private final class Live(transport: Transport, initResult: InitializeResult) extends McpClient:
-    def serverInfo: Implementation = initResult.serverInfo
-    def serverCapabilities: ServerCapabilities = initResult.capabilities
-    def protocolVersion: String = initResult.protocolVersion
-    def instructions: Option[String] = initResult.instructions
+  private final class Live(transport: Transport, negotiated: Negotiated) extends McpClient:
+    def serverInfo: Implementation = negotiated.serverInfo
+    def serverCapabilities: ServerCapabilities = negotiated.capabilities
+    def protocolVersion: String = negotiated.version.wire
+    def instructions: Option[String] = negotiated.instructions
 
     def ping: IO[McpClientError, Unit] =
       transport.rpc[Json.Obj]("ping", Json.Obj()).unit
@@ -425,7 +631,7 @@ object McpClient:
 
     def callTool(name: String, arguments: Json.Obj): IO[McpClientError, CallToolResult] =
       val argOpt = if arguments.fields.isEmpty then None else Some(arguments)
-      transport.rpc[CallToolResult]("tools/call", asObj(ToolCallParams(ToolName(name), argOpt)))
+      transport.toolsCall(asObj(ToolCallParams(ToolName(name), argOpt)))
 
     def callTool(name: String): IO[McpClientError, CallToolResult] =
       callTool(name, Json.Obj())
