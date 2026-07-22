@@ -372,19 +372,22 @@ object ConformanceSpec extends ZIOSpecDefault:
       |  - dns-rebinding-protection
       |""".stripMargin
 
-  // The `latest` conformance kit (0.1.x) drives the 2025-11-25 protocol; the
-  // `0.2.0-alpha` line drives the modern 2026-07-28 protocol. Our server is
-  // dual-era, so each kit exercises a different negotiated path against it.
-  private val LegacyKitVersion = "@modelcontextprotocol/[email protected]"
-  private val ModernKitVersion = "@modelcontextprotocol/[email protected]"
+  // The official MCP conformance kit (npm). The `latest` line (0.1.x) drives the
+  // 2025-11-25 protocol; the `0.2.0-alpha` line drives the modern 2026-07-28
+  // protocol. Our server is dual-era, so each version exercises a different
+  // negotiated path against it. The name and version are kept separate and
+  // joined with `@` only when building the `npm install` command.
+  private val ConformancePackage = "@modelcontextprotocol/conformance"
+  private val LegacyKitVersion   = "0.1.16"
+  private val ModernKitVersion   = "0.2.0-alpha.9"
 
-  def conformanceImage(kit: String, tag: String): ImageFromDockerfile =
+  def conformanceImage(version: String, tag: String): ImageFromDockerfile =
     ImageFromDockerfile(s"mcp-conformance-$tag", false)
       .withDockerfileFromBuilder: builder =>
         builder
           .from("node:22-slim")
-          .run(s"npm install -g $kit")
-          .entryPoint("npx", "@modelcontextprotocol/conformance")
+          .run(s"npm install -g $ConformancePackage@$version")
+          .entryPoint("npx", ConformancePackage)
           .build()
 
   val legacyImage: ImageFromDockerfile = conformanceImage(LegacyKitVersion, "legacy")
