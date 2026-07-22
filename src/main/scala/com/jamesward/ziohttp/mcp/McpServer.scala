@@ -150,7 +150,10 @@ final class McpServer[-R] private (
     prompts.map(p => p.definition.name -> p).toMap
 
   private val serverCapabilities: ServerCapabilities =
-    val extensionMap = resourceSrc.map(_.capabilities).getOrElse(Map.empty)
+    // Advertise the 2026-07-28 Tasks extension alongside any dynamic-source
+    // extensions. The stateful `routes` fulfil it (they carry the task store).
+    val extensionMap: Map[String, Json] =
+      Map(TaskRecord.ExtensionId -> (Json.Obj(): Json)) ++ resourceSrc.map(_.capabilities).getOrElse(Map.empty)
     ServerCapabilities(
       tools = if tools.nonEmpty || toolSrc.isDefined then Some(Json.Obj()) else None,
       resources = if resources.nonEmpty || resourceTemplates.nonEmpty || resourceSrc.isDefined then Some(Json.Obj(Chunk("subscribe" -> Json.Bool(true)))) else None,
@@ -301,7 +304,7 @@ final class McpServer[-R] private (
       body      <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
       bodyJson  <- ZIO.fromEither(body.fromJson[Json.Obj])
                      .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
-      response  <- routeMessage(request, state.sessions, state.pendingRequests, bodyJson, principal, pathParams)
+      response  <- routeMessage(request, state.sessions, state.pendingRequests, state.tasks, bodyJson, principal, pathParams)
     yield response
 
   private def statelessPostHandler(pathParams: Map[String, String], request: Request): ZIO[R, Response, Response] =
@@ -319,7 +322,8 @@ final class McpServer[-R] private (
             case Left(resp) =>
               ZIO.succeed(resp)
             case Right(ProtocolEra.Modern(version)) =>
-              dispatchModern(request, id, method, version, params, principal, pathParams)
+              // The stateless routes have no task store, so tasks are unavailable here.
+              dispatchModern(request, id, method, version, params, principal, pathParams, tasks = None)
             case Right(ProtocolEra.Legacy) =>
               method match
                 case "initialize" =>
@@ -370,11 +374,15 @@ final class McpServer[-R] private (
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
+    tasks: Option[Ref[Map[TaskId, TaskRecord]]],
   ): ZIO[R, Response, Response] =
     McpDispatchMethod.parse(method) match
+      case Some(McpDispatchMethod.TasksGet)    => handleTasksGet(id, params, tasks)
+      case Some(McpDispatchMethod.TasksCancel) => handleTasksCancel(id, params, tasks)
+      case Some(McpDispatchMethod.TasksUpdate) => handleTasksUpdate(id, params, tasks)
       case Some(dm) =>
         dispatchMethod(id, dm, version, params, principal, pathParams,
-          modernHandleToolsCall(request, version, _, _, principal, pathParams))
+          modernHandleToolsCall(request, version, tasks, _, _, principal, pathParams))
       case None =>
         ZIO.fail(methodNotFoundResponse(id, version, method))
 
@@ -389,6 +397,7 @@ final class McpServer[-R] private (
   private def modernHandleToolsCall(
     request: Request,
     version: ProtocolVersion,
+    tasks: Option[Ref[Map[TaskId, TaskRecord]]],
     id: RequestId,
     params: Option[Json.Obj],
     principal: Option[Principal],
@@ -400,27 +409,118 @@ final class McpServer[-R] private (
           // Dynamic tool sources do not participate in MRTR.
           dispatchToSource(id, version, callParams, principal, pathParams)
         case Some(tool) =>
-          val inputResponses = params
-            .flatMap(_.get("inputResponses")).flatMap(_.asArray)
-            .map(_.flatMap(_.as[InputResponse].toOption))
-            .getOrElse(Chunk.empty)
-          enforceToolScopes(request, principal, tool) *> {
-            val ctx = McpToolContext.modern(inputResponses, principal, pathParams)
-            tool.callWithContext(callParams.arguments, ctx)
-              .foldCauseZIO(
-                cause =>
-                  cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
-                    case Some(signal) =>
-                      val ir = InputRequiredResult(Chunk(signal.request))
-                      ZIO.succeed(rawResultResponse(id, ir.toResultJson(serverInfo)))
-                    case None =>
-                      resultResponse(id, version, CallToolResult(
-                        content = Chunk(ToolContent.text("Tool execution failed")),
-                        isError = Some(true),
-                      )),
-                result => resultResponse(id, version, result),
-              )
-          }
+          val taskRequested = McpMeta.of(params).flatMap(_.get(TaskRecord.ExtensionId)).isDefined
+          (taskRequested, tasks) match
+            case (true, Some(store)) =>
+              runToolAsTask(id, tool, callParams, principal, pathParams, store)
+            case _ =>
+              val inputResponses = params
+                .flatMap(_.get("inputResponses")).flatMap(_.asArray)
+                .map(_.flatMap(_.as[InputResponse].toOption))
+                .getOrElse(Chunk.empty)
+              enforceToolScopes(request, principal, tool) *> {
+                val ctx = McpToolContext.modern(inputResponses, principal, pathParams)
+                tool.callWithContext(callParams.arguments, ctx)
+                  .foldCauseZIO(
+                    cause =>
+                      cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
+                        case Some(signal) =>
+                          val ir = InputRequiredResult(Chunk(signal.request))
+                          ZIO.succeed(rawResultResponse(id, ir.toResultJson(serverInfo)))
+                        case None =>
+                          resultResponse(id, version, CallToolResult(
+                            content = Chunk(ToolContent.text("Tool execution failed")),
+                            isError = Some(true),
+                          )),
+                    result => resultResponse(id, version, result),
+                  )
+              }
+
+  /**
+   * Execute a tool as a Tasks-extension task: create a `working` task, run the
+   * tool on a background fiber that records the terminal result/error, and
+   * return the task handle immediately (`resultType: "task"`). The client polls
+   * `tasks/get` and cancels with `tasks/cancel`.
+   */
+  private def runToolAsTask(
+    id: RequestId,
+    tool: McpToolHandlerR[R],
+    callParams: ToolCallParams,
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+    store: Ref[Map[TaskId, TaskRecord]],
+  ): ZIO[R, Response, Response] =
+    for
+      now    <- Clock.instant.map(_.toEpochMilli)
+      record  = TaskRecord.create(now)
+      taskId  = record.task.taskId
+      ctx     = McpToolContext.modern(Chunk.empty, principal, pathParams)
+      run     = tool.callWithContext(callParams.arguments, ctx).flatMap: result =>
+                  Clock.instant.map(_.toEpochMilli).flatMap: t =>
+                    store.update(_.updatedWith(taskId)(_.map(r => r.copy(
+                      task = r.task.copy(status = TaskStatus.Completed, lastUpdatedAt = t),
+                      result = result.toJsonAST.toOption,
+                    ))))
+      _      <- store.update(_.updated(taskId, record))
+      fiber  <- run.forkDaemon
+      _      <- store.update(_.updatedWith(taskId)(_.map(_.copy(fiber = Some(fiber)))))
+    yield rawResultResponse(id, ModernEnvelope.withServerInfo(
+      Json.Obj(Chunk("resultType" -> Json.Str("task"), "task" -> (record.task.toJson: Json))),
+      serverInfo,
+    ))
+
+  /** `tasks/get` — return the current task state, including the finished result. */
+  private def handleTasksGet(
+    id: RequestId,
+    params: Option[Json.Obj],
+    tasks: Option[Ref[Map[TaskId, TaskRecord]]],
+  ): ZIO[Any, Response, Response] =
+    withTaskStore(id, tasks): store =>
+      taskIdParam(id, params).flatMap: taskId =>
+        store.get.flatMap: m =>
+          m.get(taskId) match
+            case Some(record) => ZIO.succeed(rawResultResponse(id, record.toResultJson(serverInfo)))
+            case None         => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Unknown task: ${taskId.value}"))
+
+  /** `tasks/cancel` — interrupt the task's fiber, mark it cancelled, ack empty. */
+  private def handleTasksCancel(
+    id: RequestId,
+    params: Option[Json.Obj],
+    tasks: Option[Ref[Map[TaskId, TaskRecord]]],
+  ): ZIO[Any, Response, Response] =
+    withTaskStore(id, tasks): store =>
+      taskIdParam(id, params).flatMap: taskId =>
+        for
+          m   <- store.get
+          now <- Clock.instant.map(_.toEpochMilli)
+          _   <- m.get(taskId).flatMap(_.fiber).fold(ZIO.unit)(_.interrupt.unit)
+          _   <- store.update(_.updatedWith(taskId)(_.map(r =>
+                   if r.task.status.isTerminal then r
+                   else r.copy(task = r.task.copy(status = TaskStatus.Cancelled, lastUpdatedAt = now)))))
+        yield rawResultResponse(id, ModernEnvelope.withServerInfo(Json.Obj(), serverInfo))
+
+  /** `tasks/update` — provide client-to-server input for an `input_required`
+    * task. Not applicable to this server's tasks, so it acks with the task state. */
+  private def handleTasksUpdate(
+    id: RequestId,
+    params: Option[Json.Obj],
+    tasks: Option[Ref[Map[TaskId, TaskRecord]]],
+  ): ZIO[Any, Response, Response] =
+    handleTasksGet(id, params, tasks)
+
+  private def withTaskStore(id: RequestId, tasks: Option[Ref[Map[TaskId, TaskRecord]]])(
+    f: Ref[Map[TaskId, TaskRecord]] => ZIO[Any, Response, Response]
+  ): ZIO[Any, Response, Response] =
+    tasks match
+      case Some(store) => f(store)
+      case None =>
+        ZIO.fail(jsonRpcErrorResponseWith(Some(id), ErrorCode.MissingRequiredClientCapability,
+          "Tasks extension is not available on this endpoint", Status.Ok))
+
+  private def taskIdParam(id: RequestId, params: Option[Json.Obj]): ZIO[Any, Response, TaskId] =
+    params.flatMap(_.get("taskId")).flatMap(_.asString) match
+      case Some(t) => ZIO.succeed(TaskId(t))
+      case None    => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, "Missing 'taskId'"))
 
   // --- Shared method dispatch (used by both stateful and stateless) ---
 
@@ -497,6 +597,7 @@ final class McpServer[-R] private (
     request: Request,
     sessions: Ref[Map[SessionId, SessionState]],
     pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
+    taskStore: Ref[Map[TaskId, TaskRecord]],
     bodyJson: Json.Obj,
     principal: Option[Principal],
     pathParams: Map[String, String],
@@ -514,7 +615,7 @@ final class McpServer[-R] private (
         .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
         .flatMap:
           case JsonRpcMessage.Request(id, method, params) =>
-            handleRequest(request, sessions, pendingReqs, id, method, params, principal, pathParams)
+            handleRequest(request, sessions, pendingReqs, taskStore, id, method, params, principal, pathParams)
           case JsonRpcMessage.Notification(method, params) =>
             handleNotification(request, sessions, method, params)
 
@@ -539,6 +640,7 @@ final class McpServer[-R] private (
     request: Request,
     sessions: Ref[Map[SessionId, SessionState]],
     pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
+    taskStore: Ref[Map[TaskId, TaskRecord]],
     id: RequestId,
     method: String,
     params: Option[Json.Obj],
@@ -551,7 +653,7 @@ final class McpServer[-R] private (
       case Left(resp) =>
         ZIO.succeed(resp)
       case Right(ProtocolEra.Modern(version)) =>
-        dispatchModern(request, id, method, version, params, principal, pathParams)
+        dispatchModern(request, id, method, version, params, principal, pathParams, tasks = Some(taskStore))
       case Right(ProtocolEra.Legacy) =>
         method match
           case "initialize" =>
@@ -1053,15 +1155,19 @@ object McpServer:
   trait State:
     def sessions: Ref[Map[SessionId, SessionState]]
     def pendingRequests: Ref[Map[RequestId, Promise[Nothing, Json]]]
+    /** In-memory store for the 2026-07-28 Tasks extension. */
+    def tasks: Ref[Map[TaskId, TaskRecord]]
 
   object State:
     val default: ULayer[State] = ZLayer.fromZIO:
       for
         s <- Ref.make(Map.empty[SessionId, SessionState])
         p <- Ref.make(Map.empty[RequestId, Promise[Nothing, Json]])
+        t <- Ref.make(Map.empty[TaskId, TaskRecord])
       yield new State:
         val sessions = s
         val pendingRequests = p
+        val tasks = t
 
   private val localhostPatterns = Set("localhost", "127.0.0.1", "[::1]", "::1")
 
