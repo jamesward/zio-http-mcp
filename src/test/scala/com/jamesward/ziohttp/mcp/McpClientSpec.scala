@@ -78,13 +78,18 @@ object McpClientSpec extends ZIOSpecDefault:
   private def addArgs(a: Int, b: Int): Json.Obj =
     Json.Obj(Chunk("a" -> Json.Num(a), "b" -> Json.Num(b)))
 
+  // These tests exercise the legacy (2025-11-25) session + SSE transport, so
+  // pin the client to the legacy handshake rather than the modern default.
+  private def connectLegacy(url: String): ZIO[Client & Scope, McpClientError, McpClient] =
+    McpClient.connect(McpClientConfig(url, preferredVersion = ProtocolVersion.V2025_11_25))
+
   override def spec =
     suite("McpClient (vs our own server)")(
       test("stateless: initialize, list tools, call tool (plain JSON)"):
         ZIO.scoped:
           for
             port   <- Server.install(testServer.statelessRoutes)
-            client <- McpClient.connect(s"http://localhost:$port/mcp")
+            client <- connectLegacy(s"http://localhost:$port/mcp")
             tools  <- client.listTools
             result <- client.callTool("add", addArgs(5, 3))
           yield
@@ -97,11 +102,42 @@ object McpClientSpec extends ZIOSpecDefault:
               result.structuredContent.contains(Json.Obj(Chunk("result" -> Json.Num(8)))),
             )
       ,
+      test("client pinned to an early protocol version (2025-06-18) negotiates and calls tools"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(testServer.statelessRoutes)
+            client <- McpClient.connect(McpClientConfig(
+                        s"http://localhost:$port/mcp",
+                        preferredVersion = ProtocolVersion.V2025_06_18,
+                      ))
+            tools  <- client.listTools
+            result <- client.callToolAs[AddOutput]("add", addArgs(5, 3))
+          yield assertTrue(
+            // the server echoed the older version the client requested
+            client.protocolVersion == "2025-06-18",
+            tools.map(_.name.value).contains("add"),
+            result.result == 8,
+          )
+      ,
+      test("client pinned to 2025-03-26 also works end-to-end"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(testServer.statelessRoutes)
+            client <- McpClient.connect(McpClientConfig(
+                        s"http://localhost:$port/mcp",
+                        preferredVersion = ProtocolVersion.V2025_03_26,
+                      ))
+            result <- client.callToolAs[AddOutput]("add", addArgs(1, 2))
+          yield assertTrue(
+            client.protocolVersion == "2025-03-26",
+            result.result == 3,
+          )
+      ,
       test("stateful: SSE tool call + session handshake"):
         ZIO.scoped:
           for
             port   <- Server.install(testServer.routes)
-            client <- McpClient.connect(s"http://localhost:$port/mcp")
+            client <- connectLegacy(s"http://localhost:$port/mcp")
             _      <- client.ping
             result <- client.callTool("greet", addArgs(2, 2))
           yield
@@ -115,7 +151,7 @@ object McpClientSpec extends ZIOSpecDefault:
         ZIO.scoped:
           for
             port      <- Server.install(testServer.statelessRoutes)
-            client    <- McpClient.connect(s"http://localhost:$port/mcp")
+            client    <- connectLegacy(s"http://localhost:$port/mcp")
             resources <- client.listResources
             contents  <- client.readResource("app://config")
           yield assertTrue(
@@ -127,7 +163,7 @@ object McpClientSpec extends ZIOSpecDefault:
         ZIO.scoped:
           for
             port   <- Server.install(testServer.statelessRoutes)
-            client <- McpClient.connect(s"http://localhost:$port/mcp")
+            client <- connectLegacy(s"http://localhost:$port/mcp")
             err    <- client.callTool("does-not-exist").flip
           yield assertTrue(
             err.isInstanceOf[McpClientError.JsonRpc],
@@ -138,7 +174,7 @@ object McpClientSpec extends ZIOSpecDefault:
         ZIO.scoped:
           for
             port   <- Server.install(testServer.statelessRoutes)
-            client <- McpClient.connect(s"http://localhost:$port/mcp")
+            client <- connectLegacy(s"http://localhost:$port/mcp")
             r1     <- client.callTool("add", AddInput(5, 3))
             r2     <- client.callToolAs[AddOutput]("add", addArgs(5, 3))
             r3     <- client.callToolAs[AddInput, AddOutput]("add", AddInput(4, 4))
@@ -152,7 +188,7 @@ object McpClientSpec extends ZIOSpecDefault:
         ZIO.scoped:
           for
             port   <- Server.install(testServer.statelessRoutes)
-            client <- McpClient.connect(s"http://localhost:$port/mcp")
+            client <- connectLegacy(s"http://localhost:$port/mcp")
             err    <- client.callToolAs[AddOutput]("boom", addArgs(1, 1)).flip
           yield assertTrue(
             err.isInstanceOf[McpClientError.ToolFailed],
@@ -163,7 +199,7 @@ object McpClientSpec extends ZIOSpecDefault:
         ZIO.scoped:
           for
             port   <- Server.install(testServer.statelessRoutes)
-            client <- McpClient.connect(s"http://localhost:$port/mcp")
+            client <- connectLegacy(s"http://localhost:$port/mcp")
             // `greet` returns a plain string, which can't decode into AddOutput
             err    <- client.callToolAs[AddOutput]("greet", addArgs(1, 1)).flip
           yield assertTrue(err.isInstanceOf[McpClientError.Decode])
@@ -172,7 +208,7 @@ object McpClientSpec extends ZIOSpecDefault:
         ZIO.scoped:
           for
             port   <- Server.install(instructedServer.statelessRoutes)
-            client <- McpClient.connect(s"http://localhost:$port/mcp")
+            client <- connectLegacy(s"http://localhost:$port/mcp")
           yield assertTrue(
             client.instructions.contains("Use the add tool to sum two integers."),
           )
@@ -181,36 +217,36 @@ object McpClientSpec extends ZIOSpecDefault:
         ZIO.scoped:
           for
             port   <- Server.install(testServer.statelessRoutes)
-            client <- McpClient.connect(s"http://localhost:$port/mcp")
+            client <- connectLegacy(s"http://localhost:$port/mcp")
           yield assertTrue(client.instructions.isEmpty)
       ,
       test("dynamic InstructionsSource supplies instructions per request"):
         ZIO.scoped:
           for
             port   <- Server.install(dynamicInstructedServer.statelessRoutes)
-            client <- McpClient.connect(s"http://localhost:$port/mcp")
+            client <- connectLegacy(s"http://localhost:$port/mcp")
           yield assertTrue(client.instructions.contains("dynamic instructions"))
       ,
       test("instructions: source overload wins when called after a String"):
         ZIO.scoped:
           for
             port    <- Server.install(sourceWinsServer.statelessRoutes)
-            client  <- McpClient.connect(s"http://localhost:$port/mcp")
+            client  <- connectLegacy(s"http://localhost:$port/mcp")
           yield assertTrue(client.instructions.contains("source value"))
       ,
       test("instructions: String overload wins when called after a source"):
         ZIO.scoped:
           for
             port    <- Server.install(stringWinsServer.statelessRoutes)
-            client  <- McpClient.connect(s"http://localhost:$port/mcp")
+            client  <- connectLegacy(s"http://localhost:$port/mcp")
           yield assertTrue(client.instructions.contains("static value"))
       ,
       test("InstructionsSource varies by parameterised mount (ctx.pathParams)"):
         ZIO.scoped:
           for
             port    <- Server.install(perMountInstructedServer.statelessRoutes)
-            acme    <- McpClient.connect(s"http://localhost:$port/acme")
-            globex  <- McpClient.connect(s"http://localhost:$port/globex")
+            acme    <- connectLegacy(s"http://localhost:$port/acme")
+            globex  <- connectLegacy(s"http://localhost:$port/globex")
           yield assertTrue(
             acme.instructions.contains("instructions for acme"),
             globex.instructions.contains("instructions for globex"),

@@ -41,7 +41,30 @@ case class ToolDefinition(
 
 object ToolDefinition:
   given CanEqual[ToolDefinition, ToolDefinition] = CanEqual.derived
-  given JsonCodec[ToolDefinition] = DeriveJsonCodec.gen[ToolDefinition]
+
+  private val derived: JsonCodec[ToolDefinition] = DeriveJsonCodec.gen[ToolDefinition]
+
+  given JsonEncoder[ToolDefinition] = derived.encoder
+
+  /**
+   * Lenient decoder. Some servers advertise a non-object `inputSchema` for a
+   * no-argument tool (a boolean or absent schema — valid under JSON Schema
+   * 2020-12, and explicitly loosened in MCP 2026-07-28). Coerce a non-object
+   * `inputSchema` to `{}` and drop a non-object `outputSchema` so a single odd
+   * tool does not fail the whole `tools/list` decode.
+   */
+  given JsonDecoder[ToolDefinition] = JsonDecoder[Json.Obj].mapOrFail: obj =>
+    val fixedInput = obj.get("inputSchema") match
+      case Some(j) if j.asObject.isEmpty => replaceField(obj, "inputSchema", Json.Obj())
+      case None                          => Json.Obj(obj.fields :+ ("inputSchema" -> Json.Obj()))
+      case _                             => obj
+    val fixed = fixedInput.get("outputSchema") match
+      case Some(j) if j.asObject.isEmpty => Json.Obj(fixedInput.fields.filterNot(_._1 == "outputSchema"))
+      case _                             => fixedInput
+    derived.decoder.fromJsonAST(fixed)
+
+  private def replaceField(obj: Json.Obj, key: String, value: Json): Json.Obj =
+    Json.Obj(obj.fields.map { case (k, _) if k == key => k -> value; case kv => kv })
 
 // --- Initialize ---
 

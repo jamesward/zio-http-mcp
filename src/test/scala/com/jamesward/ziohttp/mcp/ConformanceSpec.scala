@@ -367,43 +367,74 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   // dns-rebinding-protection requires a localhost URL but rootless Docker
   // cannot reach the host's localhost, so we mark it as an expected failure.
-  private val expectedFailuresYaml: String =
+  private val legacyExpectedFailuresYaml: String =
     """server:
       |  - dns-rebinding-protection
       |""".stripMargin
 
-  val conformanceImage: ImageFromDockerfile =
-    ImageFromDockerfile("mcp-conformance", false)
+  // Modern (2026-07-28) baseline. In addition to dns-rebinding-protection:
+  //   - tools-call-with-progress: our modern `tools/call` answers with a single
+  //     JSON result and does not yet stream `notifications/progress` over an SSE
+  //     response stream (progress/log are no-ops in the modern MRTR context).
+  //     The legacy path DOES stream progress; this is a known modern-path gap,
+  //     declared here (not hidden) until modern SSE progress streaming lands.
+  private val modernExpectedFailuresYaml: String =
+    """server:
+      |  - dns-rebinding-protection
+      |  - tools-call-with-progress
+      |""".stripMargin
+
+  // The official MCP conformance kit (npm). The `latest` line (0.1.x) drives the
+  // 2025-11-25 protocol; the `0.2.0-alpha` line drives the modern 2026-07-28
+  // protocol. Our server is dual-era, so each version exercises a different
+  // negotiated path against it. The name and version are kept separate and
+  // joined with `@` only when building the `npm install` command.
+  private val ConformancePackage = "@modelcontextprotocol/conformance"
+  private val LegacyKitVersion   = "0.1.16"
+  private val ModernKitVersion   = "0.2.0-alpha.9"
+
+  def conformanceImage(version: String, tag: String): ImageFromDockerfile =
+    ImageFromDockerfile(s"mcp-conformance-$tag", false)
       .withDockerfileFromBuilder: builder =>
         builder
           .from("node:22-slim")
-          .run("npm install -g @modelcontextprotocol/conformance")
-          .entryPoint("npx", "@modelcontextprotocol/conformance")
+          .run(s"npm install -g $ConformancePackage@$version")
+          .entryPoint("npx", ConformancePackage)
           .build()
 
-  def runConformance(port: Int, scenario: Option[String] = None): Task[(Long, String)] =
+  val legacyImage: ImageFromDockerfile = conformanceImage(LegacyKitVersion, "legacy")
+  val modernImage: ImageFromDockerfile = conformanceImage(ModernKitVersion, "modern")
+
+  def runConformance(image: ImageFromDockerfile, port: Int, specVersion: String, expectedFailures: String, scenario: Option[String] = None): Task[(Long, String)] =
     ZIO.attemptBlocking:
       TC.exposeHostPorts(port)
 
       // Write expected failures YAML to a temp file for mounting
       val tmpFile = java.io.File.createTempFile("expected-failures", ".yaml")
       tmpFile.deleteOnExit()
-      java.nio.file.Files.writeString(tmpFile.toPath, expectedFailuresYaml)
+      java.nio.file.Files.writeString(tmpFile.toPath, expectedFailures)
 
       val stdout = ToStringConsumer()
-      val container = GenericContainer(conformanceImage)
+      val container = GenericContainer(image)
       container.withAccessToHost(true)
       container.withFileSystemBind(tmpFile.getAbsolutePath, "/tmp/expected-failures.yaml",
         org.testcontainers.containers.BindMode.READ_ONLY)
       val baseArgs = Seq(
         "server",
         "--url", s"http://host.testcontainers.internal:$port/mcp",
+        // `--spec-version` picks which protocol era the kit drives: without it
+        // the kit defaults to the legacy `initialize` handshake even on the
+        // 2026-07-28 line, so it must be set explicitly to actually exercise the
+        // modern (server/discover + per-request `_meta`) wire protocol.
+        "--spec-version", specVersion,
         "--expected-failures", "/tmp/expected-failures.yaml",
       )
       val args = scenario.fold(baseArgs)(s => baseArgs ++ Seq("--scenario", s))
       container.withCommand(args*)
       container.withStartupCheckStrategy(
-        OneShotStartupCheckStrategy().withTimeout(JDuration.ofSeconds(60))
+        // The kit runs ~30 scenarios in one shot; allow generous headroom so a
+        // slower Docker host does not time the whole run out mid-suite.
+        OneShotStartupCheckStrategy().withTimeout(JDuration.ofSeconds(180))
       )
       container.withLogConsumer(stdout)
 
@@ -423,17 +454,27 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   override def spec =
     suite("MCP Conformance")(
-      test("conformance test suite passes"):
+      test("2025-11-25 (legacy) conformance suite passes"):
         for
           port              <- Server.install(testServer.routes)
           _                 <- ZIO.logInfo(s"MCP server started on port $port")
-          (exitCode, output) <- runConformance(port)
-          _                 <- ZIO.logInfo(s"Conformance exit code: $exitCode")
-          _                 <- ZIO.logInfo(s"Conformance output:\n$output")
+          (exitCode, output) <- runConformance(legacyImage, port, "2025-11-25", legacyExpectedFailuresYaml)
+          _                 <- ZIO.logInfo(s"Legacy conformance exit code: $exitCode")
+          _                 <- ZIO.logInfo(s"Legacy conformance output:\n$output")
+        yield assertTrue(
+          output.contains("Baseline check passed") || exitCode == 0L,
+        )
+      ,
+      test("2026-07-28 (modern) conformance suite passes"):
+        for
+          port              <- Server.install(testServer.routes)
+          (exitCode, output) <- runConformance(modernImage, port, "2026-07-28", modernExpectedFailuresYaml)
+          _                 <- ZIO.logInfo(s"Modern conformance exit code: $exitCode")
+          _                 <- ZIO.logInfo(s"Modern conformance output:\n$output")
         yield assertTrue(
           output.contains("Baseline check passed") || exitCode == 0L,
         )
     ).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@
       withLiveClock @@
-      timeout(2.minutes) @@
+      timeout(5.minutes) @@
       sequential

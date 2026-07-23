@@ -5,6 +5,8 @@ An MCP (Model Context Protocol) server and client library for Scala 3, ZIO, and 
 
 Implements the [MCP 2025-11-25 specification](https://modelcontextprotocol.io) with Streamable HTTP transport, SSE streaming, tools, resources, prompts, sampling, elicitation, and progress notifications. The client supports the Streamable HTTP transport and OAuth 2.1 `client_credentials` authorization.
 
+The library is **dual-era**: it also implements the stateless [MCP 2026-07-28 revision](https://modelcontextprotocol.io/specification/draft/basic/versioning) and negotiates the protocol version per connection. See [Protocol version negotiation](#protocol-version-negotiation).
+
 ## Getting Started
 
 Add the dependency to your `build.sbt`:
@@ -338,6 +340,45 @@ object Main extends ZIOAppDefault:
   def run =
     Server.serve(server.statelessRoutes).provide(Server.default)
 ```
+
+## Protocol version negotiation
+
+The library supports two protocol revisions and negotiates between them per connection:
+
+- **`2025-11-25` (legacy)** — the `initialize` / `notifications/initialized` handshake, `Mcp-Session-Id` sessions, and server-initiated sampling/elicitation over an SSE back-channel.
+- **`2026-07-28` (modern)** — stateless: no handshake and no session. Every request carries its protocol version and client capabilities in `_meta` (`io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientInfo`, `io.modelcontextprotocol/clientCapabilities`), `server/discover` advertises capabilities on demand, and server-to-client interactions use the Multi Round-Trip Request (MRTR) pattern instead of an SSE back-channel.
+
+### Server
+
+`server.routes` is **dual-era** — it serves both revisions on the same endpoint, choosing per request:
+
+- A request carrying modern `_meta` (or naming a modern-only method such as `server/discover`) is validated (the `Mcp-Method`, `Mcp-Name`, and `MCP-Protocol-Version` headers must match the body) and served statelessly. Results are wrapped in the modern envelope (`resultType`, `_meta.io.modelcontextprotocol/serverInfo`, and `ttlMs`/`cacheScope` on cacheable results). An unsupported version returns `400` with `UnsupportedProtocolVersionError` (`-32022`) listing the supported versions; a header mismatch returns `400`/`-32020`; an unknown modern method returns `404`/`-32601`.
+- An `initialize` request selects the legacy handshake + session path, unchanged.
+
+The server also implements the modern **Tasks extension** (`io.modelcontextprotocol/tasks`): a `tools/call` whose `_meta` carries the tasks marker runs on a background fiber and returns a task handle (`resultType: "task"`) immediately, which the client polls with `tasks/get` and cancels with `tasks/cancel`.
+
+### Client
+
+`McpClient` prefers the newest revision by default and negotiates automatically — it probes `server/discover`, stays modern (stateless) against a modern server, and falls back to the `initialize` handshake against a legacy one:
+
+```scala
+// Newest by default: negotiates modern, or falls back to legacy transparently.
+ZIO.scoped:
+  McpClient.connect("https://example.com/mcp").flatMap: client =>
+    client.listTools
+```
+
+Pin the era with `preferredVersion`, and supply an `onInputRequest` handler to satisfy a modern server's MRTR sampling/elicitation requests:
+
+```scala
+val config = McpClientConfig(
+  serverUrl = "https://example.com/mcp",
+  preferredVersion = ProtocolVersion.V2025_11_25,      // force the legacy handshake
+  onInputRequest = Some(req => ZIO.succeed(/* answer the sampling/elicitation request */ ???)),
+)
+```
+
+`client.protocolVersion` reports the negotiated revision.
 
 ## Authorization
 

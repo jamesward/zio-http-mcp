@@ -8,6 +8,11 @@ scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
   "-language:strictEquality",
   // "-Xfatal-warnings", // not sure where it went
+  // Pin the emitted bytecode to Java 17 regardless of the JDK running the
+  // build, so CI can run on a newer JDK (e.g. Java 25, needed to load the
+  // Java 21 tachyon interop dependency at test time) while the published
+  // artifacts stay JDK 17 compatible.
+  "-release", "17",
 )
 
 val zioVersion = "2.1.26"
@@ -30,6 +35,10 @@ libraryDependencies ++= Seq(
 
   "io.modelcontextprotocol.sdk" % "mcp-core"           % "2.0.0" % Test,
   "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "2.0.0" % Test,
+
+  // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
+  // third-party interop target for cross-version negotiation tests.
+  "dev.tachyonmcp" % "tachyon-server" % "1.0.0-beta.12" % Test,
 )
 
 fork := true
