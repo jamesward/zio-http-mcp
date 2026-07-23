@@ -106,6 +106,43 @@ object DualEraIntegrationSpec extends ZIOSpecDefault:
         )
       ,
 
+      test("our client drives the same server in BOTH eras (legacy 2025-11-25 and modern 2026-07-28)"):
+        for
+          port <- Server.install(server.routes)
+
+          // --- our client, pinned to the LEGACY era (initialize handshake + session) ---
+          legacy <- ZIO.scoped:
+                      for
+                        c <- McpClient.connect(McpClientConfig(
+                               s"http://localhost:$port/mcp",
+                               preferredVersion = ProtocolVersion.V2025_11_25,
+                             ))
+                        tools  <- c.listTools
+                        result <- c.callToolAs[AddOutput]("add", Json.Obj("a" -> Json.Num(2), "b" -> Json.Num(3)))
+                      yield (c.protocolVersion, tools.map(_.name.value).toSet, result.result)
+
+          // --- our client, MODERN era (default: server/discover, stateless) ---
+          modern <- ZIO.scoped:
+                      for
+                        c <- McpClient.connect(McpClientConfig(
+                               s"http://localhost:$port/mcp",
+                               preferredVersion = ProtocolVersion.V2026_07_28,
+                             ))
+                        tools  <- c.listTools
+                        result <- c.callToolAs[AddOutput]("add", Json.Obj("a" -> Json.Num(10), "b" -> Json.Num(11)))
+                      yield (c.protocolVersion, tools.map(_.name.value).toSet, result.result)
+        yield assertTrue(
+          // legacy era: negotiated 2025-11-25, tools + call work over the handshake/session
+          legacy._1 == ProtocolVersion.V2025_11_25.wire,
+          legacy._2 == Set("add"),
+          legacy._3 == 5,
+          // modern era: negotiated 2026-07-28, tools + call work statelessly
+          modern._1 == ProtocolVersion.V2026_07_28.wire,
+          modern._2 == Set("add"),
+          modern._3 == 21,
+        )
+      ,
+
       test("a minimal new-protocol client with no routing headers is served"):
         for
           port      <- Server.install(server.routes)

@@ -393,7 +393,7 @@ object ConformanceSpec extends ZIOSpecDefault:
   val legacyImage: ImageFromDockerfile = conformanceImage(LegacyKitVersion, "legacy")
   val modernImage: ImageFromDockerfile = conformanceImage(ModernKitVersion, "modern")
 
-  def runConformance(image: ImageFromDockerfile, port: Int, scenario: Option[String] = None): Task[(Long, String)] =
+  def runConformance(image: ImageFromDockerfile, port: Int, specVersion: String, scenario: Option[String] = None): Task[(Long, String)] =
     ZIO.attemptBlocking:
       TC.exposeHostPorts(port)
 
@@ -410,12 +410,19 @@ object ConformanceSpec extends ZIOSpecDefault:
       val baseArgs = Seq(
         "server",
         "--url", s"http://host.testcontainers.internal:$port/mcp",
+        // `--spec-version` picks which protocol era the kit drives: without it
+        // the kit defaults to the legacy `initialize` handshake even on the
+        // 2026-07-28 line, so it must be set explicitly to actually exercise the
+        // modern (server/discover + per-request `_meta`) wire protocol.
+        "--spec-version", specVersion,
         "--expected-failures", "/tmp/expected-failures.yaml",
       )
       val args = scenario.fold(baseArgs)(s => baseArgs ++ Seq("--scenario", s))
       container.withCommand(args*)
       container.withStartupCheckStrategy(
-        OneShotStartupCheckStrategy().withTimeout(JDuration.ofSeconds(60))
+        // The kit runs ~30 scenarios in one shot; allow generous headroom so a
+        // slower Docker host does not time the whole run out mid-suite.
+        OneShotStartupCheckStrategy().withTimeout(JDuration.ofSeconds(180))
       )
       container.withLogConsumer(stdout)
 
@@ -439,7 +446,7 @@ object ConformanceSpec extends ZIOSpecDefault:
         for
           port              <- Server.install(testServer.routes)
           _                 <- ZIO.logInfo(s"MCP server started on port $port")
-          (exitCode, output) <- runConformance(legacyImage, port)
+          (exitCode, output) <- runConformance(legacyImage, port, "2025-11-25")
           _                 <- ZIO.logInfo(s"Legacy conformance exit code: $exitCode")
           _                 <- ZIO.logInfo(s"Legacy conformance output:\n$output")
         yield assertTrue(
@@ -449,7 +456,7 @@ object ConformanceSpec extends ZIOSpecDefault:
       test("2026-07-28 (modern) conformance suite passes"):
         for
           port              <- Server.install(testServer.routes)
-          (exitCode, output) <- runConformance(modernImage, port)
+          (exitCode, output) <- runConformance(modernImage, port, "2026-07-28")
           _                 <- ZIO.logInfo(s"Modern conformance exit code: $exitCode")
           _                 <- ZIO.logInfo(s"Modern conformance output:\n$output")
         yield assertTrue(
