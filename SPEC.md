@@ -3,13 +3,14 @@
 Implementation of the Model Context Protocol 2025-11-25 spec:
 https://modelcontextprotocol.io/specification/2025-11-25
 
-Also implements the stateless 2026-07-28 revision and negotiates the protocol
-version per connection (dual-era). See the "Protocol version negotiation"
-section of the README and `NegotiationSpec` / `TasksSpec` for the modern path:
-`server/discover`, per-request `_meta` version, the modern result envelope
-(`resultType`, `_meta.serverInfo`, `ttlMs`/`cacheScope`), MRTR
-(`InputRequiredResult`), and the `io.modelcontextprotocol/tasks` extension.
-https://modelcontextprotocol.io/specification/draft/basic/versioning
+Also implements the stateless 2026-07-28 revision (final) and negotiates the
+protocol version per connection (dual-era). See the "Protocol version
+negotiation" section of the README and `NegotiationSpec` / `TasksSpec` for the
+modern path: `server/discover`, per-request `_meta` version, the modern result
+envelope (`resultType`, `_meta.serverInfo`, `ttlMs`/`cacheScope`), MRTR
+(`InputRequiredResult`), request-scoped notification streaming, and the
+`io.modelcontextprotocol/tasks` extension.
+https://modelcontextprotocol.io/specification/2026-07-28
 
 Technologies:
 - Scala 3

@@ -163,13 +163,22 @@ object McpToolContext:
    * or — when no answer is available yet — aborts the handler with an
    * [[InputRequiredSignal]] so the server can ask for it via MRTR.
    *
-   * `log` / `progress` are no-ops here: a modern tool call answered with a
-   * single JSON result carries no notification stream.
+   * Request-scoped notifications flow on the response stream of the request
+   * they relate to (2026-07-28 Streamable HTTP): when `notifications` is set
+   * the dispatcher answers the call with an SSE stream and this context feeds
+   * it. `progress` emits only when the request carried a `_meta.progressToken`,
+   * and `log` emits only when the request opted in via
+   * `_meta.io.modelcontextprotocol/logLevel` (at or above that level) — servers
+   * MUST NOT emit `notifications/message` for requests that did not include it.
+   * With no `notifications` queue (a plain single-JSON call) both are no-ops.
    */
   private[mcp] def modern(
     inputResponses: Chunk[InputResponse],
     callerPrincipal: Option[Principal] = None,
     callerPathParams: Map[String, String] = Map.empty,
+    notifications: Option[Queue[JsonRpcMessage]] = None,
+    progressToken: Option[Json] = None,
+    minLogLevel: Option[LogLevel] = None,
   ): McpToolContext =
     new McpToolContext:
       private val counter = new java.util.concurrent.atomic.AtomicInteger(0)
@@ -177,8 +186,26 @@ object McpToolContext:
       override val principal: Option[Principal] = callerPrincipal
       override val pathParams: Map[String, String] = callerPathParams
 
-      def log(level: LogLevel, message: String): UIO[Unit] = ZIO.unit
-      def progress(current: Double, total: Double, message: Option[String]): UIO[Unit] = ZIO.unit
+      def log(level: LogLevel, message: String): UIO[Unit] =
+        (notifications, minLogLevel) match
+          case (Some(queue), Some(min)) if level.ordinal >= min.ordinal =>
+            val params = Json.Obj(Chunk(
+              "level" -> Json.Str(level.asString),
+              "data" -> Json.Str(message),
+            ))
+            queue.offer(JsonRpcMessage.Notification("notifications/message", Some(params))).unit
+          case _ => ZIO.unit
+
+      def progress(current: Double, total: Double, message: Option[String]): UIO[Unit] =
+        (notifications, progressToken) match
+          case (Some(queue), Some(token)) =>
+            val fields = Chunk(
+              "progressToken" -> token,
+              "progress" -> Json.Num(current),
+              "total" -> Json.Num(total),
+            ) ++ message.fold(Chunk.empty[(String, Json)])(m => Chunk("message" -> Json.Str(m)))
+            queue.offer(JsonRpcMessage.Notification("notifications/progress", Some(Json.Obj(fields)))).unit
+          case _ => ZIO.unit
 
       def sample(prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
         val params = Json.Obj(Chunk(
