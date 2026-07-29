@@ -31,7 +31,10 @@ object McpClientLiveSpec extends ZIOSpecDefault:
               client <- McpClient.connect(javadocsUrl)
             yield assertTrue(
               client.serverInfo.name == "javadocs.dev",
-              client.protocolVersion == McpProtocol.Version,
+              // A third-party server's era can change under us (javadocs.dev now
+              // negotiates 2026-07-28); assert we settled on a supported revision
+              // rather than pinning the era of a live server we don't control.
+              ProtocolVersion.supportedWire.contains(client.protocolVersion),
               client.serverCapabilities.tools.isDefined,
             )
         ,
