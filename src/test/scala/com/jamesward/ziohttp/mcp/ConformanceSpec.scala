@@ -372,26 +372,25 @@ object ConformanceSpec extends ZIOSpecDefault:
       |  - dns-rebinding-protection
       |""".stripMargin
 
-  // Modern (2026-07-28) baseline. In addition to dns-rebinding-protection:
-  //   - tools-call-with-progress: our modern `tools/call` answers with a single
-  //     JSON result and does not yet stream `notifications/progress` over an SSE
-  //     response stream (progress/log are no-ops in the modern MRTR context).
-  //     The legacy path DOES stream progress; this is a known modern-path gap,
-  //     declared here (not hidden) until modern SSE progress streaming lands.
+  // Modern (2026-07-28) baseline: only the Docker-networking limitation.
+  // Modern `tools/call` streams request-scoped `notifications/progress` /
+  // `notifications/message` over the SSE response stream when the request
+  // opts in, so `tools-call-with-progress` passes and is no longer baselined.
   private val modernExpectedFailuresYaml: String =
     """server:
       |  - dns-rebinding-protection
-      |  - tools-call-with-progress
       |""".stripMargin
 
   // The official MCP conformance kit (npm). The `latest` line (0.1.x) drives the
-  // 2025-11-25 protocol; the `0.2.0-alpha` line drives the modern 2026-07-28
-  // protocol. Our server is dual-era, so each version exercises a different
-  // negotiated path against it. The name and version are kept separate and
-  // joined with `@` only when building the `npm install` command.
+  // 2025-11-25 protocol; the `0.2.0` line drives the modern 2026-07-28 protocol
+  // (`0.2.0-alpha.10` is the release aligned with the finalized 2026-07-28 spec;
+  // move to the stable `0.2.0` once it ships). Our server is dual-era, so each
+  // version exercises a different negotiated path against it. The name and
+  // version are kept separate and joined with `@` only when building the
+  // `npm install` command.
   private val ConformancePackage = "@modelcontextprotocol/conformance"
   private val LegacyKitVersion   = "0.1.16"
-  private val ModernKitVersion   = "0.2.0-alpha.9"
+  private val ModernKitVersion   = "0.2.0-alpha.10"
 
   def conformanceImage(version: String, tag: String): ImageFromDockerfile =
     ImageFromDockerfile(s"mcp-conformance-$tag", false)

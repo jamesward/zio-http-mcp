@@ -391,8 +391,14 @@ final class McpServer[-R] private (
    * [[McpToolContext.modern]] context: any `sample` / `elicit` the handler
    * performs is answered from the `inputResponses` the client sent on its retry,
    * or — when an answer is not yet available — the handler aborts and the server
-   * returns an [[InputRequiredResult]] (Multi Round-Trip Requests). Answered in
-   * a single JSON result.
+   * returns an [[InputRequiredResult]] (Multi Round-Trip Requests).
+   *
+   * Answered in a single JSON result unless the request opted into
+   * request-scoped notifications — a `_meta.progressToken` and/or a
+   * `_meta.io.modelcontextprotocol/logLevel` — in which case the response is an
+   * SSE stream carrying `notifications/progress` / `notifications/message`
+   * followed by the final result (2026-07-28 Streamable HTTP: request-scoped
+   * notifications flow on the response stream of the request they relate to).
    */
   private def modernHandleToolsCall(
     request: Request,
@@ -409,7 +415,8 @@ final class McpServer[-R] private (
           // Dynamic tool sources do not participate in MRTR.
           dispatchToSource(id, version, callParams, principal, pathParams)
         case Some(tool) =>
-          val taskRequested = McpMeta.of(params).flatMap(_.get(TaskRecord.ExtensionId)).isDefined
+          val meta          = McpMeta.of(params)
+          val taskRequested = meta.flatMap(_.get(TaskRecord.ExtensionId)).isDefined
           (taskRequested, tasks) match
             case (true, Some(store)) =>
               runToolAsTask(id, tool, callParams, principal, pathParams, store)
@@ -418,23 +425,63 @@ final class McpServer[-R] private (
                 .flatMap(_.get("inputResponses")).flatMap(_.asArray)
                 .map(_.flatMap(_.as[InputResponse].toOption))
                 .getOrElse(Chunk.empty)
+              val progressToken = McpMeta.raw(meta, McpMeta.ProgressToken)
+              val logLevel      = McpMeta.raw(meta, McpMeta.LogLevel)
+                .flatMap(_.as[com.jamesward.ziohttp.mcp.LogLevel].toOption)
               enforceToolScopes(request, principal, tool) *> {
-                val ctx = McpToolContext.modern(inputResponses, principal, pathParams)
-                tool.callWithContext(callParams.arguments, ctx)
-                  .foldCauseZIO(
-                    cause =>
-                      cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
-                        case Some(signal) =>
-                          val ir = InputRequiredResult(Chunk(signal.request))
-                          ZIO.succeed(rawResultResponse(id, ir.toResultJson(serverInfo)))
-                        case None =>
-                          resultResponse(id, version, CallToolResult(
-                            content = Chunk(ToolContent.text("Tool execution failed")),
-                            isError = Some(true),
-                          )),
-                    result => resultResponse(id, version, result),
-                  )
+                if progressToken.isDefined || logLevel.isDefined then
+                  modernStreamedToolCall(id, tool, callParams, inputResponses, principal, pathParams, progressToken, logLevel)
+                else
+                  val ctx = McpToolContext.modern(inputResponses, principal, pathParams)
+                  tool.callWithContext(callParams.arguments, ctx)
+                    .foldCauseZIO(
+                      cause => ZIO.succeed(rawResultResponse(id, modernToolFailureJson(cause))),
+                      result => resultResponse(id, version, result),
+                    )
               }
+
+  /** The final result object for a failed modern tool call: an
+    * [[InputRequiredResult]] when the failure is an MRTR input signal,
+    * otherwise a generic `isError` [[CallToolResult]] in the modern envelope. */
+  private def modernToolFailureJson(cause: Cause[Any]): Json.Obj =
+    cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
+      case Some(signal) =>
+        InputRequiredResult(Chunk(signal.request)).toResultJson(serverInfo)
+      case None =>
+        val errorResult = CallToolResult(
+          content = Chunk(ToolContent.text("Tool execution failed")),
+          isError = Some(true),
+        )
+        val obj = callToolResultJson(errorResult).asObject.getOrElse(Json.Obj())
+        ModernEnvelope.complete(obj, serverInfo, cacheable = false)
+
+  /** Modern `tools/call` answered as an SSE stream: the tool runs on a forked
+    * fiber feeding request-scoped notifications into the stream, and the final
+    * modern-envelope result (or MRTR interim result) closes it. */
+  private def modernStreamedToolCall(
+    id: RequestId,
+    tool: McpToolHandlerR[R],
+    callParams: ToolCallParams,
+    inputResponses: Chunk[InputResponse],
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+    progressToken: Option[Json],
+    logLevel: Option[com.jamesward.ziohttp.mcp.LogLevel],
+  ): ZIO[R, Response, Response] =
+    Queue.unbounded[JsonRpcMessage].flatMap: queue =>
+      val ctx = McpToolContext.modern(inputResponses, principal, pathParams, Some(queue), progressToken, logLevel)
+      Promise.make[Nothing, Json].flatMap: resultPromise =>
+        val runTool = tool.callWithContext(callParams.arguments, ctx)
+          .foldCauseZIO(
+            cause => ZIO.succeed(modernToolFailureJson(cause)),
+            result =>
+              val obj = callToolResultJson(result).asObject.getOrElse(Json.Obj())
+              ZIO.succeed(ModernEnvelope.complete(obj, serverInfo, cacheable = false)),
+          )
+          .flatMap(json => resultPromise.succeed(json))
+          .ensuring(drainThenShutdown(queue))
+        runTool.fork.as:
+          sseToolCallResponse(id, queue, resultPromise, endAfterResult = true)
 
   /**
    * Execute a tool as a Tasks-extension task: create a `working` task, run the
@@ -814,16 +861,16 @@ final class McpServer[-R] private (
               val toolEffect = tool.callWithContext(callParams.arguments, ctx)
 
               // Fork the tool, stream messages + result as SSE
-              Promise.make[Nothing, CallToolResult].flatMap: resultPromise =>
+              Promise.make[Nothing, Json].flatMap: resultPromise =>
                 val runTool = toolEffect
-                  .flatMap(resultPromise.succeed)
+                  .flatMap(r => resultPromise.succeed(callToolResultJson(r)))
                   .catchAllDefect: defect =>
                     val errorResult = CallToolResult(
                       content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
                       isError = Some(true),
                     )
-                    resultPromise.succeed(errorResult)
-                  .ensuring(queue.shutdown)
+                    resultPromise.succeed(callToolResultJson(errorResult))
+                  .ensuring(drainThenShutdown(queue))
                 runTool.fork.as:
                   sseToolCallResponse(id, queue, resultPromise)
           }
@@ -1047,24 +1094,45 @@ final class McpServer[-R] private (
 
   // --- SSE response for tool calls ---
 
+  /** Shut the notification queue down only once the SSE consumer has taken
+    * everything already offered — a bare `shutdown` discards pending items, so
+    * notifications emitted just before the tool finished could be lost. The
+    * timeout covers a consumer that went away (client disconnect). */
+  private def drainThenShutdown(queue: Queue[JsonRpcMessage]): UIO[Unit] =
+    queue.size
+      .repeat(Schedule.recurWhile[Int](_ > 0) && Schedule.spaced(1.milli))
+      .timeout(5.seconds)
+      .zipRight(queue.shutdown)
+
+  /** Encode a [[CallToolResult]] to JSON, falling back to an `isError` result
+    * when encoding fails (so the wire always carries a well-formed result). */
+  private def callToolResultJson(result: CallToolResult): Json =
+    result.toJsonAST.getOrElse(
+      CallToolResult(content = Chunk(ToolContent.text("Internal error: failed to encode result")), isError = Some(true))
+        .toJsonAST.getOrElse(Json.Obj())
+    )
+
+  /** SSE response for a tool call: request-scoped notifications from `queue`,
+    * then the final JSON-RPC response. When `endAfterResult` is set the stream
+    * terminates after the response (the modern stateless behavior — nothing can
+    * follow the result); otherwise keepalives hold the connection open (the
+    * legacy behavior, preserved verbatim). */
   private def sseToolCallResponse(
     id: RequestId,
     queue: Queue[JsonRpcMessage],
-    resultPromise: Promise[Nothing, CallToolResult],
+    resultPromise: Promise[Nothing, Json],
+    endAfterResult: Boolean = false,
   ): Response =
     val messageStream = ZStream.fromQueue(queue).map: msg =>
       sseEvent(msg.toJson)
 
-    val resultStream = ZStream.fromZIO(resultPromise.await).map: result =>
-      val json = result.toJsonAST.getOrElse(
-        CallToolResult(content = Chunk(ToolContent.text("Internal error: failed to encode result")), isError = Some(true))
-          .toJsonAST.getOrElse(Json.Obj())
-      )
+    val resultStream = ZStream.fromZIO(resultPromise.await).map: json =>
       sseEvent(JsonRpcResponse(id, json).toJson)
 
     val keepalive = ZStream.tick(30.seconds).as(": keepalive\n\n")
 
-    val stream = (messageStream ++ resultStream).merge(keepalive)
+    val events = messageStream ++ resultStream
+    val stream = if endAfterResult then events.mergeHaltLeft(keepalive) else events.merge(keepalive)
 
     Response(
       status = Status.Ok,

@@ -27,6 +27,17 @@ object NegotiationSpec extends ZIOSpecDefault:
     .handle[Any, Nothing, AddInput, String]: input =>
       ZIO.succeed(s"${input.a + input.b}")
 
+  val noisyTool: McpToolHandler = McpTool("noisy")
+    .description("Emits progress and log notifications while running")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      for
+        _ <- ctx.progress(0, 100)
+        _ <- ctx.log(com.jamesward.ziohttp.mcp.LogLevel.Debug, "starting")
+        _ <- ctx.progress(50, 100)
+        _ <- ctx.log(com.jamesward.ziohttp.mcp.LogLevel.Warning, "halfway")
+        _ <- ctx.progress(100, 100)
+      yield Chunk(ToolContent.text("noisy done"))
+
   val testResource: McpResourceHandler = McpResource("test://data", "Test Data")
     .description("A test resource")
     .mimeType("text/plain")
@@ -41,6 +52,7 @@ object NegotiationSpec extends ZIOSpecDefault:
   val testServer = McpServer("neg-server", "9.9.9")
     .instructions("be helpful")
     .tool(addTool)
+    .tool(noisyTool)
     .resource(testResource)
     .prompt(testPrompt)
 
@@ -49,8 +61,15 @@ object NegotiationSpec extends ZIOSpecDefault:
   private def meta(version: String): Json.Obj =
     Json.Obj(McpMeta.ProtocolVersion -> Json.Str(version))
 
-  private def modernBody(id: Int, method: String, extra: Chunk[(String, Json)] = Chunk.empty, version: String = Modern): String =
-    val params = Json.Obj(extra :+ ("_meta" -> (meta(version): Json)))
+  private def modernBody(
+    id: Int,
+    method: String,
+    extra: Chunk[(String, Json)] = Chunk.empty,
+    version: String = Modern,
+    metaExtra: Chunk[(String, Json)] = Chunk.empty,
+  ): String =
+    val fullMeta = Json.Obj(meta(version).fields ++ metaExtra)
+    val params = Json.Obj(extra :+ ("_meta" -> (fullMeta: Json)))
     s"""{"jsonrpc":"2.0","id":$id,"method":"$method","params":${(params: Json).toJson}}"""
 
   /** POST a modern request with the required routing headers. Overrides let
@@ -78,6 +97,19 @@ object NegotiationSpec extends ZIOSpecDefault:
   private def resultOf(b: Json.Obj): Option[Json.Obj] = b.get("result").flatMap(_.asObject)
   private def errorOf(b: Json.Obj): Option[Json.Obj]  = b.get("error").flatMap(_.asObject)
   private def codeOf(b: Json.Obj): Option[Int] = errorOf(b).flatMap(_.get("code")).flatMap(_.asNumber).map(_.value.intValue)
+
+  /** Parse the JSON payloads out of an SSE body's `data:` lines, in order. */
+  private def sseDataJsons(body: String): Chunk[Json.Obj] =
+    Chunk.fromIterator(
+      body.linesIterator
+        .filter(_.startsWith("data: "))
+        .map(_.stripPrefix("data: "))
+        .flatMap(_.fromJson[Json.Obj].toOption)
+    )
+
+  private def notificationsOf(events: Chunk[Json.Obj], method: String): Chunk[Json.Obj] =
+    events.filter(_.get("method").flatMap(_.asString).contains(method))
+      .flatMap(_.get("params").flatMap(_.asObject))
 
   private val unitSuite = suite("Negotiation (unit)")(
 
@@ -227,7 +259,7 @@ object NegotiationSpec extends ZIOSpecDefault:
         assertTrue(
           resp.status == Status.Ok,
           r.flatMap(_.get("resultType")).flatMap(_.asString).contains("complete"),
-          r.flatMap(_.get("tools")).flatMap(_.asArray).exists(_.size == 1),
+          r.flatMap(_.get("tools")).flatMap(_.asArray).exists(_.size == 2),
           r.flatMap(_.get("_meta")).flatMap(_.asObject).flatMap(_.get(McpMeta.ServerInfo)).isDefined,
           r.flatMap(_.get("ttlMs")).isDefined,
         )
@@ -250,6 +282,58 @@ object NegotiationSpec extends ZIOSpecDefault:
           resp.status == Status.Ok,
           text.contains("7"),
           r.flatMap(_.get("resultType")).flatMap(_.asString).contains("complete"),
+        )
+    ,
+
+    test("modern tools/call with a progressToken streams progress notifications then the result over SSE"):
+      val extra = Chunk[(String, Json)]("name" -> Json.Str("noisy"), "arguments" -> Json.Obj())
+      val body  = modernBody(1, "tools/call", extra, metaExtra = Chunk(McpMeta.ProgressToken -> Json.Str("tok-1")))
+      for
+        port  <- Server.install(testServer.routes)
+        resp  <- postModern(port, body, "tools/call", name = Some("noisy"))
+        raw   <- resp.body.asString
+      yield
+        val events   = sseDataJsons(raw)
+        val progress = notificationsOf(events, "notifications/progress")
+        val values   = progress.flatMap(_.get("progress")).flatMap(_.asNumber).map(_.value.doubleValue)
+        val response = events.findLast(_.get("id").isDefined)
+        val result   = response.flatMap(resultOf)
+        val text     = result.flatMap(_.get("content")).flatMap(_.asArray).flatMap(_.headOption)
+          .flatMap(_.asObject).flatMap(_.get("text")).flatMap(_.asString)
+        assertTrue(
+          resp.status == Status.Ok,
+          resp.rawHeader("content-type").exists(_.contains("text/event-stream")),
+          progress.size == 3,
+          progress.forall(_.get("progressToken").flatMap(_.asString).contains("tok-1")),
+          values == Chunk(0.0, 50.0, 100.0),
+          // no logLevel opt-in on the request, so log calls MUST NOT surface
+          notificationsOf(events, "notifications/message").isEmpty,
+          text.contains("noisy done"),
+          result.flatMap(_.get("resultType")).flatMap(_.asString).contains("complete"),
+          result.flatMap(_.get("_meta")).flatMap(_.asObject).flatMap(_.get(McpMeta.ServerInfo)).isDefined,
+        )
+    ,
+
+    test("modern tools/call with a logLevel streams messages at or above that level"):
+      val extra = Chunk[(String, Json)]("name" -> Json.Str("noisy"), "arguments" -> Json.Obj())
+      val body  = modernBody(1, "tools/call", extra, metaExtra = Chunk(McpMeta.LogLevel -> Json.Str("warning")))
+      for
+        port  <- Server.install(testServer.routes)
+        resp  <- postModern(port, body, "tools/call", name = Some("noisy"))
+        raw   <- resp.body.asString
+      yield
+        val events   = sseDataJsons(raw)
+        val messages = notificationsOf(events, "notifications/message")
+        val data     = messages.flatMap(_.get("data")).flatMap(_.asString)
+        assertTrue(
+          resp.status == Status.Ok,
+          resp.rawHeader("content-type").exists(_.contains("text/event-stream")),
+          // the debug-level "starting" message is below the requested level
+          data == Chunk("halfway"),
+          // no progressToken on the request, so progress calls MUST NOT surface
+          notificationsOf(events, "notifications/progress").isEmpty,
+          events.findLast(_.get("id").isDefined).flatMap(resultOf)
+            .flatMap(_.get("resultType")).flatMap(_.asString).contains("complete"),
         )
     ,
 
@@ -433,7 +517,7 @@ object NegotiationSpec extends ZIOSpecDefault:
         initR.status == Status.Ok,
         session.nonEmpty,
         listR.status == Status.Ok,
-        listB.get("result").flatMap(_.asObject).flatMap(_.get("tools")).flatMap(_.asArray).exists(_.size == 1),
+        listB.get("result").flatMap(_.asObject).flatMap(_.get("tools")).flatMap(_.asArray).exists(_.size == 2),
         // legacy follow-ups are NOT wrapped in the modern envelope
         listB.get("result").flatMap(_.asObject).flatMap(_.get("resultType")).isEmpty,
         // `ping` still exists in the legacy era and round-trips over the session

@@ -38,7 +38,7 @@ libraryDependencies ++= Seq(
 
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
-  "dev.tachyonmcp" % "tachyon-server" % "1.0.0-beta.12" % Test,
+  "dev.tachyonmcp" % "tachyon-server" % "1.0.0-beta.13" % Test,
 )
 
 fork := true

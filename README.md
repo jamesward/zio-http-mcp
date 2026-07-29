@@ -5,7 +5,7 @@ An MCP (Model Context Protocol) server and client library for Scala 3, ZIO, and 
 
 Implements the [MCP 2025-11-25 specification](https://modelcontextprotocol.io) with Streamable HTTP transport, SSE streaming, tools, resources, prompts, sampling, elicitation, and progress notifications. The client supports the Streamable HTTP transport and OAuth 2.1 `client_credentials` authorization.
 
-The library is **dual-era**: it also implements the stateless [MCP 2026-07-28 revision](https://modelcontextprotocol.io/specification/draft/basic/versioning) and negotiates the protocol version per connection. See [Protocol version negotiation](#protocol-version-negotiation).
+The library is **dual-era**: it also implements the stateless [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28) (final) and negotiates the protocol version per connection. See [Protocol version negotiation](#protocol-version-negotiation).
 
 ## Getting Started
 
@@ -352,7 +352,7 @@ The library supports two protocol revisions and negotiates between them per conn
 
 `server.routes` is **dual-era** — it serves both revisions on the same endpoint, choosing per request:
 
-- A request carrying modern `_meta` (or naming a modern-only method such as `server/discover`) is validated (the `Mcp-Method`, `Mcp-Name`, and `MCP-Protocol-Version` headers must match the body) and served statelessly. Results are wrapped in the modern envelope (`resultType`, `_meta.io.modelcontextprotocol/serverInfo`, and `ttlMs`/`cacheScope` on cacheable results). An unsupported version returns `400` with `UnsupportedProtocolVersionError` (`-32022`) listing the supported versions; a header mismatch returns `400`/`-32020`; an unknown modern method returns `404`/`-32601`.
+- A request carrying modern `_meta` (or naming a modern-only method such as `server/discover`) is validated (the `Mcp-Method`, `Mcp-Name`, and `MCP-Protocol-Version` headers must match the body) and served statelessly. Results are wrapped in the modern envelope (`resultType`, `_meta.io.modelcontextprotocol/serverInfo`, and `ttlMs`/`cacheScope` on cacheable results). An unsupported version returns `400` with `UnsupportedProtocolVersionError` (`-32022`) listing the supported versions; a header mismatch returns `400`/`-32020`; an unknown modern method returns `404`/`-32601`. A modern `tools/call` that opts into request-scoped notifications — a `_meta.progressToken` and/or `_meta.io.modelcontextprotocol/logLevel` — is answered as an SSE stream carrying `notifications/progress` / `notifications/message` (filtered to the requested level) followed by the final result; without the opt-in it stays a single JSON result.
 - An `initialize` request selects the legacy handshake + session path, unchanged.
 
 The server also implements the modern **Tasks extension** (`io.modelcontextprotocol/tasks`): a `tools/call` whose `_meta` carries the tasks marker runs on a background fiber and returns a task handle (`resultType: "task"`) immediately, which the client polls with `tasks/get` and cancels with `tasks/cancel`.
