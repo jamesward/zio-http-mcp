@@ -8,8 +8,8 @@ import zio.json.ast.Json
 import zio.test.*
 import zio.test.TestAspect.*
 
-import dev.tachyonmcp.server.TachyonServer
-import dev.tachyonmcp.server.features.tools.{ToolHandler, ToolResult}
+import dev.tachyonmcp.api.server.features.tools.ToolResult
+import dev.tachyonmcp.core.server.TachyonServer
 
 given canEqualStatusTachyon: CanEqual[Status, Status] = CanEqual.derived
 
@@ -26,18 +26,22 @@ object TachyonInteropSpec extends ZIOSpecDefault:
   /** Start a tachyon server with a `greet` tool on an ephemeral port. */
   private def tachyonServer: ZIO[Scope, Throwable, TachyonServer] =
     ZIO.acquireRelease(
-      ZIO.attemptBlocking(
-        TachyonServer.builder()
+      ZIO.attemptBlocking:
+        val server = TachyonServer.builder()
           .name("tachyon-server")
           .version("1.0.0")
-          .tool(ToolHandler.of(
-            "greet",
-            "Greets the caller",
-            (_, _) => ToolResult.text("hello from tachyon"),
-          ))
+          .withTools: tools =>
+            tools.register(
+              b =>
+                b.name("greet")
+                b.description("Greets the caller")
+              ,
+              (_, _) => ToolResult.text("hello from tachyon")
+            )
           .port(0)
-          .start()
-      )
+          .build()
+        server.start()
+        server
     )(server => ZIO.attemptBlocking(server.close()).ignore)
 
   private val Modern = ProtocolVersion.V2026_07_28.wire
