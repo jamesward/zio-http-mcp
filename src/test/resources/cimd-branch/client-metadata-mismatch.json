@@ -1,0 +1,14 @@
+{
+  "client_id": "https://cdn.jsdelivr.net/gh/jamesward/zio-http-mcp@claude/mcp-auth-zio-http-e98ypt/src/test/resources/cimd-branch/some-other-location.json",
+  "client_name": "mismatched client_id fixture",
+  "redirect_uris": [
+    "http://127.0.0.1:3000/callback"
+  ],
+  "grant_types": [
+    "authorization_code"
+  ],
+  "response_types": [
+    "code"
+  ],
+  "token_endpoint_auth_method": "none"
+}

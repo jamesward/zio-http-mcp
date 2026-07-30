@@ -1,5 +1,5 @@
 {
-  "client_id": "https://raw.githubusercontent.com/jamesward/zio-http-mcp/claude/mcp-auth-zio-http-e98ypt/src/test/resources/cimd/client-metadata.json",
+  "client_id": "https://cdn.jsdelivr.net/gh/jamesward/zio-http-mcp@main/src/test/resources/cimd/client-metadata.json",
   "client_name": "zio-http-mcp client",
   "client_uri": "https://github.com/jamesward/zio-http-mcp",
   "redirect_uris": ["http://127.0.0.1:3000/callback"],
