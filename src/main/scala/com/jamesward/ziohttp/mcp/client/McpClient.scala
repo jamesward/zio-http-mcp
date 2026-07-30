@@ -116,8 +116,11 @@ trait McpClient:
  *
  * @param serverUrl   The MCP endpoint, e.g. `https://example.com/mcp`.
  * @param clientInfo  Identity reported to the server in `initialize`.
- * @param oauth       When set, the client runs the OAuth 2.1 `client_credentials`
- *                    flow (with automatic discovery) and attaches a bearer token.
+ * @param oauth       When set, the client runs an OAuth 2.1 flow (with automatic
+ *                    discovery) and attaches a bearer token: [[OAuthClientCredentials]]
+ *                    for machine-to-machine, or [[OAuthAuthorizationCode]] for the
+ *                    MCP-spec authorization-code + PKCE flow (CIMD / DCR /
+ *                    pre-registration, RFC 9207 `iss` validation).
  * @param headers     Static headers attached to every request (e.g. a fixed
  *                    `Authorization: Bearer <token>` or a custom auth header for an
  *                    upstream that authenticates by a pre-shared credential). Applied
@@ -126,7 +129,7 @@ trait McpClient:
 final case class McpClientConfig(
   serverUrl: String,
   clientInfo: Implementation = Implementation("zio-http-mcp-client", "0.1.0"),
-  oauth: Option[OAuthClientCredentials] = None,
+  oauth: Option[McpClientOAuth] = None,
   headers: Headers = Headers.empty,
   /**
    * The protocol version the client prefers. Defaults to the newest supported
@@ -491,7 +494,7 @@ object McpClient:
             token    <- st.token match
                           case Some(t) if !forceRefresh && t.isValid(now) => ZIO.succeed(t)
                           case _ =>
-                            ClientOAuth.fetchToken(zclient, resolved, oauth)
+                            ClientOAuth.fetchToken(zclient, resolved, oauth, st.token)
                               .tap(t => stateRef.update(_.copy(token = Some(t))))
           yield Some(token.value)
 

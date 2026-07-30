@@ -16,6 +16,8 @@ Every code example in README.md must have a corresponding test. Tests live in:
 - `TachyonInteropSpec` — for cross-implementation interop against the third-party `kpavlov/tachyon` server (modern negotiation + legacy interop)
 - `McpClientLiveSpec` — for the no-auth client example against the live Java SDK server `https://www.javadocs.dev/mcp`
 - `McpClientAuthSpec` — for the client `OAuthClientCredentials` example, exercised against our own auth-protected `McpServer` with tokens minted via DCR at `login.jamesward.dev`
+- `CimdAuthSpec` — for the client `OAuthAuthorizationCode` example (authorization-code + PKCE, CIMD, DCR fallback, pre-registration, RFC 9207 `iss` validation, PRM resource validation), exercised in-process against `TestIdp` + our own auth-protected `McpServer` (loopback, no network)
+- `ClientConformanceSpec` — for the client-side auth behaviors graded by the official MCP conformance kit's client scenarios (`auth/basic-cimd`, `auth/iss-*`, `auth/metadata-*`, `auth/resource-mismatch`, `auth/scope-*`, `auth/pre-registration`, `auth/client-credentials-basic`), driving `ConformanceClientMain` as the client-under-test
 
 When adding or modifying a README example, add or update the matching test in the appropriate spec.
 
@@ -27,6 +29,8 @@ When adding or modifying a README example, add or update the matching test in th
 - Run `./sbt "testOnly *McpClientSpec*"` for client unit tests against our own server (loopback HTTP, no network)
 - Run `./sbt "testOnly *McpClientLiveSpec*"` for the no-auth client test against `www.javadocs.dev` (requires network; tagged `live`)
 - Run `./sbt "testOnly *McpClientAuthSpec*"` for the client OAuth `client_credentials` test against our own auth server + `login.jamesward.dev` (requires network; tagged `live-auth`)
+- Run `./sbt "testOnly *CimdAuthSpec*"` for the client authorization-code + PKCE + CIMD flow against the in-process `TestIdp` (loopback, no network)
+- Run `./sbt "testOnly *ClientConformanceSpec*"` for the official conformance kit's *client* auth scenarios against our `McpClient` (requires `npx`/Node and npm-registry network access; tagged `conformance-client`)
 - Run `./sbt "testOnly *NegotiationSpec* *TasksSpec*"` for protocol version negotiation and Tasks-extension unit/HTTP tests (no network)
 - Run `./sbt "testOnly *McpClientModernSpec*"` for the modern (2026-07-28) client negotiation tests against our own dual-era server (loopback, no network)
 - Run `./sbt "testOnly *TachyonInteropSpec*"` for third-party interop against `kpavlov/tachyon` (loopback, no external network; JDK 21+)
@@ -36,3 +40,7 @@ When adding or modifying a README example, add or update the matching test in th
 ## Shared Test Helpers
 
 `AuthTestHelpers` (in the test source tree) provides DCR + token-fetch + auth-server-build helpers used by `LiveAuthSpec`, `JavaSdkAuthSpec`, and `McpClientAuthSpec`. Reuse these rather than duplicating helper code when adding new auth integration tests.
+
+`TestIdp` (in the test source tree) is a minimal in-process OAuth 2.1 authorization server for client-side auth flow tests: RFC 8414 metadata, auto-approving `/authorize` with CIMD dereferencing and configurable RFC 9207 `iss` behavior, PKCE-verifying `/token` minting RS256 JWTs (validated via `discoverJwks`), optional DCR, and recorded events for wire-level assertions. Used by `CimdAuthSpec`; reuse it for new client-side auth tests.
+
+`ConformanceClientMain` (in the test source tree) is the client-under-test entrypoint for the conformance kit's client mode; it reads `MCP_CONFORMANCE_SCENARIO` / `MCP_CONFORMANCE_CONTEXT` / `MCP_CONFORMANCE_PROTOCOL_VERSION` and picks the matching `McpClientOAuth` config.

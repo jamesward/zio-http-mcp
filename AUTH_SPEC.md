@@ -718,6 +718,14 @@ This means the library **does not need a "compat with 2025-06-18 only" caveat** 
 
 The README will state: *"Compatible with MCP authorization specs 2025-06-18 and 2025-11-25 (resource server only)."*
 
+### 2026-07-28 update
+
+The **2026-07-28** authorization spec hardened the *client* side; the resource-server requirements are unchanged, so the server implementation above remains fully conformant. The client-side flow is now implemented in `McpClient` (superseding the "Client-side OAuth flows" non-goal and *Future work* item 2):
+
+- `OAuthAuthorizationCode` runs the full hardened flow: PRM discovery (path-inserted well-known form first) with **PRM `resource` validation against the server URL**, path-aware RFC 8414/OIDC AS-metadata discovery with issuer validation, **PKCE S256**, RFC 8707 `resource` on both authorization and token requests, **RFC 9207 `iss` validation** (exact string compare, required when `authorization_response_iss_parameter_supported` is advertised), the spec's scope-selection strategy, and refresh-token renewal.
+- Client identification follows the spec's priority: pre-registration → **CIMD** (`client_id_metadata_document_supported`) → DCR (deprecated fallback, registering with `application_type` per SEP-837).
+- Validation: `CimdAuthSpec` (in-process against `TestIdp`) and `ClientConformanceSpec` (the official conformance kit's `auth/*` client scenarios).
+
 ## Future work
 
 Items intentionally deferred from v1, in rough priority order:
