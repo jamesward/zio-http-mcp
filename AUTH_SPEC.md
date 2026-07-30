@@ -724,7 +724,12 @@ The **2026-07-28** authorization spec hardened the *client* side; the resource-s
 
 - `OAuthAuthorizationCode` runs the full hardened flow: PRM discovery (path-inserted well-known form first) with **PRM `resource` validation against the server URL**, path-aware RFC 8414/OIDC AS-metadata discovery with issuer validation, **PKCE S256**, RFC 8707 `resource` on both authorization and token requests, **RFC 9207 `iss` validation** (exact string compare, required when `authorization_response_iss_parameter_supported` is advertised), the spec's scope-selection strategy, and refresh-token renewal.
 - Client identification follows the spec's priority: pre-registration → **CIMD** (`client_id_metadata_document_supported`) → DCR (deprecated fallback, registering with `application_type` per SEP-837).
-- Validation: `CimdAuthSpec` (in-process against `TestIdp`) and `ClientConformanceSpec` (the official conformance kit's `auth/*` client scenarios).
+- Validation: `CimdAuthSpec` (in-process against `TestIdp`), `ClientConformanceSpec` (the official conformance kit's `auth/*` client scenarios), and `LiveCimdAuthSpec` (CIMD interop against the real `login.jamesward.dev`).
+
+Two findings from the live CIMD interop worth recording, since neither is obvious from the specs:
+
+- Authorization servers require the metadata document to be served as `Content-Type: application/json`; `raw.githubusercontent.com`'s `text/plain` is rejected, so the fixtures are read over jsDelivr instead.
+- `login.jamesward.dev` rejects an unresolvable or mismatched metadata document with a bare `401` carrying its protected-resource `WWW-Authenticate` challenge, rather than the OAuth2 `invalid_client` JSON error an opaque unknown `client_id` produces. Client code should therefore not rely on a structured `invalid_client` body to detect a rejected CIMD client.
 
 ## Future work
 

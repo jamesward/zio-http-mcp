@@ -560,7 +560,14 @@ The library works against any AS that:
 - Supports the [RFC 8707 `resource` parameter](https://www.rfc-editor.org/rfc/rfc8707) (for audience binding),
 - Either signs JWTs with a JWKS-published key (preferred) or exposes [RFC 7662 token introspection](https://www.rfc-editor.org/rfc/rfc7662).
 
-For clients with no pre-existing relationship, the AS should support [Client ID Metadata Documents](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00) (advertised via `client_id_metadata_document_supported`, the `2026-07-28` spec's preferred mechanism) and/or [RFC 7591 Dynamic Client Registration](https://datatracker.ietf.org/doc/html/rfc7591) (deprecated in `2026-07-28`, retained for backwards compatibility). Verified to work against `https://login.jamesward.dev` (Spring Authorization Server with open DCR).
+For clients with no pre-existing relationship, the AS should support [Client ID Metadata Documents](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00) (advertised via `client_id_metadata_document_supported`, the `2026-07-28` spec's preferred mechanism) and/or [RFC 7591 Dynamic Client Registration](https://datatracker.ietf.org/doc/html/rfc7591) (deprecated in `2026-07-28`, retained for backwards compatibility). Both are verified to work against `https://login.jamesward.dev`, which supports open DCR and CIMD.
+
+#### Hosting a Client ID Metadata Document
+
+When using CIMD, the client hosts a JSON document at the HTTPS URL it uses as its `client_id`. Two requirements bite in practice:
+
+- The document's `client_id` **must equal its own URL exactly**. Authorization servers reject a mismatch.
+- Serve it as **`Content-Type: application/json`**. A document served as `text/plain` is rejected — which rules out `raw.githubusercontent.com` as a host; a CDN that sets the JSON content type (jsDelivr, for example) or your own server works.
 
 ### Running
 

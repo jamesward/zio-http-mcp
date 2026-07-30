@@ -17,6 +17,7 @@ Every code example in README.md must have a corresponding test. Tests live in:
 - `McpClientLiveSpec` — for the no-auth client example against the live Java SDK server `https://www.javadocs.dev/mcp`
 - `McpClientAuthSpec` — for the client `OAuthClientCredentials` example, exercised against our own auth-protected `McpServer` with tokens minted via DCR at `login.jamesward.dev`
 - `CimdAuthSpec` — for the client `OAuthAuthorizationCode` example (authorization-code + PKCE, CIMD, DCR fallback, pre-registration, RFC 9207 `iss` validation, PRM resource validation), exercised in-process against `TestIdp` + our own auth-protected `McpServer` (loopback, no network)
+- `LiveCimdAuthSpec` — for CIMD interop against the real `login.jamesward.dev` authorization server (metadata advertisement, client identification by metadata document, rejection of a mismatched or unresolvable document)
 - `ClientConformanceSpec` — for the client-side auth behaviors graded by the official MCP conformance kit's client scenarios (`auth/basic-cimd`, `auth/iss-*`, `auth/metadata-*`, `auth/resource-mismatch`, `auth/scope-*`, `auth/pre-registration`, `auth/client-credentials-basic`), driving `ConformanceClientMain` as the client-under-test
 
 When adding or modifying a README example, add or update the matching test in the appropriate spec.
@@ -31,6 +32,7 @@ When adding or modifying a README example, add or update the matching test in th
 - Run `./sbt "testOnly *McpClientAuthSpec*"` for the client OAuth `client_credentials` test against our own auth server + `login.jamesward.dev` (requires network; tagged `live-auth`)
 - Run `./sbt "testOnly *CimdAuthSpec*"` for the client authorization-code + PKCE + CIMD flow against the in-process `TestIdp` (loopback, no network)
 - Run `./sbt "testOnly *ClientConformanceSpec*"` for the official conformance kit's *client* auth scenarios against our `McpClient` (requires `npx`/Node and npm-registry network access; tagged `conformance-client`)
+- Run `./sbt "testOnly *LiveCimdAuthSpec*"` for CIMD interop against `login.jamesward.dev` (requires network; tagged `live-auth`). The metadata documents it uses live in `src/test/resources/cimd` and are read over jsDelivr at the `main` ref, so the document-dependent assertions skip (with a warning) until a fixture change reaches `main`. To exercise them from a branch, publish the branch and set `CIMD_BASE_URL` to the branch's jsDelivr directory — note that sbt's server pins environment variables at startup, so run `./sbt shutdown` first when changing it
 - Run `./sbt "testOnly *NegotiationSpec* *TasksSpec*"` for protocol version negotiation and Tasks-extension unit/HTTP tests (no network)
 - Run `./sbt "testOnly *McpClientModernSpec*"` for the modern (2026-07-28) client negotiation tests against our own dual-era server (loopback, no network)
 - Run `./sbt "testOnly *TachyonInteropSpec*"` for third-party interop against `kpavlov/tachyon` (loopback, no external network; JDK 21+)
