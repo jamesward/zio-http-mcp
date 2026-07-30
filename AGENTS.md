@@ -36,8 +36,8 @@ When adding or modifying a README example, add or update the matching test in th
 - Run `./sbt "testOnly *NegotiationSpec* *TasksSpec*"` for protocol version negotiation and Tasks-extension unit/HTTP tests (no network)
 - Run `./sbt "testOnly *McpClientModernSpec*"` for the modern (2026-07-28) client negotiation tests against our own dual-era server (loopback, no network)
 - Run `./sbt "testOnly *TachyonInteropSpec*"` for third-party interop against `kpavlov/tachyon` (loopback, no external network; JDK 21+)
-- Run `./sbt "testOnly *ConformanceSpec*"` for MCP conformance tests (requires Docker). Runs the `2025-11-25` kit (`0.1.x`, pinned) and the `2026-07-28` kit (`0.2.0` line) — both are hard checks now that the `2026-07-28` spec is final
-- Conformance tests use testcontainers with `host.testcontainers.internal` for Docker networking (rootless Docker compatible)
+- Run `./sbt "testOnly *ConformanceSpec*"` for MCP conformance tests (requires `npx`/Node and npm-registry network access). Runs the `2025-11-25` kit (`0.1.x`, pinned) and the `2026-07-28` kit (`0.2.0` line) — both are hard checks now that the `2026-07-28` spec is final
+- The kit runs as a host process against a `localhost` URL, with an empty expected-failures baseline: every scenario is expected to pass. It previously ran in a testcontainer, which forced `host.testcontainers.internal` networking and made `dns-rebinding-protection` an unavoidable baselined failure
 
 ## Shared Test Helpers
 

@@ -7,13 +7,6 @@ import zio.schema.*
 import zio.test.*
 import zio.test.TestAspect.*
 
-import org.testcontainers.Testcontainers as TC
-import org.testcontainers.containers.GenericContainer
-import org.testcontainers.containers.output.ToStringConsumer
-import org.testcontainers.containers.startupcheck.OneShotStartupCheckStrategy
-import org.testcontainers.images.builder.ImageFromDockerfile
-
-import java.time.Duration as JDuration
 import java.util.Base64
 
 object ConformanceSpec extends ZIOSpecDefault:
@@ -365,21 +358,13 @@ object ConformanceSpec extends ZIOSpecDefault:
     .prompt(testPromptWithEmbeddedResource)
     .prompt(testPromptWithImage)
 
-  // dns-rebinding-protection requires a localhost URL but rootless Docker
-  // cannot reach the host's localhost, so we mark it as an expected failure.
-  private val legacyExpectedFailuresYaml: String =
-    """server:
-      |  - dns-rebinding-protection
-      |""".stripMargin
-
-  // Modern (2026-07-28) baseline: only the Docker-networking limitation.
-  // Modern `tools/call` streams request-scoped `notifications/progress` /
-  // `notifications/message` over the SSE response stream when the request
-  // opts in, so `tools-call-with-progress` passes and is no longer baselined.
-  private val modernExpectedFailuresYaml: String =
-    """server:
-      |  - dns-rebinding-protection
-      |""".stripMargin
+  // No baselined failures: the kit runs on the host against a real `localhost`
+  // URL, so `dns-rebinding-protection` — which previously had to be baselined
+  // because rootless Docker could not reach the host's localhost — is exercised
+  // for real. Modern `tools/call` likewise streams request-scoped
+  // `notifications/progress` / `notifications/message` over the SSE response
+  // stream when the request opts in, so `tools-call-with-progress` passes too.
+  private val expectedFailuresYaml: String = "{}\n"
 
   // The official MCP conformance kit (npm). The `latest` line (0.1.x) drives the
   // 2025-11-25 protocol; the `0.2.0` line drives the modern 2026-07-28 protocol
@@ -387,69 +372,54 @@ object ConformanceSpec extends ZIOSpecDefault:
   // move to the stable `0.2.0` once it ships). Our server is dual-era, so each
   // version exercises a different negotiated path against it. The name and
   // version are kept separate and joined with `@` only when building the
-  // `npm install` command.
+  // `npx` invocation.
   private val ConformancePackage = "@modelcontextprotocol/conformance"
   private val LegacyKitVersion   = "0.1.16"
   private val ModernKitVersion   = "0.2.0-alpha.10"
 
-  def conformanceImage(version: String, tag: String): ImageFromDockerfile =
-    ImageFromDockerfile(s"mcp-conformance-$tag", false)
-      .withDockerfileFromBuilder: builder =>
-        builder
-          .from("node:22-slim")
-          .run(s"npm install -g $ConformancePackage@$version")
-          .entryPoint("npx", ConformancePackage)
-          .build()
-
-  val legacyImage: ImageFromDockerfile = conformanceImage(LegacyKitVersion, "legacy")
-  val modernImage: ImageFromDockerfile = conformanceImage(ModernKitVersion, "modern")
-
-  def runConformance(image: ImageFromDockerfile, port: Int, specVersion: String, expectedFailures: String, scenario: Option[String] = None): Task[(Long, String)] =
+  /**
+   * Run the kit against the server bound on `port`, as a host process via `npx`.
+   *
+   * The kit used to run in a testcontainer, which meant reaching the server over
+   * `host.testcontainers.internal` and baselining `dns-rebinding-protection` as an
+   * expected failure, since rootless Docker cannot reach the host's `localhost`.
+   * Running it on the host removes both the Docker dependency and that caveat, and
+   * matches how [[ClientConformanceSpec]] drives the kit's client mode.
+   */
+  def runConformance(kitVersion: String, port: Int, specVersion: String, expectedFailures: String, scenario: Option[String] = None): Task[(Int, String)] =
     ZIO.attemptBlocking:
-      TC.exposeHostPorts(port)
+      val expectedFailuresFile = java.io.File.createTempFile("expected-failures", ".yaml")
+      expectedFailuresFile.deleteOnExit()
+      java.nio.file.Files.writeString(expectedFailuresFile.toPath, expectedFailures)
 
-      // Write expected failures YAML to a temp file for mounting
-      val tmpFile = java.io.File.createTempFile("expected-failures", ".yaml")
-      tmpFile.deleteOnExit()
-      java.nio.file.Files.writeString(tmpFile.toPath, expectedFailures)
+      // The kit writes a `results/` directory into its working directory; keep
+      // that out of the repo.
+      val workDir = java.nio.file.Files.createTempDirectory("mcp-conformance").toFile
+      workDir.deleteOnExit()
 
-      val stdout = ToStringConsumer()
-      val container = GenericContainer(image)
-      container.withAccessToHost(true)
-      container.withFileSystemBind(tmpFile.getAbsolutePath, "/tmp/expected-failures.yaml",
-        org.testcontainers.containers.BindMode.READ_ONLY)
       val baseArgs = Seq(
+        "npx", "-y", s"$ConformancePackage@$kitVersion",
         "server",
-        "--url", s"http://host.testcontainers.internal:$port/mcp",
+        "--url", s"http://localhost:$port/mcp",
         // `--spec-version` picks which protocol era the kit drives: without it
         // the kit defaults to the legacy `initialize` handshake even on the
         // 2026-07-28 line, so it must be set explicitly to actually exercise the
         // modern (server/discover + per-request `_meta`) wire protocol.
         "--spec-version", specVersion,
-        "--expected-failures", "/tmp/expected-failures.yaml",
+        "--expected-failures", expectedFailuresFile.getAbsolutePath,
       )
       val args = scenario.fold(baseArgs)(s => baseArgs ++ Seq("--scenario", s))
-      container.withCommand(args*)
-      container.withStartupCheckStrategy(
-        // The kit runs ~30 scenarios in one shot; allow generous headroom so a
-        // slower Docker host does not time the whole run out mid-suite.
-        OneShotStartupCheckStrategy().withTimeout(JDuration.ofSeconds(180))
-      )
-      container.withLogConsumer(stdout)
 
-      try
-        container.start()
-        val exitCode: Long = container.getContainerInfo.getState.getExitCodeLong
-        (exitCode, stdout.toUtf8String)
-      catch
-        case _: org.testcontainers.containers.ContainerLaunchException =>
-          val exitCode: Long =
-            try container.getContainerInfo.getState.getExitCodeLong
-            catch case _: Exception => -1L
-          (exitCode, stdout.toUtf8String)
-      finally
-        try container.stop()
-        catch case _: Exception => ()
+      val builder = ProcessBuilder(args*)
+      builder.directory(workDir)
+      builder.redirectErrorStream(true)
+      val process = builder.start()
+      val output  = String(process.getInputStream.readAllBytes())
+      // The kit runs ~30 scenarios in one shot; allow generous headroom so a
+      // slow npm fetch does not time the whole run out mid-suite.
+      val exited  = process.waitFor(300, java.util.concurrent.TimeUnit.SECONDS)
+      if !exited then process.destroyForcibly()
+      ((if exited then process.exitValue() else -1), output)
 
   override def spec =
     suite("MCP Conformance")(
@@ -457,22 +427,18 @@ object ConformanceSpec extends ZIOSpecDefault:
         for
           port              <- Server.install(testServer.routes)
           _                 <- ZIO.logInfo(s"MCP server started on port $port")
-          (exitCode, output) <- runConformance(legacyImage, port, "2025-11-25", legacyExpectedFailuresYaml)
+          (exitCode, output) <- runConformance(LegacyKitVersion, port, "2025-11-25", expectedFailuresYaml)
           _                 <- ZIO.logInfo(s"Legacy conformance exit code: $exitCode")
-          _                 <- ZIO.logInfo(s"Legacy conformance output:\n$output")
-        yield assertTrue(
-          output.contains("Baseline check passed") || exitCode == 0L,
-        )
+          _                 <- ZIO.logInfo(s"Legacy conformance output:\n$output").when(exitCode != 0)
+        yield assertTrue(exitCode == 0)
       ,
       test("2026-07-28 (modern) conformance suite passes"):
         for
           port              <- Server.install(testServer.routes)
-          (exitCode, output) <- runConformance(modernImage, port, "2026-07-28", modernExpectedFailuresYaml)
+          (exitCode, output) <- runConformance(ModernKitVersion, port, "2026-07-28", expectedFailuresYaml)
           _                 <- ZIO.logInfo(s"Modern conformance exit code: $exitCode")
-          _                 <- ZIO.logInfo(s"Modern conformance output:\n$output")
-        yield assertTrue(
-          output.contains("Baseline check passed") || exitCode == 0L,
-        )
+          _                 <- ZIO.logInfo(s"Modern conformance output:\n$output").when(exitCode != 0)
+        yield assertTrue(exitCode == 0)
     ).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@
       withLiveClock @@
       timeout(5.minutes) @@

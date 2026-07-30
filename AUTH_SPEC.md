@@ -472,7 +472,7 @@ The library is AS-agnostic: any AS that publishes RFC 8414 metadata, supports RF
 - AS metadata discovery (`/.well-known/oauth-authorization-server` with OIDC fallback) is implemented in-house since the lib only handles JWKS fetching given a known `jwks_uri`.
 
 Test-only:
-- `org.testcontainers:testcontainers` is already present (used by `ConformanceSpec`); not currently needed for `LiveAuthSpec` but may be added later for the optional `KeycloakAuthSpec`.
+- None. `LiveAuthSpec` talks to a hosted AS over plain HTTP. (`ConformanceSpec` shells out to the conformance kit via `npx`, so it needs Node on the host but no extra JVM dependency; an optional `KeycloakAuthSpec` would need `org.testcontainers:testcontainers` added back.)
 
 ---
 
