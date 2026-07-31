@@ -21,7 +21,7 @@ import zio.test.TestAspect.*
  *
  * A CIMD document must declare a `client_id` equal to its own URL, which means it
  * has to be served from a public HTTPS host the authorization server can reach.
- * [[CimdTestServer]] provides that: `https://www.cimd.now/<port>/<path>` returns a
+ * A CIMD test server provides that: `https://www.cimd.now/<port>/<path>` returns a
  * document whose `client_id` is that URL and whose `redirect_uris` is
  * `http://localhost:<port>/<path>`, so a test can mint a document matching whatever
  * loopback port it happens to bind.
@@ -126,4 +126,4 @@ object LiveCimdAuthSpec extends ZIOSpecDefault:
           error <- probeClientIdentification(s"$cimdServer/", redirectUri(port, "callback"))
         yield assertTrue(!error.contains("invalid_grant"))
       ,
-    ).provide(Client.default) @@ tag("live-auth") @@ sequential @@ withLiveClock @@ timeout(90.seconds)
+    ).provide(Client.default) @@ tag("live-auth") @@ sequential @@ withLiveClock @@ timeout(90.seconds) @@ AuthTestHelpers.retryTransientUpstream

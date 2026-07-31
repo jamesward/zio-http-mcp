@@ -43,6 +43,8 @@ When adding or modifying a README example, add or update the matching test in th
 
 `AuthTestHelpers` (in the test source tree) provides DCR + token-fetch + auth-server-build helpers used by `LiveAuthSpec`, `JavaSdkAuthSpec`, and `McpClientAuthSpec`. Reuse these rather than duplicating helper code when adding new auth integration tests.
 
+It also provides `retryTransientUpstream`, a `TestAspect` applied to every spec that talks to a hosted service. It retries a test up to 3 times with exponential backoff, but **only** when the failure text looks like a transient outage (`ServiceUnavailable`/`503`, `502`, `504`, dropped or timed-out connections). Assertion failures and other runtime errors are never retried, so a real regression still fails on the first attempt. Add it to new specs that depend on an external host; don't add it to offline specs, where a flake is a bug worth seeing.
+
 `TestIdp` (in the test source tree) is a minimal in-process OAuth 2.1 authorization server for client-side auth flow tests: RFC 8414 metadata, auto-approving `/authorize` with CIMD dereferencing and configurable RFC 9207 `iss` behavior, PKCE-verifying `/token` minting RS256 JWTs (validated via `discoverJwks`), optional DCR, and recorded events for wire-level assertions. Used by `CimdAuthSpec`; reuse it for new client-side auth tests.
 
 `ConformanceClientMain` (in the test source tree) is the client-under-test entrypoint for the conformance kit's client mode; it reads `MCP_CONFORMANCE_SCENARIO` / `MCP_CONFORMANCE_CONTEXT` / `MCP_CONFORMANCE_PROTOCOL_VERSION` and picks the matching `McpClientOAuth` config.

@@ -61,4 +61,4 @@ object McpClientLiveSpec extends ZIOSpecDefault:
               result.content.nonEmpty,
             )
       ) @@ tag("live"),
-    ).provide(Client.default) @@ sequential @@ withLiveClock @@ timeout(90.seconds)
+    ).provide(Client.default) @@ sequential @@ withLiveClock @@ timeout(90.seconds) @@ AuthTestHelpers.retryTransientUpstream

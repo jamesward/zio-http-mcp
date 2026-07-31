@@ -59,4 +59,4 @@ object McpClientAuthSpec extends ZIOSpecDefault:
               result.isError.forall(!_),
               text.contains("5"),
             )
-    ).provide(Client.default) @@ tag("live-auth") @@ sequential @@ withLiveClock @@ timeout(90.seconds)
+    ).provide(Client.default) @@ tag("live-auth") @@ sequential @@ withLiveClock @@ timeout(90.seconds) @@ AuthTestHelpers.retryTransientUpstream
