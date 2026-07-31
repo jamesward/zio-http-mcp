@@ -45,6 +45,26 @@ fork := true
 
 javaOptions += "-Djava.net.preferIPv4Stack=true"
 
+// Disable Testcontainers' Ryuk reaper for the (forked) test JVM.
+//
+// Ryuk is a helper container that publishes a host port so it can be signalled
+// to reap leaked containers at JVM exit. Under rootless Docker (RootlessKit)
+// that published port is allocated from the bottom of the OS ephemeral range
+// (32768–60999) — the very same range the ConformanceSpec test server draws
+// from via `Server.onAnyOpenPort`. When the two collide, Ryuk fails to start
+// with `bind: address already in use` on 0.0.0.0:32768, and because
+// `DockerClientFactory` caches that failure on its JVM-wide singleton, every
+// subsequent conformance run in the same sbt session then fails fast — turning
+// one transient port clash into a persistent failure.
+//
+// Testcontainers reads this flag only from the process environment (see
+// `ResourceReaper.instance()`), so it must be an env var, not a system
+// property. With Ryuk disabled it falls back to `JVMHookResourceReaper`, which
+// starts no container and publishes no port (it prunes by label from a JVM
+// shutdown hook). ConformanceSpec already stops each container in a `finally`
+// and uses a one-shot startup check, so cleanup is unaffected.
+Test / envVars += "TESTCONTAINERS_RYUK_DISABLED" -> "true"
+
 licenses := Seq("MIT License" -> url("https://opensource.org/licenses/MIT"))
 
 homepage := Some(url("https://github.com/jamesward/zio-http-mcp"))
