@@ -726,10 +726,12 @@ The **2026-07-28** authorization spec hardened the *client* side; the resource-s
 - Client identification follows the spec's priority: pre-registration → **CIMD** (`client_id_metadata_document_supported`) → DCR (deprecated fallback, registering with `application_type` per SEP-837).
 - Validation: `CimdAuthSpec` (in-process against `TestIdp`), `ClientConformanceSpec` (the official conformance kit's `auth/*` client scenarios), and `LiveCimdAuthSpec` (CIMD interop against the real `login.jamesward.dev`).
 
-Two findings from the live CIMD interop worth recording, since neither is obvious from the specs:
+Findings from the live CIMD interop worth recording, since none are obvious from the specs:
 
-- Authorization servers require the metadata document to be served as `Content-Type: application/json`; `raw.githubusercontent.com`'s `text/plain` is rejected, so the fixtures are read over jsDelivr instead.
+- Authorization servers require the metadata document to be served as `Content-Type: application/json`; `raw.githubusercontent.com`'s `text/plain` is rejected.
 - `login.jamesward.dev` rejects an unresolvable or mismatched metadata document with a bare `401` carrying its protected-resource `WWW-Authenticate` challenge, rather than the OAuth2 `invalid_client` JSON error an opaque unknown `client_id` produces. Client code should therefore not rely on a structured `invalid_client` body to detect a rejected CIMD client.
+- Because a document's `client_id` must equal its own URL, tests need a public HTTPS host rather than a repo fixture. The CIMD test server (`https://www.cimd.now/<port>/<path>`) mints one on demand, with `redirect_uris` bound to `http://localhost:<port>/<path>` so a test can match whatever loopback port it binds.
+- The official conformance kit's `auth/basic-cimd` scenario never dereferences the document — it only checks that the client sent a URL-shaped `client_id`. Document fetching and validation are therefore covered by [[CimdAuthSpec]] (against [[TestIdp]]) and [[LiveCimdAuthSpec]], not by the kit.
 
 ## Future work
 

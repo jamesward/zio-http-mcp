@@ -39,22 +39,28 @@ object CimdAuthSpec extends ZIOSpecDefault:
   /** The client's CIMD document, hosted on the IDP's HTTP server for the test. */
   private def cimdRoutes(redirectUri: String)(idpPort: Int): Routes[Any, Response] =
     val docUrl = cimdDocUrl(idpPort)
-    Routes(
-      Method.GET / "client-metadata.json" -> handler(
-        Response.json(
-          Json.Obj(Chunk(
-            "client_id" -> Json.Str(docUrl),
-            "client_name" -> Json.Str("zio-http-mcp test client"),
-            "redirect_uris" -> Json.Arr(Chunk(Json.Str(redirectUri))),
-            "grant_types" -> Json.Arr(Chunk(Json.Str("authorization_code"))),
-            "response_types" -> Json.Arr(Chunk(Json.Str("code"))),
-            "token_endpoint_auth_method" -> Json.Str("none"),
-          )).toJson
-        )
+    def document(clientId: String): Response =
+      Response.json(
+        Json.Obj(Chunk(
+          "client_id" -> Json.Str(clientId),
+          "client_name" -> Json.Str("zio-http-mcp test client"),
+          "redirect_uris" -> Json.Arr(Chunk(Json.Str(redirectUri))),
+          "grant_types" -> Json.Arr(Chunk(Json.Str("authorization_code"))),
+          "response_types" -> Json.Arr(Chunk(Json.Str("code"))),
+          "token_endpoint_auth_method" -> Json.Str("none"),
+        )).toJson
       )
+    Routes(
+      Method.GET / "client-metadata.json" -> handler(document(docUrl)),
+      // Declares someone else's URL as its `client_id` — the AS must refuse it.
+      Method.GET / "client-metadata-mismatch.json" ->
+        handler(document("https://elsewhere.example.com/client-metadata.json")),
     )
 
   private def cimdDocUrl(idpPort: Int): String = s"http://localhost:$idpPort/client-metadata.json"
+
+  private def cimdMismatchDocUrl(idpPort: Int): String =
+    s"http://localhost:$idpPort/client-metadata-mismatch.json"
 
   private val redirectUri = "http://127.0.0.1:23456/callback"
 
@@ -173,6 +179,22 @@ object CimdAuthSpec extends ZIOSpecDefault:
                                  redirectUri = redirectUri,
                                ))
           yield assertTrue(tools.nonEmpty, result.isError.forall(!_))
+      ,
+      test("AS rejects a CIMD document whose client_id does not match its URL"):
+        ZIO.scoped:
+          for
+            idp    <- TestIdp.serveScoped(extraRoutes = cimdRoutes(redirectUri))
+            port   <- serveMcpServer(idp)
+            result <- connectAndCall(port, OAuthAuthorizationCode(
+                        clientMetadataUrl = Some(cimdMismatchDocUrl(idpUrlPort(idp))),
+                        redirectUri = redirectUri,
+                      )).exit
+            events <- idp.recordedEvents
+          yield assertTrue(
+            result.isFailure,
+            events.rejections.exists(_.contains("client_id")),
+            events.tokens.isEmpty,
+          )
       ,
       test("AS rejects a redirect_uri that is not in the CIMD document"):
         ZIO.scoped:
