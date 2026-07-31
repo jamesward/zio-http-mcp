@@ -31,6 +31,8 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
   "dev.zio" %% "zio-test-magnolia"  % zioVersion % Test,
 
+  "org.testcontainers" % "testcontainers" % "2.0.5" % Test,
+
   "io.modelcontextprotocol.sdk" % "mcp-core"           % "2.0.0" % Test,
   "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "2.0.0" % Test,
 
