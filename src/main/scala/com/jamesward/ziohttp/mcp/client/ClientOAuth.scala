@@ -306,14 +306,30 @@ private[client] object ClientOAuth:
     scopes: Set[String],
   ): IO[McpClientError, (String, Option[Config.Secret])] =
     oauth.clientId match
-      case Some(id) => ZIO.succeed((id, oauth.clientSecret))
+      case Some(id) =>
+        ZIO.logInfo(
+          s"OAuth client identity: using pre-registered client_id '$id' for issuer '${meta.issuer}' " +
+            "(CIMD and Dynamic Client Registration skipped)")
+          .as((id, oauth.clientSecret))
       case None =>
         oauth.clientMetadataUrl match
           case Some(url) if meta.clientIdMetadataDocumentSupported =>
-            ZIO.succeed((url, None))
+            ZIO.logInfo(
+              s"OAuth client identity: using CIMD (Client ID Metadata Document) client_id '$url' " +
+                s"— issuer '${meta.issuer}' advertises client_id_metadata_document_supported")
+              .as((url, None))
           case _ =>
+            // Explain why CIMD was not used, then fall back to DCR (or fail).
+            val cimdSkipReason =
+              if oauth.clientMetadataUrl.isEmpty then "no clientMetadataUrl configured"
+              else s"clientMetadataUrl is configured but issuer '${meta.issuer}' does not advertise " +
+                "client_id_metadata_document_supported"
             meta.registrationEndpoint match
-              case Some(regEp) => dynamicallyRegister(client, regEp, oauth, scopes)
+              case Some(regEp) =>
+                ZIO.logInfo(
+                  s"OAuth client identity: falling back to Dynamic Client Registration at '$regEp' " +
+                    s"for issuer '${meta.issuer}' (no pre-registered clientId; CIMD unavailable: $cimdSkipReason)") *>
+                  dynamicallyRegister(client, regEp, oauth, scopes)
               case None =>
                 ZIO.fail(McpClientError.Auth(
                   "No way to identify the client: no pre-registered clientId, the authorization " +
@@ -359,6 +375,7 @@ private[client] object ClientOAuth:
                 .mapError(e => McpClientError.Auth(s"Invalid registration JSON: $e"))
       id   <- ZIO.fromOption(json.get("client_id").flatMap(_.asString))
                 .orElseFail(McpClientError.Auth("Registration response missing 'client_id'"))
+      _    <- ZIO.logInfo(s"Dynamic Client Registration succeeded at '$registrationEndpoint': registered client_id '$id'")
     yield (id, json.get("client_secret").flatMap(_.asString).map(Config.Secret(_)))
 
   /** The authorization-code round trip: authorize (PKCE, resource, state) → validate → exchange. */

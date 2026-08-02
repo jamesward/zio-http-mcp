@@ -461,6 +461,13 @@ object McpClient:
     private def interpret(resp: Response, id: RequestId): ZIO[Scope, McpClientError, Attempt] =
       if resp.status.code == 401 then
         resp.body.asString.orElseSucceed("").map(Attempt.Unauthorized.apply)
+      else if resp.status.code == 403 then
+        // Authorization denial (insufficient scope): an HTTP-layer auth outcome,
+        // the sibling of the 401 case above — not a JSON-RPC negotiation error.
+        // Surface it as a protocol-level failure; the body still carries the
+        // server's JSON-RPC -32003 "insufficient_scope" detail in the message.
+        resp.body.asString.orElseSucceed("").flatMap: b =>
+          ZIO.fail(McpClientError.Protocol(s"Request returned 403: $b"))
       else if !resp.status.isSuccess then
         // A modern server signals negotiation failures with a non-2xx status and
         // a JSON-RPC error body (UnsupportedProtocolVersion -32022, HeaderMismatch

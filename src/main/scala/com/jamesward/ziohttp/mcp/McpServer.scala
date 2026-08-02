@@ -92,7 +92,10 @@ final class McpServer[-R] private (
    *
    * The parameter captures exactly one segment at the server root. Auth-derived resource
    * URIs (when [[com.jamesward.ziohttp.mcp.auth.McpAuth.resourceUri]] is not set) resolve
-   * to the host root rather than the per-value path, keeping the audience host-wide.
+   * per-request to the accessed `/<value>` — the advertised RFC 9728 resource, the
+   * `WWW-Authenticate` challenge, and the audience the middleware checks are all
+   * per-mount, so a token minted for one value is not valid at another. Set an explicit
+   * `resourceUri` to pin a single host-wide resource across all values instead.
    *
    * Mutually exclusive with [[mountedAt]]; the last one called wins.
    */
@@ -184,25 +187,47 @@ final class McpServer[-R] private (
     (prmRoutes ++ mcpRoutes).sandbox
 
   def statelessRoutes: Routes[R, Response] =
+    (prmRoutes ++ mcpStatelessRoutes).sandbox
+
+  /**
+   * MCP method routes (POST/GET/DELETE) for the stateless transport, WITHOUT the
+   * RFC 9728 Protected Resource Metadata well-known routes. Compose these per mount
+   * and add [[McpServer.prmStatelessRoutes]] exactly ONCE when serving multiple
+   * authed mounts under a single host, so the host-level PRM endpoints aren't
+   * duplicated (which would otherwise collide on identical route patterns). The 401
+   * `WWW-Authenticate` challenge is still emitted here with the correct per-mount
+   * `resource_metadata` URL, so it stays consistent with the shared PRM routes.
+   * Single-mount servers should use [[statelessRoutes]], which bundles the PRM routes.
+   */
+  def mcpStatelessRoutes: Routes[R, Response] =
     val notAllowed = ZIO.succeed(Response.status(Status.MethodNotAllowed))
+    // A GET opens the server→client SSE stream. The stateless transport doesn't
+    // offer one (405 is spec-permitted); log the attempt so a client that REQUIRES
+    // it (older HTTP+SSE transport) is visible for diagnosis.
+    def getSseDeclined(req: Request): UIO[Response] =
+      ZIO.logInfo(
+        s"MCP stateless GET declined 405 (no server→client SSE stream): path=${req.url.path.encode} " +
+          s"accept=${req.rawHeader("accept").getOrElse("-")} " +
+          s"mcp-protocol-version=${req.rawHeader("mcp-protocol-version").getOrElse("-")} " +
+          s"mcp-session-id=${req.rawHeader("mcp-session-id").getOrElse("-")} " +
+          s"user-agent=${req.rawHeader("user-agent").getOrElse("-")}"
+      ).as(Response.status(Status.MethodNotAllowed))
     val baseRoutes: Routes[R, Response] = pathParamName match
       case Some(name) =>
         val seg = zio.http.codec.PathCodec.string(name)
         Routes(
           Method.POST   / seg -> handler((slug: String, req: Request) => statelessPostHandler(Map(name -> slug), req)),
-          Method.GET    / seg -> handler((_: String, _: Request) => notAllowed),
+          Method.GET    / seg -> handler((_: String, req: Request) => getSseDeclined(req)),
           Method.DELETE / seg -> handler((_: String, _: Request) => notAllowed),
         )
       case None =>
         Routes(
           Method.POST   / mountPathCodec -> handler((req: Request) => statelessPostHandler(Map.empty, req)),
-          Method.GET    / mountPathCodec -> handler((_: Request) => notAllowed),
+          Method.GET    / mountPathCodec -> handler((req: Request) => getSseDeclined(req)),
           Method.DELETE / mountPathCodec -> handler((_: Request) => notAllowed),
         )
-    val mcpRoutes =
-      if isRootMount || pathParamName.isDefined then baseRoutes
-      else baseRoutes ++ Routes(Method.GET / mountPathCodec / trailing -> Handler.notFound)
-    (prmRoutes ++ mcpRoutes).sandbox
+    if isRootMount || pathParamName.isDefined then baseRoutes
+    else baseRoutes ++ Routes(Method.GET / mountPathCodec / trailing -> Handler.notFound)
 
   /** PathCodec for the mount point. `PathCodec.apply` parses leading/trailing
     * slashes the way you'd expect: `"/mcp"`, `"mcp"`, `"/mcp/"` all produce
@@ -219,10 +244,41 @@ final class McpServer[-R] private (
     mountPath.split('/').forall(_.isEmpty)
 
   /** Path component used to derive the auth resource URI when no explicit one is set.
-    * For a parameterised mount the per-value segment is omitted so the advertised
-    * resource URI / audience stays host-wide rather than per-`<value>`. */
+    * The static fallback for fixed/root mounts. Parameterised mounts derive the
+    * resource per-request (see [[mcpResourcePath]] / [[prmResourcePath]]) so the
+    * advertised resource identifies the exact `/<value>` the client accessed. */
   private def authResourcePath: String =
     if pathParamName.isDefined then "" else mountPath
+
+  /** Resource path used to derive the auth resource URI for an MCP request
+    * (POST/GET/DELETE on the mount). For a parameterised mount this is the accessed
+    * segment (`/<value>`), so the resource — and therefore the token audience the
+    * middleware checks — is per-mount (RFC 9728 §3.3, RFC 8707): the resource
+    * identifies the exact URL the client called, and a token minted for one value is
+    * not valid at another. Fixed/root mounts keep the static mount path. Only applies
+    * when [[com.jamesward.ziohttp.mcp.auth.McpAuth.resourceUri]] is not set explicitly. */
+  private def mcpResourcePath(request: Request): String =
+    pathParamName match
+      case Some(_) =>
+        request.url.path.encode.split('/').iterator.filter(_.nonEmpty).nextOption() match
+          case Some(seg) => s"/$seg"
+          case None      => ""
+      case None => authResourcePath
+
+  /** Resource path for a Protected Resource Metadata request. A parameterised mount
+    * serves the document per path segment at
+    * `/.well-known/oauth-protected-resource/<value>` (RFC 9728 §3.1 path-inserted
+    * form), so the advertised `resource` matches the accessed URL and lines up with
+    * the `resource_metadata` URL published in the `WWW-Authenticate` challenge.
+    * Fixed/root mounts keep the static mount path. */
+  private def prmResourcePath(request: Request): String =
+    pathParamName match
+      case Some(_) =>
+        val enc    = request.url.path.encode
+        val marker = "/.well-known/oauth-protected-resource"
+        val idx    = enc.indexOf(marker)
+        if idx < 0 then "" else enc.substring(idx + marker.length).stripSuffix("/")
+      case None => authResourcePath
 
   /**
    * Routes that serve the RFC 9728 Protected Resource Metadata document at both
@@ -238,7 +294,7 @@ final class McpServer[-R] private (
       case None => Routes.empty
       case Some(a) =>
         def respondPRM(request: Request): UIO[Response] =
-          val resourceUri = ResourceUriResolver.resolve(a.resourceUri, authResourcePath, request)
+          val resourceUri = ResourceUriResolver.resolve(a.resourceUri, prmResourcePath(request), request)
           val prm = ProtectedResourceMetadata.fromAuth(a, resourceUri)
           ZIO.log(s"PRM document requested: ${request.url.encode} (resource=${resourceUri.value})")
             .as(Response.json(prm.toJson).addHeader(Header.CacheControl.MaxAge(3600)))
@@ -248,7 +304,7 @@ final class McpServer[-R] private (
         Routes(
           Method.GET / ".well-known" / "oauth-protected-resource" -> handlerFn,
           Method.GET / ".well-known" / "oauth-protected-resource" / trailing -> trailingHandler,
-        )
+        ) ++ McpServer.asMetadataRedirectRoutes(a)
 
   /**
    * Run the auth middleware if [[auth]] is configured, otherwise yield `None`.
@@ -259,14 +315,15 @@ final class McpServer[-R] private (
     authConfig match
       case None => ZIO.succeed(None)
       case Some(a) =>
+        val resourcePath = mcpResourcePath(request)
         AuthMiddleware
-          .authenticate(a, authResourcePath, request, additionalRequiredScopes = Set.empty)
+          .authenticate(a, resourcePath, request, additionalRequiredScopes = Set.empty)
           .tapBoth(
             err => ZIO.logWarning(s"Auth failed for ${request.method} ${request.url.encode}: ${err.description}"),
             principal => ZIO.logInfo(s"Auth ok for ${request.method} ${request.url.encode}: sub=${principal.subject.getOrElse("?")} client_id=${principal.clientId.getOrElse("?")} scopes=${principal.scopes.map(_.value).mkString(",")}"),
           )
           .mapBoth(
-            err => AuthMiddleware.errorResponse(a, authResourcePath, request, err, a.requiredScopes),
+            err => AuthMiddleware.errorResponse(a, resourcePath, request, err, a.requiredScopes),
             principal => Some(principal),
           )
 
@@ -284,7 +341,7 @@ final class McpServer[-R] private (
         val combined = a.requiredScopes ++ tool.requiredScopes
         val err = AuthError.InsufficientScope(combined, p.scopes)
         ZIO.logWarning(s"Per-tool scope check failed for ${tool.name.value}: required=${combined.map(_.value).mkString(",")} actual=${p.scopes.map(_.value).mkString(",")}") *>
-          ZIO.fail(AuthMiddleware.errorResponse(a, authResourcePath, request, err, combined))
+          ZIO.fail(AuthMiddleware.errorResponse(a, mcpResourcePath(request), request, err, combined))
       case _ =>
         ZIO.unit
 
@@ -744,15 +801,17 @@ final class McpServer[-R] private (
   ): ZIO[R, Response, InitializeResult] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
     for
-      init  <- ZIO.fromEither(paramsJson.fromJson[InitializeParams])
-                 .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid initialize params: $e"))
-      instr <- resolveInstructions(principal, pathParams)
+      init      <- ZIO.fromEither(paramsJson.fromJson[InitializeParams])
+                     .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid initialize params: $e"))
+      // Echo the client's requested version when it is a supported legacy
+      // revision (2025-03-26 … 2025-11-25); otherwise fall back to our newest
+      // legacy revision so older/unknown clients still get a usable session.
+      negotiated = ProtocolVersion.negotiateLegacy(init.protocolVersion)
+      _         <- ZIO.logInfo(s"MCP initialize (legacy handshake): requestedProtocol=${init.protocolVersion} negotiatedProtocol=${negotiated.wire}")
+      instr     <- resolveInstructions(principal, pathParams)
     yield
       InitializeResult(
-        // Echo the client's requested version when it is a supported legacy
-        // revision (2025-03-26 … 2025-11-25); otherwise fall back to our newest
-        // legacy revision so older/unknown clients still get a usable session.
-        protocolVersion = ProtocolVersion.negotiateLegacy(init.protocolVersion).wire,
+        protocolVersion = negotiated.wire,
         capabilities = serverCapabilities,
         serverInfo = serverInfo,
         instructions = instr,
@@ -814,7 +873,9 @@ final class McpServer[-R] private (
     val ctx = McpToolContext.noopWith(principal, pathParams)
     val dynamic = toolSrc.fold[ZIO[R, Nothing, Chunk[ToolDefinition]]](ZIO.succeed(Chunk.empty))(_.listTools(ctx))
     dynamic.flatMap: extra =>
-      resultResponse(id, version, ToolsListResult(tools = visible.map(_.definition) ++ extra), cacheable = true)
+      val all = visible.map(_.definition) ++ extra
+      ZIO.logInfo(s"MCP tools/list -> ${all.size} tool(s): ${all.map(_.name.value).mkString(", ")}") *>
+        resultResponse(id, version, ToolsListResult(tools = all), cacheable = true)
 
   private def parseToolCallParams(
     id: RequestId,
@@ -1222,6 +1283,69 @@ final class McpServer[-R] private (
 object McpServer:
   def apply(name: String, version: String): McpServer[Any] =
     new McpServer(Implementation(name, version), Chunk.empty, Chunk.empty, Chunk.empty, Chunk.empty, None)
+
+  /**
+   * Standalone RFC 9728 Protected Resource Metadata routes for a host that serves
+   * MULTIPLE authed mounts. Mount these ONCE (alongside each mount's
+   * [[McpServer.mcpStatelessRoutes]]) instead of letting every mount's
+   * [[McpServer.statelessRoutes]] carry its own copy — which duplicates the identical
+   * `/.well-known/oauth-protected-resource[/…]` patterns.
+   *
+   * The advertised `resource` is derived per request from the well-known path when
+   * [[McpAuth.resourceUri]] is not pinned: `/.well-known/oauth-protected-resource/<x>`
+   * → `<origin>/<x>` (per-mount, RFC 9728 §3.3) and the bare root form → `<origin>`.
+   * This matches the `resource_metadata` URL each mount's 401 challenge points at, so
+   * a root mount and a `/<value>` param mount stay consistent under one PRM handler.
+   * When `resourceUri` is set, that pinned value is returned for every path.
+   */
+  def prmStatelessRoutes(auth: McpAuth[?]): Routes[Any, Response] =
+    val marker = "/.well-known/oauth-protected-resource"
+    def resourcePathOf(request: Request): String =
+      val enc = request.url.path.encode
+      val idx = enc.indexOf(marker)
+      if idx < 0 then "" else enc.substring(idx + marker.length).stripSuffix("/")
+    def respondPRM(request: Request): UIO[Response] =
+      val resourceUri = ResourceUriResolver.resolve(auth.resourceUri, resourcePathOf(request), request)
+      val prm = ProtectedResourceMetadata.fromAuth(auth, resourceUri)
+      ZIO.logInfo(s"PRM document requested: ${request.url.encode} (resource=${resourceUri.value})")
+        .as(Response.json(prm.toJson).addHeader(Header.CacheControl.MaxAge(3600)))
+    // Backwards-compat AS-metadata discovery (see asMetadataRedirectRoutes) is
+    // bundled here so multi-mount hosts get it alongside the shared PRM routes.
+    Routes(
+      Method.GET / ".well-known" / "oauth-protected-resource" -> handler((req: Request) => respondPRM(req)),
+      Method.GET / ".well-known" / "oauth-protected-resource" / trailing -> handler((_: zio.http.Path, req: Request) => respondPRM(req)),
+    ) ++ asMetadataRedirectRoutes(auth)
+
+  /**
+   * Backwards-compat OAuth authorization-server metadata discovery for pre-RFC-9728
+   * clients (e.g. the Rust `rmcp` client used by some MCP CLIs). Such clients IGNORE
+   * the PRM `authorization_servers` and instead probe the RESOURCE origin for AS
+   * metadata — both RFC 8414 `oauth-authorization-server` and OIDC
+   * `openid-configuration`, in root and path-inserted forms. These routes
+   * 302-redirect such probes to the configured authorization server so discovery
+   * succeeds; modern clients use the PRM and never hit them. Skipped when the AS is
+   * same-origin as the resource (the AS serves its own metadata there — avoids a
+   * redirect-to-self loop). Bundled into both [[prmStatelessRoutes]] (multi-mount)
+   * and the single-mount [[statelessRoutes]].
+   */
+  private[mcp] def asMetadataRedirectRoutes(auth: McpAuth[?]): Routes[Any, Response] =
+    def redirectToAsMetadata(request: Request): UIO[Response] =
+      val issuer = auth.authorizationServers.head.issuer.stripSuffix("/")
+      val origin = ResourceUriResolver.resolve(None, "", request).value.stripSuffix("/")
+      if issuer == origin then ZIO.succeed(Response.status(Status.NotFound))
+      else
+        val target = s"$issuer/.well-known/oauth-authorization-server"
+        URL.decode(target) match
+          case Right(u) =>
+            ZIO.logInfo(s"AS-metadata compat redirect (legacy same-origin discovery): ${request.url.encode} -> $target")
+              .as(Response(status = Status.Found).addHeader(Header.Location(u)))
+          case Left(_) => ZIO.succeed(Response.status(Status.NotFound))
+    Routes(
+      Method.GET / ".well-known" / "oauth-authorization-server" -> handler((req: Request) => redirectToAsMetadata(req)),
+      Method.GET / ".well-known" / "oauth-authorization-server" / trailing -> handler((_: zio.http.Path, req: Request) => redirectToAsMetadata(req)),
+      Method.GET / ".well-known" / "openid-configuration" -> handler((req: Request) => redirectToAsMetadata(req)),
+      Method.GET / ".well-known" / "openid-configuration" / trailing -> handler((_: zio.http.Path, req: Request) => redirectToAsMetadata(req)),
+    )
 
   trait State:
     def sessions: Ref[Map[SessionId, SessionState]]
