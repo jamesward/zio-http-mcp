@@ -718,6 +718,21 @@ This means the library **does not need a "compat with 2025-06-18 only" caveat** 
 
 The README will state: *"Compatible with MCP authorization specs 2025-06-18 and 2025-11-25 (resource server only)."*
 
+### 2026-07-28 update
+
+The **2026-07-28** authorization spec hardened the *client* side; the resource-server requirements are unchanged, so the server implementation above remains fully conformant. The client-side flow is now implemented in `McpClient` (superseding the "Client-side OAuth flows" non-goal and *Future work* item 2):
+
+- `OAuthAuthorizationCode` runs the full hardened flow: PRM discovery (path-inserted well-known form first) with **PRM `resource` validation against the server URL**, path-aware RFC 8414/OIDC AS-metadata discovery with issuer validation, **PKCE S256**, RFC 8707 `resource` on both authorization and token requests, **RFC 9207 `iss` validation** (exact string compare, required when `authorization_response_iss_parameter_supported` is advertised), the spec's scope-selection strategy, and refresh-token renewal.
+- Client identification follows the spec's priority: pre-registration → **CIMD** (`client_id_metadata_document_supported`) → DCR (deprecated fallback, registering with `application_type` per SEP-837).
+- Validation: `CimdAuthSpec` (in-process against `TestIdp`), `ClientConformanceSpec` (the official conformance kit's `auth/*` client scenarios), and `LiveCimdAuthSpec` (CIMD interop against the real `login.jamesward.dev`).
+
+Findings from the live CIMD interop worth recording, since none are obvious from the specs:
+
+- Authorization servers require the metadata document to be served as `Content-Type: application/json`; `raw.githubusercontent.com`'s `text/plain` is rejected.
+- `login.jamesward.dev` rejects an unresolvable or mismatched metadata document with a bare `401` carrying its protected-resource `WWW-Authenticate` challenge, rather than the OAuth2 `invalid_client` JSON error an opaque unknown `client_id` produces. Client code should therefore not rely on a structured `invalid_client` body to detect a rejected CIMD client.
+- Because a document's `client_id` must equal its own URL, tests need a public HTTPS host rather than a repo fixture. The CIMD test server (`https://www.cimd.now/<port>/<path>`) mints one on demand, with `redirect_uris` bound to `http://localhost:<port>/<path>` so a test can match whatever loopback port it binds.
+- The official conformance kit's `auth/basic-cimd` scenario never dereferences the document — it only checks that the client sent a URL-shaped `client_id`. Document fetching and validation are therefore covered by [[CimdAuthSpec]] (against [[TestIdp]]) and [[LiveCimdAuthSpec]], not by the kit.
+
 ## Future work
 
 Items intentionally deferred from v1, in rough priority order:

@@ -1,5 +1,6 @@
 package com.jamesward.ziohttp.mcp
 
+import com.jamesward.ziohttp.mcp.auth.*
 import com.jamesward.ziohttp.mcp.client.*
 import zio.*
 import zio.http.*
@@ -7,6 +8,8 @@ import zio.json.ast.Json
 import zio.schema.*
 import zio.test.*
 import zio.test.TestAspect.*
+
+import java.time.Instant
 
 /**
  * Exercises our [[com.jamesward.ziohttp.mcp.client.McpClient]] against our own
@@ -77,6 +80,48 @@ object McpClientSpec extends ZIOSpecDefault:
 
   private def addArgs(a: Int, b: Int): Json.Obj =
     Json.Obj(Chunk("a" -> Json.Num(a), "b" -> Json.Num(b)))
+
+  // --- Auth fixtures: a server that gates one tool behind `role:author`, used
+  // to prove the client surfaces an HTTP 403 insufficient-scope denial as a
+  // protocol-level error (not a JSON-RPC error). ---
+
+  private val authorScope = OauthScope("role:author")
+
+  private val authoredTool: McpToolHandler = McpTool("authored")
+    .description("Authors-only tool")
+    .requireScopes(authorScope)
+    .handle:
+      ZIO.succeed("ok")
+
+  private def userPrincipal: Principal =
+    Principal(
+      subject = Some("user-1"),
+      clientId = Some("client-1"),
+      scopes = Set(OauthScope("role:user")),
+      audience = Set("http://localhost:0/mcp"),
+      issuer = Some("https://auth.example.com"),
+      expiresAt = Some(Instant.now().plusSeconds(3600)),
+      raw = "user-token",
+      claims = Json.Obj(),
+    )
+
+  // Accepts "user-token" as a caller holding only `role:user` (no `role:author`).
+  private val userVerifier: TokenVerifier[Any] =
+    TokenVerifier.fromFunction:
+      case "user-token" => ZIO.succeed(userPrincipal)
+      case _            => ZIO.fail(AuthError.Invalid("not the test token"))
+
+  private val authGatedServer: McpServer[Any] =
+    McpServer("auth-client-test", "0.1.0")
+      .tool(addTool)
+      .tool(authoredTool)
+      .auth(McpAuth(
+        resourceUri = Some(ResourceUri.parse("http://localhost:0/mcp").toOption.get),
+        authorizationServers = NonEmptyChunk(AuthorizationServer("https://auth.example.com")),
+        scopesSupported = Chunk(authorScope),
+        verifier = userVerifier,
+        requiredScopes = Set.empty,
+      ))
 
   // These tests exercise the legacy (2025-11-25) session + SSE transport, so
   // pin the client to the legacy handshake rather than the modern default.
@@ -157,6 +202,25 @@ object McpClientSpec extends ZIOSpecDefault:
           yield assertTrue(
             resources.map(_.uri).contains("app://config"),
             contents.headOption.flatMap(_.text).contains("""{"debug":false}"""),
+          )
+      ,
+      test("insufficient scope (HTTP 403) surfaces as McpClientError.Protocol"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(authGatedServer.statelessRoutes)
+            client <- McpClient.connect(McpClientConfig(
+                        s"http://localhost:$port/mcp",
+                        headers = Headers(Header.Authorization.Bearer("user-token")),
+                      ))
+            // `add` is ungated, so the role:user caller can call it …
+            ok     <- client.callTool("add", addArgs(2, 3))
+            // … but `authored` requires role:author → HTTP 403 insufficient_scope.
+            err    <- client.callTool("authored").flip
+          yield assertTrue(
+            ok.isError.forall(!_),
+            err.isInstanceOf[McpClientError.Protocol],
+            err.getMessage.contains("403"),
+            err.getMessage.contains("Insufficient scope"),
           )
       ,
       test("JSON-RPC error surfaces as McpClientError.JsonRpc"):

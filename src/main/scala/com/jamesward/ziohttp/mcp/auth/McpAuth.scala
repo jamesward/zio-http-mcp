@@ -52,6 +52,22 @@ object ResourceUri:
     def matchesAudience(audience: String): Boolean =
       ResourceUri.canonicalize(r) == ResourceUri.canonicalize(audience)
 
+    /**
+     * The origin (`scheme://host[:port]`) of this resource, with any path stripped.
+     * Used so a path-bearing per-mount resource also accepts a host-origin `aud`,
+     * which is what an authorization server produces when it canonicalizes the
+     * requested `resource` to its origin (RFC 8707 §2.1 permits this, and real ASes
+     * do it). Without this, RFC 9728 §3.3-strict clients that request the per-mount
+     * `resource` still fail with an audience mismatch on the origin-folded token.
+     */
+    def origin: ResourceUri =
+      val schemeIdx = r.indexOf("://")
+      if schemeIdx < 0 then r
+      else
+        val rest     = r.substring(schemeIdx + 3)
+        val slashIdx = rest.indexOf('/')
+        if slashIdx < 0 then r else r.substring(0, schemeIdx + 3 + slashIdx)
+
   private def canonicalize(s: String): String =
     // Lowercase scheme + host; preserve path; strip trailing slash on bare-host URIs.
     val schemeIdx = s.indexOf("://")

@@ -310,4 +310,4 @@ object LiveAuthSpec extends ZIOSpecDefault:
             )
         }
       ,
-    ).provide(Client.default) @@ tag("live-auth") @@ sequential @@ withLiveClock @@ timeout(60.seconds)
+    ).provide(Client.default) @@ tag("live-auth") @@ sequential @@ withLiveClock @@ timeout(60.seconds) @@ AuthTestHelpers.retryTransientUpstream

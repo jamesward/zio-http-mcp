@@ -3,7 +3,7 @@ zio-http-mcp
 
 An MCP (Model Context Protocol) server and client library for Scala 3, ZIO, and ZIO HTTP.
 
-Implements the [MCP 2025-11-25 specification](https://modelcontextprotocol.io) with Streamable HTTP transport, SSE streaming, tools, resources, prompts, sampling, elicitation, and progress notifications. The client supports the Streamable HTTP transport and OAuth 2.1 `client_credentials` authorization.
+Implements the [MCP 2025-11-25 specification](https://modelcontextprotocol.io) with Streamable HTTP transport, SSE streaming, tools, resources, prompts, sampling, elicitation, and progress notifications. The client supports the Streamable HTTP transport and OAuth 2.1 authorization — both `client_credentials` and the MCP-spec `authorization_code` + PKCE flow with Client ID Metadata Documents (CIMD).
 
 The library is **dual-era**: it also implements the stateless [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28) (final) and negotiates the protocol version per connection. See [Protocol version negotiation](#protocol-version-negotiation).
 
@@ -382,7 +382,7 @@ val config = McpClientConfig(
 
 ## Authorization
 
-Authorization is opt-in. A server with no `.auth(...)` call behaves exactly as the examples above — no new headers, no new endpoints, no `R` requirement changes. Add `.auth(...)` to enable OAuth 2.1 bearer-token validation conforming to the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization) (compatible with both `2025-06-18` and `2025-11-25`).
+Authorization is opt-in. A server with no `.auth(...)` call behaves exactly as the examples above — no new headers, no new endpoints, no `R` requirement changes. Add `.auth(...)` to enable OAuth 2.1 bearer-token validation conforming to the [MCP authorization spec](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) (compatible with `2025-06-18`, `2025-11-25`, and `2026-07-28` — the resource-server requirements are the same across all three).
 
 The library acts as an **OAuth 2.1 Resource Server**. It does not host an authorization server — point at one (Keycloak, Authentik, Auth0, Spring Authorization Server, etc.). DCR (Dynamic Client Registration), CIMD, and the user-consent flow are AS-side concerns.
 
@@ -560,7 +560,14 @@ The library works against any AS that:
 - Supports the [RFC 8707 `resource` parameter](https://www.rfc-editor.org/rfc/rfc8707) (for audience binding),
 - Either signs JWTs with a JWKS-published key (preferred) or exposes [RFC 7662 token introspection](https://www.rfc-editor.org/rfc/rfc7662).
 
-For DCR-capable clients, the AS must also support [RFC 7591 Dynamic Client Registration](https://datatracker.ietf.org/doc/html/rfc7591). Verified to work against `https://login.jamesward.dev` (Spring Authorization Server with open DCR).
+For clients with no pre-existing relationship, the AS should support [Client ID Metadata Documents](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document-00) (advertised via `client_id_metadata_document_supported`, the `2026-07-28` spec's preferred mechanism) and/or [RFC 7591 Dynamic Client Registration](https://datatracker.ietf.org/doc/html/rfc7591) (deprecated in `2026-07-28`, retained for backwards compatibility). Both are verified to work against `https://login.jamesward.dev`, which supports open DCR and CIMD.
+
+#### Hosting a Client ID Metadata Document
+
+When using CIMD, the client hosts a JSON document at the HTTPS URL it uses as its `client_id`. Two requirements bite in practice:
+
+- The document's `client_id` **must equal its own URL exactly**. Authorization servers reject a mismatch.
+- Serve it as **`Content-Type: application/json`**. A document served as `text/plain` is rejected — which rules out `raw.githubusercontent.com` as a host; a CDN that sets the JSON content type (jsDelivr, for example) or your own server works.
 
 ### Running
 
@@ -692,7 +699,41 @@ ZIO.scoped:
 .provide(Client.default)
 ```
 
-Supply `tokenEndpoint` and/or `resource` on `OAuthClientCredentials` to pin those values and skip the corresponding discovery step. v1 supports `client_credentials` only; the spec's `authorization_code` + PKCE flow is future work.
+Supply `tokenEndpoint` and/or `resource` on `OAuthClientCredentials` to pin those values and skip the corresponding discovery step.
+
+### OAuth 2.1 (authorization_code + PKCE, CIMD)
+
+For the [MCP `2026-07-28` hardened authorization flow](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization), supply `OAuthAuthorizationCode`. The client runs the full flow:
+
+1. Probe the MCP endpoint; on `401` read the `resource_metadata` URL and `scope` hint from the `WWW-Authenticate` challenge (falling back to the [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) well-known forms — path-inserted first, then root).
+2. Fetch the Protected Resource Metadata; **verify its `resource` matches the server URL** (a PRM naming a different resource aborts the flow); pick the advertised authorization server.
+3. Discover AS metadata, trying the [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) and [OIDC Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html) well-known forms in the spec's priority order (path-aware for issuers with a path component), and verify the metadata `issuer` matches.
+4. Obtain a client id by the spec's registration priority: pre-registered `clientId` → **Client ID Metadata Documents** (`clientMetadataUrl` used as the `client_id` when the AS advertises `client_id_metadata_document_supported`) → Dynamic Client Registration (deprecated fallback).
+5. Send the authorization request with **PKCE S256**, the [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) `resource` parameter, and `state`; scopes follow the spec's selection strategy (explicit config → `WWW-Authenticate` `scope` hint → PRM `scopes_supported`).
+6. Validate the authorization response: `state` round-trip and the [RFC 9207](https://datatracker.ietf.org/doc/html/rfc9207) `iss` parameter (exact string comparison, no normalization; required when the AS advertises `authorization_response_iss_parameter_supported`).
+7. Exchange the code (+ `code_verifier` + `resource`) for tokens; refresh via `grant_type=refresh_token` when the token expires.
+
+```scala
+ZIO.scoped:
+  for
+    client <- McpClient.connect(McpClientConfig(
+                serverUrl = "https://mcp.example.com/mcp",
+                oauth = Some(OAuthAuthorizationCode(
+                  // the client's hosted CIMD document; used as the client_id
+                  clientMetadataUrl = Some("https://app.example.com/oauth/client-metadata.json"),
+                  redirectUri = "http://127.0.0.1:3000/callback",
+                )),
+              ))
+    tools  <- client.listTools
+  yield tools
+.provide(Client.default)
+```
+
+How the authorization URL reaches the resource owner is pluggable via `OAuthAuthorizationCode.authorization`. The default, `AuthorizationHandler.autoRedirect`, performs the request non-interactively and reads the redirect `Location` — suitable for auto-approving authorization servers and tests. An interactive app supplies its own `AuthorizationHandler` that opens the system browser and captures the redirect on a loopback listener at `redirectUri`.
+
+Pre-registered credentials take priority when set (`clientId` / optional `clientSecret`); with neither `clientId` nor a CIMD-supporting AS, the client falls back to Dynamic Client Registration when the AS has a `registration_endpoint` (registering with `application_type: "native"` for loopback redirect URIs per SEP-837).
+
+The client-side flow is validated two ways: end-to-end in-process tests against a CIMD-capable test IDP (`CimdAuthSpec`), and the official [MCP conformance kit](https://github.com/modelcontextprotocol/conformance)'s client auth scenarios (`ClientConformanceSpec`) — `auth/basic-cimd`, the `auth/iss-*` issuer-validation family, `auth/metadata-*` discovery forms, `auth/resource-mismatch`, `auth/scope-*` selection, `auth/pre-registration`, and `auth/client-credentials-basic`.
 
 ### Static auth headers
 

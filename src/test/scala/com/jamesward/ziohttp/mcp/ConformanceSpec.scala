@@ -13,6 +13,7 @@ import org.testcontainers.containers.output.ToStringConsumer
 import org.testcontainers.containers.startupcheck.OneShotStartupCheckStrategy
 import org.testcontainers.images.builder.ImageFromDockerfile
 
+import java.nio.file.{Files, Path, Paths}
 import java.time.Duration as JDuration
 import java.util.Base64
 
@@ -365,21 +366,51 @@ object ConformanceSpec extends ZIOSpecDefault:
     .prompt(testPromptWithEmbeddedResource)
     .prompt(testPromptWithImage)
 
-  // dns-rebinding-protection requires a localhost URL but rootless Docker
-  // cannot reach the host's localhost, so we mark it as an expected failure.
-  private val legacyExpectedFailuresYaml: String =
-    """server:
-      |  - dns-rebinding-protection
-      |""".stripMargin
+  /**
+   * A CA bundle to trust inside the image build, taken from the standard
+   * environment variables. On an ordinary machine none of these are set and the
+   * image is built unchanged; behind a TLS-intercepting proxy (corporate network,
+   * sandboxed CI) they point at the proxy's bundle, without which `npm install`
+   * fails the build with `SELF_SIGNED_CERT_IN_CHAIN`.
+   */
+  private val hostCaBundle: Option[Path] =
+    List("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
+      .flatMap(sys.env.get)
+      .map(Paths.get(_))
+      .find(Files.isRegularFile(_))
 
-  // Modern (2026-07-28) baseline: only the Docker-networking limitation.
-  // Modern `tools/call` streams request-scoped `notifications/progress` /
-  // `notifications/message` over the SSE response stream when the request
-  // opts in, so `tools-call-with-progress` passes and is no longer baselined.
-  private val modernExpectedFailuresYaml: String =
-    """server:
-      |  - dns-rebinding-protection
-      |""".stripMargin
+  /**
+   * Run the kit's container in the host network namespace, so it reaches the
+   * server under test at a genuine `localhost` URL. That matters beyond
+   * convenience: `dns-rebinding-protection` asserts the server's `Origin`
+   * handling for localhost callers and cannot run over
+   * `host.testcontainers.internal`.
+   *
+   * Host networking is a Linux capability (and Docker Desktop 4.34+ with the
+   * feature enabled). Elsewhere we fall back to bridged networking, where that
+   * one scenario is baselined as an expected failure. Force either mode with
+   * `CONFORMANCE_HOST_NETWORK=true|false`.
+   */
+  private val useHostNetwork: Boolean =
+    sys.env.get("CONFORMANCE_HOST_NETWORK")
+      .map(_.equalsIgnoreCase("true"))
+      .getOrElse(java.lang.System.getProperty("os.name", "").toLowerCase.contains("linux"))
+
+  /**
+   * Bridged networking cannot give the kit a localhost URL, so
+   * `dns-rebinding-protection` is baselined in that mode only. Under host
+   * networking every scenario is expected to pass.
+   *
+   * Modern `tools/call` streams request-scoped `notifications/progress` /
+   * `notifications/message` over the SSE response stream when the request opts
+   * in, so `tools-call-with-progress` passes in both modes.
+   */
+  private val expectedFailuresYaml: String =
+    if useHostNetwork then "{}\n"
+    else
+      """server:
+        |  - dns-rebinding-protection
+        |""".stripMargin
 
   // The official MCP conformance kit (npm). The `latest` line (0.1.x) drives the
   // 2025-11-25 protocol; the `0.2.0` line drives the modern 2026-07-28 protocol
@@ -387,40 +418,70 @@ object ConformanceSpec extends ZIOSpecDefault:
   // move to the stable `0.2.0` once it ships). Our server is dual-era, so each
   // version exercises a different negotiated path against it. The name and
   // version are kept separate and joined with `@` only when building the
-  // `npm install` command.
+  // `npx` invocation.
   private val ConformancePackage = "@modelcontextprotocol/conformance"
   private val LegacyKitVersion   = "0.1.16"
   private val ModernKitVersion   = "0.2.0-alpha.10"
 
+  /**
+   * Build an image with the kit preinstalled, so the test needs Docker and nothing
+   * else on the host — no Node, no npm, no global installs.
+   */
   def conformanceImage(version: String, tag: String): ImageFromDockerfile =
-    ImageFromDockerfile(s"mcp-conformance-$tag", false)
-      .withDockerfileFromBuilder: builder =>
-        builder
-          .from("node:22-slim")
-          .run(s"npm install -g $ConformancePackage@$version")
-          .entryPoint("npx", ConformancePackage)
-          .build()
+    val base = ImageFromDockerfile(s"mcp-conformance-$tag", false)
+    // The CA has to be baked in rather than mounted: `npm install` runs during the
+    // image build, where volumes are not available.
+    val withContext = hostCaBundle.fold(base)(ca => base.withFileFromPath("ca-bundle.crt", ca))
+    withContext.withDockerfileFromBuilder: builder =>
+      builder.from("node:22-slim")
+      hostCaBundle.foreach: _ =>
+        builder.copy("ca-bundle.crt", "/usr/local/share/ca-certificates/proxy-ca.crt")
+        builder.env("NODE_EXTRA_CA_CERTS", "/usr/local/share/ca-certificates/proxy-ca.crt")
+      builder
+        .run(s"npm install -g $ConformancePackage@$version")
+        .entryPoint("npx", ConformancePackage)
+        .build()
 
   val legacyImage: ImageFromDockerfile = conformanceImage(LegacyKitVersion, "legacy")
   val modernImage: ImageFromDockerfile = conformanceImage(ModernKitVersion, "modern")
 
+  /** The URL the kit uses to reach the server, which depends on the networking mode. */
+  private def serverUrlFor(port: Int): String =
+    if useHostNetwork then s"http://localhost:$port/mcp"
+    else s"http://host.testcontainers.internal:$port/mcp"
+
+  /** Run the kit against the server bound on `port` of the host. */
   def runConformance(image: ImageFromDockerfile, port: Int, specVersion: String, expectedFailures: String, scenario: Option[String] = None): Task[(Long, String)] =
+    ZIO.logInfo(
+      s"conformance $specVersion: ${if useHostNetwork then "host" else "bridge"} networking, " +
+        s"url=${serverUrlFor(port)}, ca=${hostCaBundle.fold("none")(_.toString)}"
+    ) *>
     ZIO.attemptBlocking:
-      TC.exposeHostPorts(port)
+      val expectedFailuresFile = java.io.File.createTempFile("expected-failures", ".yaml")
+      expectedFailuresFile.deleteOnExit()
+      Files.writeString(expectedFailuresFile.toPath, expectedFailures)
 
-      // Write expected failures YAML to a temp file for mounting
-      val tmpFile = java.io.File.createTempFile("expected-failures", ".yaml")
-      tmpFile.deleteOnExit()
-      java.nio.file.Files.writeString(tmpFile.toPath, expectedFailures)
-
-      val stdout = ToStringConsumer()
+      val stdout    = ToStringConsumer()
       val container = GenericContainer(image)
-      container.withAccessToHost(true)
-      container.withFileSystemBind(tmpFile.getAbsolutePath, "/tmp/expected-failures.yaml",
+
+      // Host networking reaches the server as `localhost`; bridged networking has
+      // to go through the gateway alias, which `dns-rebinding-protection` cannot use.
+      // These `with…` builders declare testcontainers' self type, which Scala infers
+      // as `Nothing`; keep them in statement position so no cast to `Nothing` is
+      // emitted (in value position that throws `ClassCastException` at runtime).
+      if useHostNetwork then
+        container.withNetworkMode("host")
+        ()
+      else
+        TC.exposeHostPorts(port)
+        container.withAccessToHost(true)
+        ()
+
+      container.withFileSystemBind(expectedFailuresFile.getAbsolutePath, "/tmp/expected-failures.yaml",
         org.testcontainers.containers.BindMode.READ_ONLY)
       val baseArgs = Seq(
         "server",
-        "--url", s"http://host.testcontainers.internal:$port/mcp",
+        "--url", serverUrlFor(port),
         // `--spec-version` picks which protocol era the kit drives: without it
         // the kit defaults to the legacy `initialize` handshake even on the
         // 2026-07-28 line, so it must be set explicitly to actually exercise the
@@ -439,8 +500,7 @@ object ConformanceSpec extends ZIOSpecDefault:
 
       try
         container.start()
-        val exitCode: Long = container.getContainerInfo.getState.getExitCodeLong
-        (exitCode, stdout.toUtf8String)
+        (container.getContainerInfo.getState.getExitCodeLong, stdout.toUtf8String)
       catch
         case _: org.testcontainers.containers.ContainerLaunchException =>
           val exitCode: Long =
@@ -457,22 +517,18 @@ object ConformanceSpec extends ZIOSpecDefault:
         for
           port              <- Server.install(testServer.routes)
           _                 <- ZIO.logInfo(s"MCP server started on port $port")
-          (exitCode, output) <- runConformance(legacyImage, port, "2025-11-25", legacyExpectedFailuresYaml)
+          (exitCode, output) <- runConformance(legacyImage, port, "2025-11-25", expectedFailuresYaml)
           _                 <- ZIO.logInfo(s"Legacy conformance exit code: $exitCode")
-          _                 <- ZIO.logInfo(s"Legacy conformance output:\n$output")
-        yield assertTrue(
-          output.contains("Baseline check passed") || exitCode == 0L,
-        )
+          _                 <- ZIO.logInfo(s"Legacy conformance output:\n$output").when(exitCode != 0)
+        yield assertTrue(exitCode == 0L)
       ,
       test("2026-07-28 (modern) conformance suite passes"):
         for
           port              <- Server.install(testServer.routes)
-          (exitCode, output) <- runConformance(modernImage, port, "2026-07-28", modernExpectedFailuresYaml)
+          (exitCode, output) <- runConformance(modernImage, port, "2026-07-28", expectedFailuresYaml)
           _                 <- ZIO.logInfo(s"Modern conformance exit code: $exitCode")
-          _                 <- ZIO.logInfo(s"Modern conformance output:\n$output")
-        yield assertTrue(
-          output.contains("Baseline check passed") || exitCode == 0L,
-        )
+          _                 <- ZIO.logInfo(s"Modern conformance output:\n$output").when(exitCode != 0)
+        yield assertTrue(exitCode == 0L)
     ).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@
       withLiveClock @@
       timeout(5.minutes) @@

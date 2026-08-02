@@ -5,6 +5,7 @@ import zio.*
 import zio.http.*
 import zio.json.*
 import zio.json.ast.Json
+import zio.test.{Live, TestAspect, TestFailure}
 
 import java.nio.charset.StandardCharsets
 
@@ -17,6 +18,49 @@ import java.nio.charset.StandardCharsets
 private[mcp] object AuthTestHelpers:
 
   val asIssuer = "https://login.jamesward.dev"
+
+  /**
+   * Failure text that indicates the upstream service was momentarily unavailable
+   * rather than that our code is wrong: gateway-class HTTP statuses (zio-http
+   * renders these as `Status` names, e.g. `ServiceUnavailable`) and dropped or
+   * timed-out connections.
+   */
+  private val transientUpstreamMarkers = Chunk(
+    "ServiceUnavailable", "503",
+    "BadGateway", "502",
+    "GatewayTimeout", "504",
+    "Connection reset",
+    "Connection timed out",
+    "connect timed out",
+  )
+
+  private def isTransientUpstream(failure: TestFailure[Any]): Boolean =
+    failure match
+      // A failed assertion is a real result, not an outage — never retry it.
+      case TestFailure.Assertion(_, _)   => false
+      case TestFailure.Runtime(cause, _) =>
+        val rendered = cause.prettyPrint
+        transientUpstreamMarkers.exists(rendered.contains)
+
+  /**
+   * Retry a test when — and only when — it failed the way a transient upstream
+   * outage looks.
+   *
+   * The live specs depend on the hosted `login.jamesward.dev`, which occasionally
+   * answers `503` mid-suite and fails a run that has nothing wrong with it. This
+   * retries a few times with backoff so a blip is absorbed, while a sustained
+   * outage still fails after the last attempt.
+   *
+   * Deliberately narrow: assertion failures are never retried, so a genuine
+   * regression fails on the first attempt instead of being masked (and slowed
+   * down) by re-runs.
+   */
+  val retryTransientUpstream =
+    TestAspect.retry(
+      Schedule.recurWhile[TestFailure[Any]](isTransientUpstream) &&
+        Schedule.recurs(3) &&
+        Schedule.exponential(1.second)
+    )
 
   final case class DcrCredentials(clientId: String, clientSecret: String)
 
