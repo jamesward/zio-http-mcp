@@ -7,8 +7,6 @@ import zio.json.ast.Json
 import zio.schema.Schema
 import zio.schema.codec.JsonCodec as SchemaJsonCodec
 
-import scala.annotation.tailrec
-
 // --- McpInput type class: provides JSON schema + decoding for tool inputs ---
 
 trait McpInput[A]:
@@ -46,34 +44,39 @@ object McpOutput:
       CallToolResult(content = Chunk(ToolContent.text(output)))
 
   given [A](using schema: Schema[A]): McpOutput[A] with
-    private val jsonSchema = JsonSchemaGen.fromSchema(schema)
-    // MCP spec requires outputSchema to have type "object"
+    private val valueSchema = JsonSchemaGen.fromSchema(schema)
+    private val isObject: Boolean =
+      valueSchema.get("type").flatMap(_.asString).contains("object")
+
+    // The MCP spec constrains a tool's `outputSchema` to `{ "type": "object" }`
+    // and its `structuredContent` to a JSON object. A value whose schema is
+    // already object-typed (a record, a map) is used verbatim; any other value
+    // (an array, a scalar, a boolean) is nested under a single `result`
+    // property, so *every* `Schema[A]` yields a spec-compliant object schema and
+    // object structured content.
+    private val WrapperKey = "result"
+
     val outputSchema: Option[Json.Obj] =
-      jsonSchema.get("type").flatMap(_.asString) match
-        case Some("object") => Some(jsonSchema)
-        case _ => None
+      if isObject then Some(valueSchema)
+      else Some(Json.Obj(Chunk(
+        "type"       -> Json.Str("object"),
+        "properties" -> Json.Obj(Chunk(WrapperKey -> (valueSchema: Json))),
+        "required"   -> Json.Arr(Json.Str(WrapperKey)),
+      )))
+
     private val encoder = SchemaJsonCodec.jsonEncoder(schema)
-    private val isStringLike: Boolean =
-      import zio.schema.{Schema as S, StandardType as ST}
-      @tailrec
-      def check(s: S[?]): Boolean = s match
-        case S.Primitive(st, _) => st eq ST.StringType
-        case S.Transform(inner, _, _, _, _) => check(inner)
-        case S.Lazy(s0) => check(s0())
-        case _ => false
-      check(schema)
+
     def toResult(output: A): CallToolResult =
-      if isStringLike then
-        CallToolResult(content = Chunk(ToolContent.text(output.toString)))
-      else
-        val jsonStr = encoder.encodeJson(output, None).toString
-        // MCP spec requires structuredContent to be a JSON object
-        val structured = jsonStr.fromJson[Json].toOption.collect:
-          case obj: Json.Obj => obj
-        CallToolResult(
-          content = Chunk(ToolContent.text(jsonStr)),
-          structuredContent = structured,
-        )
+      val encoded = encoder.encodeJson(output, None).toString.fromJson[Json].getOrElse(Json.Null)
+      val structured: Json.Obj = encoded match
+        case obj: Json.Obj => obj
+        case other         => Json.Obj(Chunk(WrapperKey -> other))
+      // Text content mirrors the (object) structured content, per the spec's
+      // backward-compat recommendation.
+      CallToolResult(
+        content = Chunk(ToolContent.text(structured.toJson)),
+        structuredContent = Some(structured),
+      )
 
   given McpOutput[ToolContent] with
     val outputSchema: Option[Json.Obj] = None

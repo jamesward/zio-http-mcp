@@ -329,7 +329,7 @@ object TestIdp:
       port <- AuthTestHelpers.findFreePort
       idp  <- make(s"http://localhost:$port", config)
       _    <- Server.serve(idp.routes ++ extraRoutes(port))
-                .provideSome[Client](Server.defaultWithPort(port))
+                .provide(Server.defaultWithPort(port))
                 .forkScoped
       _    <- AuthTestHelpers.waitForBind(port)
     yield idp

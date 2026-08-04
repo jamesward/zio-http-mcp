@@ -38,7 +38,7 @@ libraryDependencies ++= Seq(
 
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
-  "dev.tachyonmcp" % "tachyon-core" % "1.0.0-beta.15" % Test,
+  "dev.tachyonmcp" % "tachyon-core" % "1.0.0-beta.16" % Test,
 )
 
 fork := true
@@ -65,16 +65,16 @@ javaOptions += "-Djava.net.preferIPv4Stack=true"
 // and uses a one-shot startup check, so cleanup is unaffected.
 Test / envVars += "TESTCONTAINERS_RYUK_DISABLED" -> "true"
 
-licenses := Seq("MIT License" -> url("https://opensource.org/licenses/MIT"))
+licenses := Seq("MIT License" -> uri("https://opensource.org/licenses/MIT"))
 
-homepage := Some(url("https://github.com/jamesward/zio-http-mcp"))
+homepage := Some(uri("https://github.com/jamesward/zio-http-mcp"))
 
 developers := List(
   Developer(
     "jamesward",
     "James Ward",
     "james@jamesward.com",
-    url("https://jamesward.com")
+    uri("https://jamesward.com")
   )
 )
 
