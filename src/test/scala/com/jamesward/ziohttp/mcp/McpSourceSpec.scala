@@ -55,10 +55,23 @@ object McpSourceSpec extends ZIOSpecDefault:
     override def complete(ref: CompletionRef, argument: CompletionArgument, ctx: McpToolContext): ZIO[Any, Nothing, CompletionResult] =
       ZIO.succeed(CompletionResult(CompletionValues(values = Chunk("alpha", "beta"))))
 
+  // A metadata provider that brands the mount per captured slug: title + a
+  // SEP-973 icon whose URL embeds the slug (a client MAY surface it).
+  private val serverInfoSource: ServerInfoSource[Any] = ServerInfoSource { ctx =>
+    val slug = ctx.pathParams.getOrElse("slug", "none")
+    ZIO.succeed(Implementation(
+      name    = "dyn",
+      version = "0.1.0",
+      title   = Some(s"Toolbook $slug"),
+      icons   = List(Icon(src = s"https://example.test/$slug/icon.png", mimeType = Some("image/png"), sizes = Some("48x48"))),
+    ))
+  }
+
   // Per-toolbook style mount: one server serving `/<slug>` for any slug.
   private val dynServer = McpServer("dyn", "0.1.0")
     .toolSource(toolSource)
     .resourceSource(resourceSource)
+    .serverInfo(serverInfoSource)
     .mountedAtParam("slug")
 
   // A minimal fake upstream that records the inbound Authorization header and answers
@@ -150,6 +163,20 @@ object McpSourceSpec extends ZIOSpecDefault:
             contents.headOption.flatMap(_.text).contains("body of up://anything"),
             completed.completion.values == Chunk("alpha", "beta"),
           )
+      ,
+
+      test("(c) serverInfo metadata provider brands the mount per slug (title + SEP-973 icons)"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(dynServer.statelessRoutes)
+            client <- McpClient.connect(s"http://localhost:$port/xyz789")
+          yield
+            val info = client.serverInfo
+            assertTrue(
+              info.title.contains("Toolbook xyz789"),
+              info.icons.map(_.src) == List("https://example.test/xyz789/icon.png"),
+              info.icons.headOption.flatMap(_.mimeType).contains("image/png"),
+            )
       ,
 
       test("(a) streamableHttp attaches the configured static auth header to every request"):

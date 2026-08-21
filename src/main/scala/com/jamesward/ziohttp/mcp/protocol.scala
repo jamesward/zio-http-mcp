@@ -6,11 +6,56 @@ import zio.json.ast.Json
 
 // --- Implementation Info ---
 
-case class Implementation(name: String, version: String)
+/**
+ * An icon descriptor (SEP-973), advertised in `serverInfo.icons`. `src` is an
+ * absolute `https://` URL or a `data:` URI; `mimeType` (e.g. `image/png`),
+ * `sizes` (e.g. `"48x48"` or `"any"`), and `theme` (`"light"`/`"dark"`) are
+ * optional hints a client MAY use to pick the best rendition.
+ */
+case class Icon(
+  src: String,
+  mimeType: Option[String] = None,
+  sizes: Option[String] = None,
+  theme: Option[String] = None,
+)
+
+object Icon:
+  given CanEqual[Icon, Icon] = CanEqual.derived
+  given JsonCodec[Icon] = DeriveJsonCodec.gen[Icon]
+
+/**
+ * MCP handshake identity (`serverInfo` / `clientInfo`). `name` + `version` are
+ * required; the optional `title` (human display name), `icons` (SEP-973 — a
+ * client MAY surface one as the connector icon), and `websiteUrl` are branding
+ * a server can advertise. The encoder OMITS an unset `title`/`websiteUrl` and
+ * empty `icons`, so a plain identity still serializes to exactly
+ * `{"name":…,"version":…}` (backward-compatible wire format).
+ */
+case class Implementation(
+  name: String,
+  version: String,
+  title: Option[String] = None,
+  icons: List[Icon] = Nil,
+  websiteUrl: Option[String] = None,
+)
 
 object Implementation:
   given CanEqual[Implementation, Implementation] = CanEqual.derived
-  given JsonCodec[Implementation] = DeriveJsonCodec.gen[Implementation]
+
+  given JsonEncoder[Implementation] = JsonEncoder[Json].contramap: impl =>
+    val base = Chunk[(String, Json)](
+      "name"    -> Json.Str(impl.name),
+      "version" -> Json.Str(impl.version),
+    )
+    val withTitle = impl.title.fold(base)(t => base :+ ("title" -> Json.Str(t)))
+    val withIcons =
+      if impl.icons.isEmpty then withTitle
+      else withTitle :+ ("icons" -> JsonEncoder[List[Icon]].toJsonAST(impl.icons).getOrElse(Json.Arr()))
+    val withSite  = impl.websiteUrl.fold(withIcons)(u => withIcons :+ ("websiteUrl" -> Json.Str(u)))
+    Json.Obj(withSite)
+
+  // Derived decoder: missing optional fields fall back to the case-class defaults.
+  given JsonDecoder[Implementation] = DeriveJsonDecoder.gen[Implementation]
 
 // --- Tool Annotations ---
 

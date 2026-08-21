@@ -50,10 +50,12 @@ object ModernEnvelope:
   /** Merge `io.modelcontextprotocol/serverInfo` into the result's `_meta`,
     * preserving any `_meta` the handler already produced. */
   def withServerInfo(result: Json.Obj, serverInfo: Implementation): Json.Obj =
-    val infoJson = Json.Obj(Chunk(
-      "name"    -> Json.Str(serverInfo.name),
-      "version" -> Json.Str(serverInfo.version),
-    ))
+    // Serialize via Implementation's own encoder so SEP-973 `title`/`icons`/
+    // `websiteUrl` ride along (a client reads server identity from here); the
+    // encoder omits them when unset, so the base case stays `{name, version}`.
+    val infoJson = serverInfo.toJsonAST.toOption.flatMap(_.asObject).getOrElse(
+      Json.Obj(Chunk("name" -> Json.Str(serverInfo.name), "version" -> Json.Str(serverInfo.version)))
+    )
     val existingMeta = result.get("_meta").flatMap(_.asObject).getOrElse(Json.Obj())
     val mergedMeta = putIfAbsent(existingMeta, McpMeta.ServerInfo, infoJson)
     put(result, "_meta", mergedMeta)
@@ -78,10 +80,9 @@ final case class DiscoverResult(
   instructions: Option[String] = None,
 ):
   def toResultJson: Json.Obj =
-    val serverInfoJson = Json.Obj(Chunk(
-      "name"    -> Json.Str(serverInfo.name),
-      "version" -> Json.Str(serverInfo.version),
-    ))
+    val serverInfoJson = serverInfo.toJsonAST.toOption.flatMap(_.asObject).getOrElse(
+      Json.Obj(Chunk("name" -> Json.Str(serverInfo.name), "version" -> Json.Str(serverInfo.version)))
+    )
     val base = Chunk[(String, Json)](
       "supportedVersions" -> Json.Arr(supportedVersions.map(Json.Str(_))),
       "capabilities"      -> capabilities.toJsonAST.getOrElse(Json.Obj()),

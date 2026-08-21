@@ -34,6 +34,34 @@ object InstructionsSource:
 
 
 /**
+ * A dynamic provider of the handshake `serverInfo` ([[Implementation]]) — the
+ * server identity (name, title, icons per SEP-973, websiteUrl) a client MAY
+ * surface (e.g. a connector icon). Consulted by [[McpServer]] on every
+ * `initialize` and `server/discover` with the request's [[McpToolContext]] in
+ * hand, so the identity can vary per caller (`ctx.principal`) and — the point
+ * of this seam — per mount (`ctx.pathParams`, e.g. the `<slug>` of a
+ * path-parameterised mount, so one server brands itself differently for each
+ * value it serves).
+ *
+ * Pass one to [[McpServer.serverInfo]] (the dynamic analogue of the static
+ * `McpServer(name, version)` identity). Setting one replaces the static
+ * identity in the handshake response. Runs in the `Nothing` error channel: a
+ * provider that can't reach its backing data should degrade to a sensible
+ * default (typically the static identity) rather than failing the handshake.
+ * Contravariant in `R`.
+ *
+ * It's a single-abstract-method trait, so a lambda works: `ServerInfoSource(ctx => ...)`.
+ */
+trait ServerInfoSource[-R]:
+  def serverInfo(ctx: McpToolContext): URIO[R, Implementation]
+
+object ServerInfoSource:
+  /** Build a [[ServerInfoSource]] from a function. */
+  def apply[R](f: McpToolContext => URIO[R, Implementation]): ServerInfoSource[R] =
+    (ctx: McpToolContext) => f(ctx)
+
+
+/**
  * A dynamic source of tools, queried by [[McpServer]] at request time.
  *
  * Unlike a statically registered `.tool(...)`, a source is consulted on every

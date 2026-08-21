@@ -31,18 +31,19 @@ final class McpServer[-R] private (
   pathParamName: Option[String] = None,
   val instructions: Option[String] = None,
   instructionsSrc: Option[InstructionsSource[R]] = None,
+  serverInfoSrc: Option[ServerInfoSource[R]] = None,
 ):
   def tool[R1](t: McpToolHandlerR[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
+    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
 
   def resource(r: McpResourceHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
+    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
 
   def resourceTemplate(rt: McpResourceTemplateHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
 
   def prompt(p: McpPromptHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
 
   /**
    * Register a dynamic [[McpToolSource]] consulted at request time. Its tools are merged
@@ -51,7 +52,7 @@ final class McpServer[-R] private (
    * environment, like [[tool]].
    */
   def toolSource[R1](src: McpToolSource[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, Some(src), resourceSrc, pathParamName, instructions, instructionsSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, Some(src), resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
 
   /**
    * Register a dynamic [[McpResourceSource]] consulted at request time. Its resources and
@@ -59,7 +60,7 @@ final class McpServer[-R] private (
    * it when no static resource/template matched, and `completion/complete` delegates to it.
    */
   def resourceSource[R1](src: McpResourceSource[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, Some(src), pathParamName, instructions, instructionsSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, Some(src), pathParamName, instructions, instructionsSrc, serverInfoSrc)
 
   /**
    * Mount the MCP HTTP routes at the given path. Defaults to `/mcp` (matching the
@@ -82,7 +83,7 @@ final class McpServer[-R] private (
    * Mutually exclusive with [[mountedAtParam]]; the last one called wins.
    */
   def mountedAt(path: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, path, toolSrc, resourceSrc, None, instructions, instructionsSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, path, toolSrc, resourceSrc, None, instructions, instructionsSrc, serverInfoSrc)
 
   /**
    * Mount at a single path-parameter segment, so the server serves `/<value>` for any
@@ -100,7 +101,7 @@ final class McpServer[-R] private (
    * Mutually exclusive with [[mountedAt]]; the last one called wins.
    */
   def mountedAtParam(paramName: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, Some(paramName), instructions, instructionsSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, Some(paramName), instructions, instructionsSrc, serverInfoSrc)
 
   /**
    * Enable opt-in OAuth 2.1 authorization for this server.
@@ -116,7 +117,7 @@ final class McpServer[-R] private (
    * @see [[com.jamesward.ziohttp.mcp.auth.McpAuth]]
    */
   def auth[R1](a: McpAuth[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a), mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc)
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a), mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
 
   /**
    * Set a static `instructions` string returned in the `initialize` result.
@@ -131,7 +132,7 @@ final class McpServer[-R] private (
    * than a combinable collection like tools/resources.
    */
   def instructions(text: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, Some(text), None)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, Some(text), None, serverInfoSrc)
 
   /**
    * Set a dynamic [[InstructionsSource]] for the `initialize` result's `instructions`
@@ -144,7 +145,24 @@ final class McpServer[-R] private (
    * widens the server's `R`.
    */
   def instructions[R1](source: InstructionsSource[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, None, Some(source))
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, None, Some(source), serverInfoSrc)
+
+  /**
+   * Set a dynamic [[ServerInfoSource]] "metadata provider" for the handshake
+   * `serverInfo` ([[Implementation]] — name/title/icons/websiteUrl), consulted on
+   * every `initialize` and `server/discover` with the request's [[McpToolContext]]
+   * in hand. This is what lets a single path-parameterised mount brand itself per
+   * value it serves — e.g. resolve the `<slug>` from `ctx.pathParams` and return an
+   * `Implementation` carrying that toolbook's title and icon (SEP-973), which a
+   * client MAY surface as the connector icon.
+   *
+   * The dynamic analogue of the static `McpServer(name, version)` identity: when set
+   * it replaces the static `serverInfo` in the handshake responses. Contravariant in
+   * the provider's environment, like [[tool]] / [[toolSource]] / [[instructions]]:
+   * registering one widens the server's `R`.
+   */
+  def serverInfo[R1](source: ServerInfoSource[R1]): McpServer[R & R1] =
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, Some(source))
 
   private val toolsByName: Map[ToolName, McpToolHandlerR[R]] =
     tools.map(t => t.name -> t).toMap
@@ -688,11 +706,14 @@ final class McpServer[-R] private (
     principal: Option[Principal],
     pathParams: Map[String, String],
   ): ZIO[R, Response, Response] =
-    resolveInstructions(principal, pathParams).map: instr =>
+    for
+      instr <- resolveInstructions(principal, pathParams)
+      info  <- resolveServerInfo(principal, pathParams)
+    yield
       val result = DiscoverResult(
         supportedVersions = ProtocolVersion.supportedWire,
         capabilities = serverCapabilities,
-        serverInfo = serverInfo,
+        serverInfo = info,
         instructions = instr,
       )
       rawResultResponse(id, result.toResultJson)
@@ -809,13 +830,25 @@ final class McpServer[-R] private (
       negotiated = ProtocolVersion.negotiateLegacy(init.protocolVersion)
       _         <- ZIO.logInfo(s"MCP initialize (legacy handshake): requestedProtocol=${init.protocolVersion} negotiatedProtocol=${negotiated.wire}")
       instr     <- resolveInstructions(principal, pathParams)
+      info      <- resolveServerInfo(principal, pathParams)
     yield
       InitializeResult(
         protocolVersion = negotiated.wire,
         capabilities = serverCapabilities,
-        serverInfo = serverInfo,
+        serverInfo = info,
         instructions = instr,
       )
+
+  /** Resolve the handshake `serverInfo`: the dynamic [[ServerInfoSource]] provider
+    * (with the request's principal/pathParams — so a parameterised mount can brand
+    * itself per `<value>`), or the static identity when no provider is set. */
+  private def resolveServerInfo(
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Nothing, Implementation] =
+    serverInfoSrc match
+      case Some(source) => source.serverInfo(McpToolContext.noopWith(principal, pathParams))
+      case None         => ZIO.succeed(serverInfo)
 
   /** Resolve the `initialize` instructions: either the dynamic [[InstructionsSource]]
     * provider (with the request's principal/pathParams), or the static value — never
@@ -1321,31 +1354,69 @@ object McpServer:
    * clients (e.g. the Rust `rmcp` client used by some MCP CLIs). Such clients IGNORE
    * the PRM `authorization_servers` and instead probe the RESOURCE origin for AS
    * metadata — both RFC 8414 `oauth-authorization-server` and OIDC
-   * `openid-configuration`, in root and path-inserted forms. These routes
-   * 302-redirect such probes to the configured authorization server so discovery
-   * succeeds; modern clients use the PRM and never hit them. Skipped when the AS is
-   * same-origin as the resource (the AS serves its own metadata there — avoids a
-   * redirect-to-self loop). Bundled into both [[prmStatelessRoutes]] (multi-mount)
-   * and the single-mount [[statelessRoutes]].
+   * `openid-configuration`, in root and path-inserted forms.
+   *
+   * The response is keyed on the probe's `User-Agent` (the only client signal on
+   * these unauthenticated discovery GETs — captured/logged here):
+   *   - Legacy origin-probing clients that FOLLOW the redirect and use its target
+   *     (the Rust `rmcp` client behind older kiro-cli, and any unknown / no-UA
+   *     client) get a 302 to the configured AS so discovery succeeds.
+   *   - PRM-capable clients that strictly validate the AS metadata `issuer`
+   *     against the probed origin (RFC 8414 §3.3) — MCP Inspector (Node), Claude
+   *     — REJECT a cross-origin redirect ("issuer mismatch"), so we 404 their
+   *     origin probe and let them fall back to the PRM, which advertises the real
+   *     (cross-origin) AS. See [[isPrmCapableClient]].
+   *
+   * Skipped entirely when the AS is same-origin as the resource (the AS serves its
+   * own metadata there — avoids a redirect-to-self loop). Bundled into both
+   * [[prmStatelessRoutes]] (multi-mount) and the single-mount [[statelessRoutes]].
    */
   private[mcp] def asMetadataRedirectRoutes(auth: McpAuth[?]): Routes[Any, Response] =
     def redirectToAsMetadata(request: Request): UIO[Response] =
-      val issuer = auth.authorizationServers.head.issuer.stripSuffix("/")
-      val origin = ResourceUriResolver.resolve(None, "", request).value.stripSuffix("/")
-      if issuer == origin then ZIO.succeed(Response.status(Status.NotFound))
+      val userAgent = request.rawHeader("user-agent")
+      val proto     = request.rawHeader(Negotiation.ProtocolVersionHeader)
+      val issuer    = auth.authorizationServers.head.issuer.stripSuffix("/")
+      val origin    = ResourceUriResolver.resolve(None, "", request).value.stripSuffix("/")
+      // Capture the discovery request's identifying headers — there's no auth or
+      // body on this GET, so the client is only visible via these.
+      val logProbe  = ZIO.logInfo(
+        s"AS-metadata origin probe: ${request.url.encode} " +
+          s"user-agent=${userAgent.getOrElse("-")} " +
+          s"mcp-protocol-version=${proto.getOrElse("-")}")
+      if issuer == origin then
+        logProbe.as(Response.status(Status.NotFound))
+      else if isPrmCapableClient(userAgent) then
+        (logProbe *> ZIO.logInfo(
+          s"AS-metadata 404 (PRM-capable client; use protected-resource metadata): user-agent=${userAgent.getOrElse("-")}"))
+          .as(Response.status(Status.NotFound))
       else
         val target = s"$issuer/.well-known/oauth-authorization-server"
         URL.decode(target) match
           case Right(u) =>
-            ZIO.logInfo(s"AS-metadata compat redirect (legacy same-origin discovery): ${request.url.encode} -> $target")
+            (logProbe *> ZIO.logInfo(s"AS-metadata compat redirect (legacy origin discovery): ${request.url.encode} -> $target"))
               .as(Response(status = Status.Found).addHeader(Header.Location(u)))
-          case Left(_) => ZIO.succeed(Response.status(Status.NotFound))
+          case Left(_) => logProbe.as(Response.status(Status.NotFound))
     Routes(
       Method.GET / ".well-known" / "oauth-authorization-server" -> handler((req: Request) => redirectToAsMetadata(req)),
       Method.GET / ".well-known" / "oauth-authorization-server" / trailing -> handler((_: zio.http.Path, req: Request) => redirectToAsMetadata(req)),
       Method.GET / ".well-known" / "openid-configuration" -> handler((req: Request) => redirectToAsMetadata(req)),
       Method.GET / ".well-known" / "openid-configuration" / trailing -> handler((_: zio.http.Path, req: Request) => redirectToAsMetadata(req)),
     )
+
+  /**
+   * Whether a client (identified by its `User-Agent`) does RFC 9728
+   * protected-resource-metadata discovery and strictly validates AS metadata per
+   * RFC 8414 §3.3 — so a cross-origin AS-metadata redirect would fail with an
+   * "issuer mismatch". For these we 404 the origin AS-metadata probe (they fall
+   * back to the PRM). Matched: Node runtimes (MCP Inspector's `fetch`/undici) and
+   * Claude (Claude Code / Desktop). NOT matched (→ keep the 302 compat redirect):
+   * the Rust `rmcp` client behind older kiro-cli, and any unknown / no-UA client.
+   */
+  private[mcp] def isPrmCapableClient(userAgent: Option[String]): Boolean =
+    userAgent.exists { raw =>
+      val ua = raw.toLowerCase
+      ua.contains("node") || ua.contains("undici") || ua.contains("claude")
+    }
 
   trait State:
     def sessions: Ref[Map[SessionId, SessionState]]
