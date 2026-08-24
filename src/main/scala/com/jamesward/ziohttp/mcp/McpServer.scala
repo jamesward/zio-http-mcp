@@ -223,13 +223,14 @@ final class McpServer[-R] private (
     // offer one (405 is spec-permitted); log the attempt so a client that REQUIRES
     // it (older HTTP+SSE transport) is visible for diagnosis.
     def getSseDeclined(req: Request): UIO[Response] =
-      ZIO.logDebug(
-        s"MCP stateless GET declined 405 (no server→client SSE stream): path=${req.url.path.encode} " +
-          s"accept=${req.rawHeader("accept").getOrElse("-")} " +
-          s"mcp-protocol-version=${req.rawHeader("mcp-protocol-version").getOrElse("-")} " +
-          s"mcp-session-id=${req.rawHeader("mcp-session-id").getOrElse("-")} " +
-          s"user-agent=${req.rawHeader("user-agent").getOrElse("-")}"
-      ).as(Response.status(Status.MethodNotAllowed))
+      ZIO.logAnnotate(
+        LogAnnotation("path", req.url.path.encode),
+        LogAnnotation("accept", req.rawHeader("accept").getOrElse("-")),
+        LogAnnotation("mcpProtocolVersion", req.rawHeader("mcp-protocol-version").getOrElse("-")),
+        LogAnnotation("sessionId", req.rawHeader("mcp-session-id").getOrElse("-")),
+        LogAnnotation("userAgent", req.rawHeader("user-agent").getOrElse("-")),
+      )(ZIO.logDebug("MCP stateless GET declined 405 (no server→client SSE stream)"))
+        .as(Response.status(Status.MethodNotAllowed))
     val baseRoutes: Routes[R, Response] = pathParamName match
       case Some(name) =>
         val seg = zio.http.codec.PathCodec.string(name)
@@ -314,7 +315,10 @@ final class McpServer[-R] private (
         def respondPRM(request: Request): UIO[Response] =
           val resourceUri = ResourceUriResolver.resolve(a.resourceUri, prmResourcePath(request), request)
           val prm = ProtectedResourceMetadata.fromAuth(a, resourceUri)
-          ZIO.log(s"PRM document requested: ${request.url.encode} (resource=${resourceUri.value})")
+          ZIO.logAnnotate(
+            LogAnnotation("url", request.url.encode),
+            LogAnnotation("resource", resourceUri.value),
+          )(ZIO.logInfo("PRM document requested"))
             .as(Response.json(prm.toJson).addHeader(Header.CacheControl.MaxAge(3600)))
 
         val handlerFn = handler { (req: Request) => respondPRM(req) }
@@ -337,8 +341,18 @@ final class McpServer[-R] private (
         AuthMiddleware
           .authenticate(a, resourcePath, request, additionalRequiredScopes = Set.empty)
           .tapBoth(
-            err => ZIO.logWarning(s"Auth failed for ${request.method} ${request.url.encode}: ${err.description}"),
-            principal => ZIO.logInfo(s"Auth ok for ${request.method} ${request.url.encode}: sub=${principal.subject.getOrElse("?")} client_id=${principal.clientId.getOrElse("?")} scopes=${principal.scopes.map(_.value).mkString(",")}"),
+            err => ZIO.logAnnotate(
+              LogAnnotation("method", request.method.render),
+              LogAnnotation("url", request.url.encode),
+              LogAnnotation("error", err.description),
+            )(ZIO.logWarning("Auth failed")),
+            principal => ZIO.logAnnotate(
+              LogAnnotation("method", request.method.render),
+              LogAnnotation("url", request.url.encode),
+              LogAnnotation("sub", principal.subject.getOrElse("?")),
+              LogAnnotation("clientId", principal.clientId.getOrElse("?")),
+              LogAnnotation("scopes", principal.scopes.map(_.value).mkString(",")),
+            )(ZIO.logInfo("Auth ok")),
           )
           .mapBoth(
             err => AuthMiddleware.errorResponse(a, resourcePath, request, err, a.requiredScopes),
@@ -358,7 +372,11 @@ final class McpServer[-R] private (
       case (Some(a), Some(p)) if !p.hasAllScopes(tool.requiredScopes) =>
         val combined = a.requiredScopes ++ tool.requiredScopes
         val err = AuthError.InsufficientScope(combined, p.scopes)
-        ZIO.logWarning(s"Per-tool scope check failed for ${tool.name.value}: required=${combined.map(_.value).mkString(",")} actual=${p.scopes.map(_.value).mkString(",")}") *>
+        ZIO.logAnnotate(
+          LogAnnotation("tool", tool.name.value),
+          LogAnnotation("requiredScopes", combined.map(_.value).mkString(",")),
+          LogAnnotation("actualScopes", p.scopes.map(_.value).mkString(",")),
+        )(ZIO.logWarning("Per-tool scope check failed")) *>
           ZIO.fail(AuthMiddleware.errorResponse(a, mcpResourcePath(request), request, err, combined))
       case _ =>
         ZIO.unit
@@ -411,7 +429,10 @@ final class McpServer[-R] private (
                     case None =>
                       ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
         case JsonRpcMessage.Notification(method, params) =>
-          ZIO.logDebug(s"MCP Notification: $method $params").as(Response.status(Status.Accepted))
+          ZIO.logAnnotate(
+            LogAnnotation("method", method),
+            LogAnnotation("params", params.fold("-")(_.toJson)),
+          )(ZIO.logDebug("MCP Notification")).as(Response.status(Status.Accepted))
     yield response
 
   /**
@@ -814,7 +835,10 @@ final class McpServer[-R] private (
           ZIO.succeed(Response.status(Status.Accepted))
         case None =>
           ZIO.succeed(Response.status(Status.Accepted))
-    ZIO.logDebug(s"MCP Notification: $method $params") *> handled
+    ZIO.logAnnotate(
+      LogAnnotation("method", method),
+      LogAnnotation("params", params.fold("-")(_.toJson)),
+    )(ZIO.logDebug("MCP Notification")) *> handled
 
   private def parseInitializeParams(
     id: RequestId,
@@ -832,8 +856,15 @@ final class McpServer[-R] private (
       negotiated = ProtocolVersion.negotiateLegacy(init.protocolVersion)
       // `clientInfo` (a required `initialize` param) is the MCP client's
       // self-reported identity — e.g. `kiro`/`0.x`. Prefer it over the HTTP
-      // `User-Agent`, which MCP clients frequently omit.
-      _         <- ZIO.logInfo(s"MCP initialize (legacy handshake): requestedProtocol=${init.protocolVersion} negotiatedProtocol=${negotiated.wire} client=${init.clientInfo.name}/${init.clientInfo.version}${init.clientInfo.title.fold("")(t => s" ($t)")}")
+      // `User-Agent`, which MCP clients frequently omit. Emitted as structured
+      // log annotations (a downstream JSON logger surfaces them as fields
+      // rather than as free text inside `message`).
+      client     = s"${init.clientInfo.name}/${init.clientInfo.version}${init.clientInfo.title.fold("")(t => s" ($t)")}"
+      _         <- ZIO.logAnnotate(
+                     LogAnnotation("requestedProtocol", init.protocolVersion),
+                     LogAnnotation("negotiatedProtocol", negotiated.wire),
+                     LogAnnotation("client", client),
+                   )(ZIO.logInfo("MCP initialize (legacy handshake)"))
       instr     <- resolveInstructions(principal, pathParams)
       info      <- resolveServerInfo(principal, pathParams)
     yield
@@ -912,7 +943,10 @@ final class McpServer[-R] private (
     val dynamic = toolSrc.fold[ZIO[R, Nothing, Chunk[ToolDefinition]]](ZIO.succeed(Chunk.empty))(_.listTools(ctx))
     dynamic.flatMap: extra =>
       val all = visible.map(_.definition) ++ extra
-      ZIO.logDebug(s"MCP tools/list -> ${all.size} tool(s): ${all.map(_.name.value).mkString(", ")}") *>
+      ZIO.logAnnotate(
+        LogAnnotation("toolCount", all.size.toString),
+        LogAnnotation("tools", all.map(_.name.value).mkString(",")),
+      )(ZIO.logDebug("MCP tools/list")) *>
         resultResponse(id, version, ToolsListResult(tools = all), cacheable = true)
 
   private def parseToolCallParams(
@@ -922,6 +956,10 @@ final class McpServer[-R] private (
     val paramsJson = params.getOrElse(Json.Obj()).toJson
     ZIO.fromEither(paramsJson.fromJson[ToolCallParams])
       .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid tool call params: $e"))
+      .tap(callParams => ZIO.logAnnotate(
+        LogAnnotation("tool", callParams.name.value),
+        LogAnnotation("arguments", callParams.arguments.fold("{}")(_.toJson)),
+      )(ZIO.logInfo("MCP tools/call")))
 
   /** Dispatch a `tools/call` whose name matched no static tool to the dynamic source.
     * With no source configured this is an `InvalidParams` (unknown tool); with a source
@@ -1345,7 +1383,10 @@ object McpServer:
     def respondPRM(request: Request): UIO[Response] =
       val resourceUri = ResourceUriResolver.resolve(auth.resourceUri, resourcePathOf(request), request)
       val prm = ProtectedResourceMetadata.fromAuth(auth, resourceUri)
-      ZIO.logInfo(s"PRM document requested: ${request.url.encode} (resource=${resourceUri.value})")
+      ZIO.logAnnotate(
+        LogAnnotation("url", request.url.encode),
+        LogAnnotation("resource", resourceUri.value),
+      )(ZIO.logInfo("PRM document requested"))
         .as(Response.json(prm.toJson).addHeader(Header.CacheControl.MaxAge(3600)))
     // Backwards-compat AS-metadata discovery (see asMetadataRedirectRoutes) is
     // bundled here so multi-mount hosts get it alongside the shared PRM routes.
@@ -1384,21 +1425,26 @@ object McpServer:
       val origin    = ResourceUriResolver.resolve(None, "", request).value.stripSuffix("/")
       // Capture the discovery request's identifying headers — there's no auth or
       // body on this GET, so the client is only visible via these.
-      val logProbe  = ZIO.logInfo(
-        s"AS-metadata origin probe: ${request.url.encode} " +
-          s"user-agent=${userAgent.getOrElse("-")} " +
-          s"mcp-protocol-version=${proto.getOrElse("-")}")
+      val logProbe  = ZIO.logAnnotate(
+        LogAnnotation("url", request.url.encode),
+        LogAnnotation("userAgent", userAgent.getOrElse("-")),
+        LogAnnotation("mcpProtocolVersion", proto.getOrElse("-")),
+      )(ZIO.logInfo("AS-metadata origin probe"))
       if issuer == origin then
         logProbe.as(Response.status(Status.NotFound))
       else if isPrmCapableClient(userAgent) then
-        (logProbe *> ZIO.logInfo(
-          s"AS-metadata 404 (PRM-capable client; use protected-resource metadata): user-agent=${userAgent.getOrElse("-")}"))
+        (logProbe *> ZIO.logAnnotate(
+          LogAnnotation("userAgent", userAgent.getOrElse("-")),
+        )(ZIO.logInfo("AS-metadata 404 (PRM-capable client; use protected-resource metadata)")))
           .as(Response.status(Status.NotFound))
       else
         val target = s"$issuer/.well-known/oauth-authorization-server"
         URL.decode(target) match
           case Right(u) =>
-            (logProbe *> ZIO.logInfo(s"AS-metadata compat redirect (legacy origin discovery): ${request.url.encode} -> $target"))
+            (logProbe *> ZIO.logAnnotate(
+              LogAnnotation("url", request.url.encode),
+              LogAnnotation("target", target),
+            )(ZIO.logInfo("AS-metadata compat redirect (legacy origin discovery)")))
               .as(Response(status = Status.Found).addHeader(Header.Location(u)))
           case Left(_) => logProbe.as(Response.status(Status.NotFound))
     Routes(
