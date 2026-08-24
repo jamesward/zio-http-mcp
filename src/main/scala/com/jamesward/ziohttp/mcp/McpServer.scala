@@ -476,6 +476,16 @@ final class McpServer[-R] private (
       case Some(McpDispatchMethod.TasksGet)    => handleTasksGet(id, params, tasks)
       case Some(McpDispatchMethod.TasksCancel) => handleTasksCancel(id, params, tasks)
       case Some(McpDispatchMethod.TasksUpdate) => handleTasksUpdate(id, params, tasks)
+      case Some(McpDispatchMethod.ServerDiscover) =>
+        // The modern (2026-07-28+) era has no `initialize`; `server/discover`
+        // is the handshake. Log it as the modern analog of the legacy
+        // "MCP initialize" line. `server/discover` carries no `clientInfo`, so
+        // the client is only identifiable via the (often absent) User-Agent.
+        ZIO.logAnnotate(
+          LogAnnotation("negotiatedProtocol", version.wire),
+          LogAnnotation("userAgent", request.rawHeader("user-agent").getOrElse("-")),
+        )(ZIO.logInfo("MCP server/discover (modern handshake)")) *>
+          handleServerDiscover(id, principal, pathParams)
       case Some(dm) =>
         dispatchMethod(id, dm, version, params, principal, pathParams,
           modernHandleToolsCall(request, version, tasks, _, _, principal, pathParams))
