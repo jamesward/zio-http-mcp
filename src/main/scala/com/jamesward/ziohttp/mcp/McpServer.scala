@@ -223,7 +223,7 @@ final class McpServer[-R] private (
     // offer one (405 is spec-permitted); log the attempt so a client that REQUIRES
     // it (older HTTP+SSE transport) is visible for diagnosis.
     def getSseDeclined(req: Request): UIO[Response] =
-      ZIO.logInfo(
+      ZIO.logDebug(
         s"MCP stateless GET declined 405 (no server→client SSE stream): path=${req.url.path.encode} " +
           s"accept=${req.rawHeader("accept").getOrElse("-")} " +
           s"mcp-protocol-version=${req.rawHeader("mcp-protocol-version").getOrElse("-")} " +
@@ -411,7 +411,7 @@ final class McpServer[-R] private (
                     case None =>
                       ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
         case JsonRpcMessage.Notification(method, params) =>
-          ZIO.log(s"MCP Notification: $method $params").as(Response.status(Status.Accepted))
+          ZIO.logDebug(s"MCP Notification: $method $params").as(Response.status(Status.Accepted))
     yield response
 
   /**
@@ -798,21 +798,23 @@ final class McpServer[-R] private (
     method: String,
     params: Option[Json.Obj],
   ): ZIO[Any, Response, Response] =
-    McpNotificationMethod.parse(method) match
-      case Some(McpNotificationMethod.Initialized) =>
-        val sessionId = request.rawHeader("mcp-session-id").map(SessionId(_))
-        sessionId match
-          case Some(sid) =>
-            sessions.update(_.updatedWith(sid):
-              case Some(_) => Some(SessionState.Active)
-              case None    => None
-            ).as(Response.status(Status.Accepted))
-          case None =>
-            ZIO.succeed(Response.status(Status.Accepted))
-      case Some(McpNotificationMethod.Cancelled) =>
-        ZIO.succeed(Response.status(Status.Accepted))
-      case None =>
-        ZIO.succeed(Response.status(Status.Accepted))
+    val handled =
+      McpNotificationMethod.parse(method) match
+        case Some(McpNotificationMethod.Initialized) =>
+          val sessionId = request.rawHeader("mcp-session-id").map(SessionId(_))
+          sessionId match
+            case Some(sid) =>
+              sessions.update(_.updatedWith(sid):
+                case Some(_) => Some(SessionState.Active)
+                case None    => None
+              ).as(Response.status(Status.Accepted))
+            case None =>
+              ZIO.succeed(Response.status(Status.Accepted))
+        case Some(McpNotificationMethod.Cancelled) =>
+          ZIO.succeed(Response.status(Status.Accepted))
+        case None =>
+          ZIO.succeed(Response.status(Status.Accepted))
+    ZIO.logDebug(s"MCP Notification: $method $params") *> handled
 
   private def parseInitializeParams(
     id: RequestId,
@@ -828,7 +830,10 @@ final class McpServer[-R] private (
       // revision (2025-03-26 … 2025-11-25); otherwise fall back to our newest
       // legacy revision so older/unknown clients still get a usable session.
       negotiated = ProtocolVersion.negotiateLegacy(init.protocolVersion)
-      _         <- ZIO.logInfo(s"MCP initialize (legacy handshake): requestedProtocol=${init.protocolVersion} negotiatedProtocol=${negotiated.wire}")
+      // `clientInfo` (a required `initialize` param) is the MCP client's
+      // self-reported identity — e.g. `kiro`/`0.x`. Prefer it over the HTTP
+      // `User-Agent`, which MCP clients frequently omit.
+      _         <- ZIO.logInfo(s"MCP initialize (legacy handshake): requestedProtocol=${init.protocolVersion} negotiatedProtocol=${negotiated.wire} client=${init.clientInfo.name}/${init.clientInfo.version}${init.clientInfo.title.fold("")(t => s" ($t)")}")
       instr     <- resolveInstructions(principal, pathParams)
       info      <- resolveServerInfo(principal, pathParams)
     yield
@@ -907,7 +912,7 @@ final class McpServer[-R] private (
     val dynamic = toolSrc.fold[ZIO[R, Nothing, Chunk[ToolDefinition]]](ZIO.succeed(Chunk.empty))(_.listTools(ctx))
     dynamic.flatMap: extra =>
       val all = visible.map(_.definition) ++ extra
-      ZIO.logInfo(s"MCP tools/list -> ${all.size} tool(s): ${all.map(_.name.value).mkString(", ")}") *>
+      ZIO.logDebug(s"MCP tools/list -> ${all.size} tool(s): ${all.map(_.name.value).mkString(", ")}") *>
         resultResponse(id, version, ToolsListResult(tools = all), cacheable = true)
 
   private def parseToolCallParams(
