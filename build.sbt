@@ -34,7 +34,7 @@ libraryDependencies ++= Seq(
   "org.testcontainers" % "testcontainers" % "2.0.5" % Test,
 
   "io.modelcontextprotocol.sdk" % "mcp-core"           % "2.0.0" % Test,
-  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "2.0.0" % Test,
+  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "2.0.1" % Test,
 
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
