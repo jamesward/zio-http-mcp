@@ -40,12 +40,32 @@ object ModernEnvelope:
    * overwritten, so a handler that already set any of these wins.
    */
   def complete(result: Json.Obj, serverInfo: Implementation, cacheable: Boolean): Json.Obj =
-    val withType  = putIfAbsent(result, "resultType", Json.Str(ResultTypeComplete))
-    val withMeta  = withServerInfo(withType, serverInfo)
-    if cacheable then
-      val withTtl   = putIfAbsent(withMeta, "ttlMs", Json.Num(DefaultTtlMs))
-      putIfAbsent(withTtl, "cacheScope", Json.Str(DefaultCacheScope))
-    else withMeta
+    complete(result, serverInfo, if cacheable then McpCachePolicy.Default else McpCachePolicy.NotCacheable)
+
+  def complete(result: Json.Obj, serverInfo: Implementation, cachePolicy: McpCachePolicy): Json.Obj =
+    val withType = putIfAbsent(result, "resultType", Json.Str(ResultTypeComplete))
+    val withMeta = withServerInfo(withType, serverInfo)
+    cachePolicy match
+      case McpCachePolicy.NotCacheable => withMeta
+      case McpCachePolicy.Cacheable(ttl, scope) =>
+        val withTtl = putIfAbsent(withMeta, "ttlMs", Json.Num(ttl.milliseconds))
+        putIfAbsent(withTtl, "cacheScope", Json.Str(scope.wire))
+
+  /** Build an extension result envelope whose protocol-owned fields cannot be
+    * supplied or overridden by the extension handler. */
+  private[mcp] def completeServerOwned(
+    result: Json.Obj,
+    serverInfo: Implementation,
+    cachePolicy: McpCachePolicy,
+  ): Json.Obj =
+    val withoutEnvelope = Json.Obj(result.fields.filterNot: (key, _) =>
+      key == "resultType" || key == "ttlMs" || key == "cacheScope"
+    )
+    val withoutServerInfo = withoutEnvelope.get("_meta").flatMap(_.asObject) match
+      case Some(meta) =>
+        put(withoutEnvelope, "_meta", Json.Obj(meta.fields.filterNot(_._1 == McpMeta.ServerInfo)))
+      case None => withoutEnvelope
+    complete(withoutServerInfo, serverInfo, cachePolicy)
 
   /** Merge `io.modelcontextprotocol/serverInfo` into the result's `_meta`,
     * preserving any `_meta` the handler already produced. */

@@ -7,6 +7,8 @@ import zio.json.*
 import zio.json.ast.Json
 import zio.stream.*
 
+import scala.annotation.nowarn
+
 // --- Session State ---
 
 enum SessionState:
@@ -32,18 +34,19 @@ final class McpServer[-R] private (
   val instructions: Option[String] = None,
   instructionsSrc: Option[InstructionsSource[R]] = None,
   serverInfoSrc: Option[ServerInfoSource[R]] = None,
+  val extensions: McpExtensions[R] = McpExtensions.empty,
 ):
   def tool[R1](t: McpToolHandlerR[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
+    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
 
   def resource(r: McpResourceHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
+    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
 
   def resourceTemplate(rt: McpResourceTemplateHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
 
   def prompt(p: McpPromptHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
 
   /**
    * Register a dynamic [[McpToolSource]] consulted at request time. Its tools are merged
@@ -52,7 +55,7 @@ final class McpServer[-R] private (
    * environment, like [[tool]].
    */
   def toolSource[R1](src: McpToolSource[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, Some(src), resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, Some(src), resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
 
   /**
    * Register a dynamic [[McpResourceSource]] consulted at request time. Its resources and
@@ -60,7 +63,7 @@ final class McpServer[-R] private (
    * it when no static resource/template matched, and `completion/complete` delegates to it.
    */
   def resourceSource[R1](src: McpResourceSource[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, Some(src), pathParamName, instructions, instructionsSrc, serverInfoSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, Some(src), pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
 
   /**
    * Mount the MCP HTTP routes at the given path. Defaults to `/mcp` (matching the
@@ -83,7 +86,7 @@ final class McpServer[-R] private (
    * Mutually exclusive with [[mountedAtParam]]; the last one called wins.
    */
   def mountedAt(path: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, path, toolSrc, resourceSrc, None, instructions, instructionsSrc, serverInfoSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, path, toolSrc, resourceSrc, None, instructions, instructionsSrc, serverInfoSrc, extensions)
 
   /**
    * Mount at a single path-parameter segment, so the server serves `/<value>` for any
@@ -101,7 +104,7 @@ final class McpServer[-R] private (
    * Mutually exclusive with [[mountedAt]]; the last one called wins.
    */
   def mountedAtParam(paramName: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, Some(paramName), instructions, instructionsSrc, serverInfoSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, Some(paramName), instructions, instructionsSrc, serverInfoSrc, extensions)
 
   /**
    * Enable opt-in OAuth 2.1 authorization for this server.
@@ -117,7 +120,7 @@ final class McpServer[-R] private (
    * @see [[com.jamesward.ziohttp.mcp.auth.McpAuth]]
    */
   def auth[R1](a: McpAuth[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a), mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc)
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a), mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
 
   /**
    * Set a static `instructions` string returned in the `initialize` result.
@@ -132,7 +135,7 @@ final class McpServer[-R] private (
    * than a combinable collection like tools/resources.
    */
   def instructions(text: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, Some(text), None, serverInfoSrc)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, Some(text), None, serverInfoSrc, extensions)
 
   /**
    * Set a dynamic [[InstructionsSource]] for the `initialize` result's `instructions`
@@ -145,7 +148,7 @@ final class McpServer[-R] private (
    * widens the server's `R`.
    */
   def instructions[R1](source: InstructionsSource[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, None, Some(source), serverInfoSrc)
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, None, Some(source), serverInfoSrc, extensions)
 
   /**
    * Set a dynamic [[ServerInfoSource]] "metadata provider" for the handshake
@@ -162,7 +165,15 @@ final class McpServer[-R] private (
    * registering one widens the server's `R`.
    */
   def serverInfo[R1](source: ServerInfoSource[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, Some(source))
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, Some(source), extensions)
+
+  /** Replace this server's registry with an already-validated immutable registry. */
+  def withExtensions[R1](registered: McpExtensions[R1]): McpServer[R & R1] =
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, registered)
+
+  /** Validate and immutably register one extension before routes are constructed. */
+  def extension[R1](registered: McpServerExtension[R1]): Either[McpExtensionsError, McpServer[R & R1]] =
+    extensions.add(registered).map(withExtensions(_))
 
   private val toolsByName: Map[ToolName, McpToolHandlerR[R]] =
     tools.map(t => t.name -> t).toMap
@@ -170,19 +181,22 @@ final class McpServer[-R] private (
   private val promptsByName: Map[PromptName, McpPromptHandler] =
     prompts.map(p => p.definition.name -> p).toMap
 
-  private val serverCapabilities: ServerCapabilities =
-    // Advertise the 2026-07-28 Tasks extension alongside any dynamic-source
-    // extensions. The stateful `routes` fulfil it (they carry the task store).
-    val extensionMap: Map[String, Json] =
-      Map(TaskRecord.ExtensionId -> (Json.Obj(): Json)) ++ resourceSrc.map(_.capabilities).getOrElse(Map.empty)
-    ServerCapabilities(
-      tools = if tools.nonEmpty || toolSrc.isDefined then Some(Json.Obj()) else None,
-      resources = if resources.nonEmpty || resourceTemplates.nonEmpty || resourceSrc.isDefined then Some(Json.Obj(Chunk("subscribe" -> Json.Bool(true)))) else None,
-      prompts = if prompts.nonEmpty then Some(Json.Obj()) else None,
-      logging = Some(Json.Obj()),
-      completions = Some(Json.Obj()),
-      extensions = if extensionMap.nonEmpty then Some(Json.Obj(Chunk.fromIterable(extensionMap.toSeq.map((k, v) => k -> (v: Json))))) else None,
-    )
+  @nowarn("cat=deprecation")
+  private def serverCapabilities(ctx: McpRequestContext): URIO[R, ServerCapabilities] =
+    extensions.settings(ctx).map: registered =>
+      val sourceExtensions: Map[String, Json] =
+        resourceSrc.map(_.capabilities).getOrElse(Map.empty).map((id, value) => id -> (value: Json))
+      val extensionMap: Map[String, Json] =
+        Map(TaskRecord.ExtensionId -> (Json.Obj(): Json)) ++ sourceExtensions ++
+          registered.map((id, value) => id.value -> value)
+      ServerCapabilities(
+        tools = if tools.nonEmpty || toolSrc.isDefined then Some(Json.Obj()) else None,
+        resources = if resources.nonEmpty || resourceTemplates.nonEmpty || resourceSrc.isDefined then Some(Json.Obj(Chunk("subscribe" -> Json.Bool(true)))) else None,
+        prompts = if prompts.nonEmpty then Some(Json.Obj()) else None,
+        logging = Some(Json.Obj()),
+        completions = Some(Json.Obj()),
+        extensions = if extensionMap.nonEmpty then Some(Json.Obj(Chunk.fromIterable(extensionMap.toSeq))) else None,
+      )
 
   def routes: Routes[R & McpServer.State, Response] =
     val baseRoutes: Routes[R & McpServer.State, Response] = pathParamName match
@@ -397,7 +411,7 @@ final class McpServer[-R] private (
       body      <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
       bodyJson  <- ZIO.fromEither(body.fromJson[Json.Obj])
                      .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
-      response  <- routeMessage(request, state.sessions, state.pendingRequests, state.tasks, bodyJson, principal, pathParams)
+      response  <- routeMessage(request, state, bodyJson, principal, pathParams)
     yield response
 
   private def statelessPostHandler(pathParams: Map[String, String], request: Request): ZIO[R, Response, Response] =
@@ -420,14 +434,15 @@ final class McpServer[-R] private (
             case Right(ProtocolEra.Legacy) =>
               method match
                 case "initialize" =>
-                  parseInitializeParams(id, params, principal, pathParams).flatMap(r => jsonRpcResponse(id, r))
+                  parseInitializeParams(id, params, principal, pathParams).flatMap(parsed => jsonRpcResponse(id, parsed.result))
                 case _ =>
                   McpDispatchMethod.parse(method) match
                     case Some(dm) =>
                       dispatchMethod(id, dm, ProtocolVersion.default, params, principal, pathParams,
                         statelessHandleToolsCall(request, ProtocolVersion.default, _, _, principal, pathParams))
                     case None =>
-                      ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
+                      val ctx = McpRequestContext(ProtocolVersion.default, callerPrincipal = principal, callerPathParams = pathParams)
+                      dispatchExtension(request, id, method, ProtocolVersion.default, params, ctx)
         case JsonRpcMessage.Notification(method, params) =>
           ZIO.logAnnotate(
             LogAnnotation("method", method),
@@ -462,6 +477,26 @@ final class McpServer[-R] private (
    * `initialize`. Unknown methods yield `404 Not Found` with `-32601`; tool
    * calls are answered with a single augmented JSON result.
    */
+  private def modernRequestContext(
+    version: ProtocolVersion,
+    params: Option[Json.Obj],
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): McpRequestContext =
+    val meta = McpMeta.of(params)
+    val info = McpMeta.raw(meta, McpMeta.ClientInfo).flatMap(_.as[Implementation].toOption)
+    val parsedCapabilities = McpMeta.raw(meta, McpMeta.ClientCapabilities).flatMap(_.asObject)
+      .map(McpExtensionCapabilities.parse)
+      .getOrElse(McpExtensionCapabilitiesParseResult(Map.empty, Chunk.empty))
+    McpRequestContext(
+      version,
+      info,
+      parsedCapabilities.valid,
+      principal,
+      pathParams,
+      parsedCapabilities.invalid,
+    )
+
   private def dispatchModern(
     request: Request,
     id: RequestId,
@@ -472,26 +507,95 @@ final class McpServer[-R] private (
     pathParams: Map[String, String],
     tasks: Option[Ref[Map[TaskId, TaskRecord]]],
   ): ZIO[R, Response, Response] =
+    val ctx = modernRequestContext(version, params, principal, pathParams)
     McpDispatchMethod.parse(method) match
       case Some(McpDispatchMethod.TasksGet)    => handleTasksGet(id, params, tasks)
       case Some(McpDispatchMethod.TasksCancel) => handleTasksCancel(id, params, tasks)
       case Some(McpDispatchMethod.TasksUpdate) => handleTasksUpdate(id, params, tasks)
       case Some(McpDispatchMethod.ServerDiscover) =>
-        // The modern (2026-07-28+) era has no `initialize`; `server/discover`
-        // is the handshake. Log it as the modern analog of the legacy
-        // "MCP initialize" line. `server/discover` carries no `clientInfo`, so
-        // the client is only identifiable via the (often absent) User-Agent.
         ZIO.logAnnotate(
           LogAnnotation("negotiatedProtocol", version.wire),
           LogAnnotation("userAgent", request.rawHeader("user-agent").getOrElse("-")),
         )(ZIO.logInfo("MCP server/discover (modern handshake)")) *>
-          handleServerDiscover(id, principal, pathParams)
+          handleServerDiscover(id, ctx)
       case Some(dm) =>
         dispatchMethod(id, dm, version, params, principal, pathParams,
           modernHandleToolsCall(request, version, tasks, _, _, principal, pathParams))
       case None =>
-        ZIO.fail(methodNotFoundResponse(id, version, method))
+        dispatchExtension(request, id, method, version, params, ctx)
 
+
+  private def dispatchExtension(
+    request: Request,
+    id: RequestId,
+    rawMethod: String,
+    version: ProtocolVersion,
+    params: Option[Json.Obj],
+    ctx: McpRequestContext,
+  ): ZIO[R, Response, Response] =
+    McpMethodName.parse(rawMethod).toOption.flatMap(extensions.operation) match
+      case None =>
+        ZIO.fail(methodNotFoundResponse(id, version, rawMethod))
+      case Some(bound) =>
+        val operation = bound.operation
+        if !operation.protocolSupport.supports(version) then
+          ZIO.fail(methodNotFoundResponse(id, version, rawMethod))
+        else
+          val requireSupport = operation.clientSupport match
+            case ClientSupportPolicy.Optional => ZIO.unit
+            case ClientSupportPolicy.Required => ctx.requireClientExtension(operation.extensionId).unit
+          val rawParams = params.getOrElse(Json.Obj())
+          val validateRouting =
+            if version.isStateless then
+              ZIO.fromEither(bound.routingName(rawParams)).flatMap:
+                case Some(expected) =>
+                  request.rawHeader(Negotiation.NameHeader) match
+                    case Some(actual) if Negotiation.decodeHeaderValue(actual) != expected.value =>
+                      ZIO.fail(McpMethodError.RoutingNameMismatch(expected, Negotiation.decodeHeaderValue(actual)))
+                    case _ => ZIO.unit
+                case None => ZIO.unit
+            else ZIO.unit
+          (requireSupport *> validateRouting *> bound.invoke(rawParams, ctx))
+            .foldZIO(
+              error => ZIO.fail(extensionErrorResponse(id, version, error)),
+              result =>
+                if version.isStateless then
+                  resolveServerInfo(ctx.principal, ctx.pathParams).map: info =>
+                    rawResultResponse(
+                      id,
+                      ModernEnvelope.completeServerOwned(result, info, operation.cachePolicy),
+                    )
+                else ZIO.succeed(rawResultResponse(id, result)),
+            )
+
+  private def extensionErrorResponse(
+    id: RequestId,
+    version: ProtocolVersion,
+    error: McpMethodError,
+  ): Response =
+    error match
+      case McpMethodError.InvalidParams(message) =>
+        jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, message)
+      case McpMethodError.InvalidResult(message) =>
+        jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, message)
+      case McpMethodError.UnsupportedProtocol(_) =>
+        methodNotFoundResponse(id, version, "Unsupported extension operation")
+      case McpMethodError.MissingRequiredClientExtension(extensionId) =>
+        jsonRpcErrorResponseWith(
+          Some(id),
+          ErrorCode.MissingRequiredClientCapability,
+          s"Client must declare extension '${extensionId.value}'",
+          Status.Ok,
+        )
+      case McpMethodError.RoutingNameMismatch(expected, actual) =>
+        jsonRpcErrorResponseWith(
+          Some(id),
+          ErrorCode.HeaderMismatch,
+          s"Mcp-Name header '$actual' does not match extension routing name '${expected.value}'",
+          Status.BadRequest,
+        )
+      case McpMethodError.Domain(code, message, data) =>
+        Response.json(JsonRpcError(Some(id), ErrorDetail(code, message, data)).toJson)
   /**
    * Modern (2026-07-28) `tools/call`. The tool runs against a
    * [[McpToolContext.modern]] context: any `sample` / `elicit` the handler
@@ -694,7 +798,7 @@ final class McpServer[-R] private (
       case McpDispatchMethod.Ping =>
         jsonRpcResponse(id, Json.Obj())
       case McpDispatchMethod.ServerDiscover =>
-        handleServerDiscover(id, principal, pathParams)
+        handleServerDiscover(id, McpRequestContext(version, callerPrincipal = principal, callerPathParams = pathParams))
       case McpDispatchMethod.ToolsList =>
         handleToolsList(id, version, params, principal, pathParams)
       case McpDispatchMethod.ToolsCall =>
@@ -705,8 +809,6 @@ final class McpServer[-R] private (
         handleResourceTemplatesList(id, version, principal, pathParams)
       case McpDispatchMethod.ResourcesRead =>
         handleResourceRead(id, version, params, principal, pathParams)
-      case McpDispatchMethod.ResourcesDirectoryRead =>
-        handleResourceDirectoryRead(id, version, params, principal, pathParams)
       case McpDispatchMethod.ResourcesSubscribe =>
         jsonRpcResponse(id, Json.Obj())
       case McpDispatchMethod.ResourcesUnsubscribe =>
@@ -734,16 +836,16 @@ final class McpServer[-R] private (
    */
   private def handleServerDiscover(
     id: RequestId,
-    principal: Option[Principal],
-    pathParams: Map[String, String],
+    ctx: McpRequestContext,
   ): ZIO[R, Response, Response] =
     for
-      instr <- resolveInstructions(principal, pathParams)
-      info  <- resolveServerInfo(principal, pathParams)
+      instr <- resolveInstructions(ctx.principal, ctx.pathParams)
+      info  <- resolveServerInfo(ctx.principal, ctx.pathParams)
+      caps  <- serverCapabilities(ctx)
     yield
       val result = DiscoverResult(
         supportedVersions = ProtocolVersion.supportedWire,
-        capabilities = serverCapabilities,
+        capabilities = caps,
         serverInfo = info,
         instructions = instr,
       )
@@ -751,9 +853,7 @@ final class McpServer[-R] private (
 
   private def routeMessage(
     request: Request,
-    sessions: Ref[Map[SessionId, SessionState]],
-    pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
-    taskStore: Ref[Map[TaskId, TaskRecord]],
+    state: McpServer.State,
     bodyJson: Json.Obj,
     principal: Option[Principal],
     pathParams: Map[String, String],
@@ -764,16 +864,16 @@ final class McpServer[-R] private (
     val hasMethod = bodyJson.get("method").isDefined
 
     if (hasResult || hasError) && !hasMethod then
-      handleClientResponse(pendingReqs, bodyJson)
+      handleClientResponse(state.pendingRequests, bodyJson)
     else
       val message = bodyJson.toJson.fromJson[JsonRpcMessage]
       ZIO.fromEither(message)
         .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
         .flatMap:
           case JsonRpcMessage.Request(id, method, params) =>
-            handleRequest(request, sessions, pendingReqs, taskStore, id, method, params, principal, pathParams)
+            handleRequest(request, state, id, method, params, principal, pathParams)
           case JsonRpcMessage.Notification(method, params) =>
-            handleNotification(request, sessions, method, params)
+            handleNotification(request, state.sessions, method, params)
 
   private def handleClientResponse(
     pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
@@ -794,9 +894,7 @@ final class McpServer[-R] private (
 
   private def handleRequest(
     request: Request,
-    sessions: Ref[Map[SessionId, SessionState]],
-    pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
-    taskStore: Ref[Map[TaskId, TaskRecord]],
+    state: McpServer.State,
     id: RequestId,
     method: String,
     params: Option[Json.Obj],
@@ -809,19 +907,27 @@ final class McpServer[-R] private (
       case Left(resp) =>
         ZIO.succeed(resp)
       case Right(ProtocolEra.Modern(version)) =>
-        dispatchModern(request, id, method, version, params, principal, pathParams, tasks = Some(taskStore))
+        dispatchModern(request, id, method, version, params, principal, pathParams, tasks = Some(state.tasks))
       case Right(ProtocolEra.Legacy) =>
         method match
           case "initialize" =>
-            handleInitialize(sessions, id, params, principal, pathParams)
+            handleInitialize(state, id, params, principal, pathParams)
           case _ =>
-            McpDispatchMethod.parse(method) match
-              case Some(dm) =>
-                withSession(request, sessions):
-                  dispatchMethod(id, dm, ProtocolVersion.default, params, principal, pathParams,
-                    handleToolsCall(request, _, _, pendingReqs, principal, pathParams))
-              case None =>
-                ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.MethodNotFound, s"Method not found: $method"))
+            withSession(request, state): client =>
+              val ctx = McpRequestContext(
+                client.protocolVersion,
+                client.clientInfo,
+                client.extensionCapabilities,
+                principal,
+                pathParams,
+                client.extensionCapabilityErrors,
+              )
+              McpDispatchMethod.parse(method) match
+                case Some(dm) =>
+                  dispatchMethod(id, dm, client.protocolVersion, params, principal, pathParams,
+                    handleToolsCall(request, _, _, state.pendingRequests, principal, pathParams))
+                case None =>
+                  dispatchExtension(request, id, method, client.protocolVersion, params, ctx)
 
   private def handleNotification(
     request: Request,
@@ -836,8 +942,9 @@ final class McpServer[-R] private (
           sessionId match
             case Some(sid) =>
               sessions.update(_.updatedWith(sid):
-                case Some(_) => Some(SessionState.Active)
-                case None    => None
+                case Some(SessionState.Initializing) => Some(SessionState.Active)
+                case active @ Some(SessionState.Active) => active
+                case None => None
               ).as(Response.status(Status.Accepted))
             case None =>
               ZIO.succeed(Response.status(Status.Accepted))
@@ -850,12 +957,14 @@ final class McpServer[-R] private (
       LogAnnotation("params", params.fold("-")(_.toJson)),
     )(ZIO.logDebug("MCP Notification")) *> handled
 
+  private final case class ParsedInitialize(result: InitializeResult, client: McpSessionClient)
+
   private def parseInitializeParams(
     id: RequestId,
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
-  ): ZIO[R, Response, InitializeResult] =
+  ): ZIO[R, Response, ParsedInitialize] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
     for
       init      <- ZIO.fromEither(paramsJson.fromJson[InitializeParams])
@@ -864,6 +973,21 @@ final class McpServer[-R] private (
       // revision (2025-03-26 … 2025-11-25); otherwise fall back to our newest
       // legacy revision so older/unknown clients still get a usable session.
       negotiated = ProtocolVersion.negotiateLegacy(init.protocolVersion)
+      parsedExtensionCapabilities = McpExtensionCapabilities.parse(init.capabilities)
+      sessionClient = McpSessionClient(
+                        negotiated,
+                        Some(init.clientInfo),
+                        parsedExtensionCapabilities.valid,
+                        parsedExtensionCapabilities.invalid,
+                      )
+      ctx = McpRequestContext(
+              negotiated,
+              Some(init.clientInfo),
+              parsedExtensionCapabilities.valid,
+              principal,
+              pathParams,
+              parsedExtensionCapabilities.invalid,
+            )
       // `clientInfo` (a required `initialize` param) is the MCP client's
       // self-reported identity — e.g. `kiro`/`0.x`. Prefer it over the HTTP
       // `User-Agent`, which MCP clients frequently omit. Emitted as structured
@@ -877,13 +1001,14 @@ final class McpServer[-R] private (
                    )(ZIO.logInfo("MCP initialize (legacy handshake)"))
       instr     <- resolveInstructions(principal, pathParams)
       info      <- resolveServerInfo(principal, pathParams)
+      caps      <- serverCapabilities(ctx)
     yield
-      InitializeResult(
+      ParsedInitialize(InitializeResult(
         protocolVersion = negotiated.wire,
-        capabilities = serverCapabilities,
+        capabilities = caps,
         serverInfo = info,
         instructions = instr,
-      )
+      ), sessionClient)
 
   /** Resolve the handshake `serverInfo`: the dynamic [[ServerInfoSource]] provider
     * (with the request's principal/pathParams — so a parameterised mount can brand
@@ -910,16 +1035,17 @@ final class McpServer[-R] private (
         ZIO.succeed(instructions)
 
   private def handleInitialize(
-    sessions: Ref[Map[SessionId, SessionState]],
+    state: McpServer.State,
     id: RequestId,
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
   ): ZIO[R, Response, Response] =
-    parseInitializeParams(id, params, principal, pathParams).flatMap: result =>
+    parseInitializeParams(id, params, principal, pathParams).flatMap: parsed =>
       val sessionId = SessionId.generate
-      sessions.update(_.updated(sessionId, SessionState.Initializing)) *>
-        jsonRpcResponse(id, result).map(_.addHeader("mcp-session-id", sessionId.value))
+      state.sessions.update(_.updated(sessionId, SessionState.Initializing)) *>
+        state.retainSessionClient(sessionId, parsed.client) *>
+        jsonRpcResponse(id, parsed.result).map(_.addHeader("mcp-session-id", sessionId.value))
 
   private def handleToolsList(
     id: RequestId,
@@ -1111,6 +1237,7 @@ final class McpServer[-R] private (
     val regex = pattern.replaceAll("\\{[^}]+}", "([^/]+)")
     uri.matches(regex)
 
+  @nowarn("cat=deprecation")
   private def handleResourceDirectoryRead(
     id: RequestId,
     version: ProtocolVersion,
@@ -1194,20 +1321,21 @@ final class McpServer[-R] private (
       body = Body.fromCharSequenceStreamChunked(ackEvent ++ keepalive),
     ))
 
-  private def withSession[R0](request: Request, sessions: Ref[Map[SessionId, SessionState]])(
-    effect: ZIO[R0, Response, Response]
+  private def withSession[R0](request: Request, state: McpServer.State)(
+    effect: McpSessionClient => ZIO[R0, Response, Response]
   ): ZIO[R0, Response, Response] =
     val sessionId = request.rawHeader("mcp-session-id").map(SessionId(_))
     sessionId match
       case None =>
         ZIO.fail(Response.status(Status.BadRequest))
       case Some(sid) =>
-        sessions.get.flatMap: m =>
-          m.get(sid) match
-            case None =>
-              ZIO.fail(Response.status(Status.NotFound))
-            case Some(_) =>
-              effect
+        state.sessions.get.flatMap: states =>
+          states.get(sid) match
+            case None => ZIO.fail(Response.status(Status.NotFound))
+            case Some(SessionState.Initializing | SessionState.Active) =>
+              state.sessionClient(sid).flatMap:
+                case Some(client) => effect(client)
+                case None => effect(McpSessionClient(ProtocolVersion.default, None, Map.empty, Chunk.empty))
 
   private def getHandler(pathParams: Map[String, String], request: Request): ZIO[R & McpServer.State, Response, Response] =
     val _ = pathParams
@@ -1215,7 +1343,7 @@ final class McpServer[-R] private (
       _     <- validateOrigin(request)
       _     <- authenticate(request)
       state <- ZIO.service[McpServer.State]
-      _     <- withSession(request, state.sessions)(ZIO.succeed(Response.ok))
+      _     <- withSession(request, state)(_ => ZIO.succeed(Response.ok))
     yield
       Response(
         status = Status.Ok,
@@ -1235,7 +1363,7 @@ final class McpServer[-R] private (
       _     <- authenticate(request)
       state <- ZIO.service[McpServer.State]
       _     <- request.rawHeader("mcp-session-id").map(SessionId(_)) match
-        case Some(sid) => state.sessions.update(_ - sid)
+        case Some(sid) => state.sessions.update(_ - sid) *> state.removeSessionClient(sid)
         case None      => ZIO.unit
     yield Response.ok
 
@@ -1485,16 +1613,33 @@ object McpServer:
     /** In-memory store for the 2026-07-28 Tasks extension. */
     def tasks: Ref[Map[TaskId, TaskRecord]]
 
+    private[mcp] def sessionClient(sessionId: SessionId): UIO[Option[McpSessionClient]] = ZIO.none
+    private[mcp] def retainSessionClient(sessionId: SessionId, client: McpSessionClient): UIO[Unit] = ZIO.unit
+    private[mcp] def removeSessionClient(sessionId: SessionId): UIO[Unit] = ZIO.unit
+
   object State:
     val default: ULayer[State] = ZLayer.fromZIO:
       for
         s <- Ref.make(Map.empty[SessionId, SessionState])
         p <- Ref.make(Map.empty[RequestId, Promise[Nothing, Json]])
         t <- Ref.make(Map.empty[TaskId, TaskRecord])
+        c <- Ref.make(Map.empty[SessionId, McpSessionClient])
       yield new State:
         val sessions = s
         val pendingRequests = p
         val tasks = t
+
+        private[mcp] override def sessionClient(sessionId: SessionId): UIO[Option[McpSessionClient]] =
+          c.get.map(_.get(sessionId))
+
+        private[mcp] override def retainSessionClient(
+          sessionId: SessionId,
+          client: McpSessionClient,
+        ): UIO[Unit] =
+          c.update(_.updated(sessionId, client))
+
+        private[mcp] override def removeSessionClient(sessionId: SessionId): UIO[Unit] =
+          c.update(_ - sessionId)
 
   private val localhostPatterns = Set("localhost", "127.0.0.1", "[::1]", "::1")
 

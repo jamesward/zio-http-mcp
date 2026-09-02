@@ -136,6 +136,7 @@ trait McpResourceSource[-R]:
    * JSON-RPC `InvalidParams` error. Defaults to unsupported; override + advertise via
    * [[capabilities]] to enable.
    */
+  @deprecated("Register an McpServerExtension operation instead", "0.6.0")
   def readDirectory(uri: String, ctx: McpToolContext): ZIO[R, ToolError, Chunk[ResourceDefinition]] =
     ZIO.fail(ToolError(s"Directory read not supported: $uri"))
 
@@ -146,6 +147,7 @@ trait McpResourceSource[-R]:
    * `Map("io.modelcontextprotocol/skills" -> Json.Obj("directoryRead" -> Json.Bool(true)))`.
    * Defaults to none.
    */
+  @deprecated("Register an McpServerExtension capability instead", "0.6.0")
   def capabilities: Map[String, zio.json.ast.Json.Obj] = Map.empty
 
 object McpResourceSource:

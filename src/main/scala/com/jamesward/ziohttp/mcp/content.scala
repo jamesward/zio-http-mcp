@@ -39,6 +39,7 @@ case class ResourceContents(
   mimeType: Option[String] = None,
   text: Option[String] = None,
   blob: Option[String] = None,
+  @jsonField("_meta") meta: Option[Json.Obj] = None,
 )
 
 object ResourceContents:
@@ -76,7 +77,8 @@ object ToolContent:
     val mime = r.mimeType.fold(Chunk.empty[(String, Json)])(m => Chunk("mimeType" -> Json.Str(m)))
     val text = r.text.fold(Chunk.empty[(String, Json)])(t => Chunk("text" -> Json.Str(t)))
     val blob = r.blob.fold(Chunk.empty[(String, Json)])(b => Chunk("blob" -> Json.Str(b)))
-    Json.Obj(base ++ mime ++ text ++ blob)
+    val meta = r.meta.fold(Chunk.empty[(String, Json)])(m => Chunk("_meta" -> m))
+    Json.Obj(base ++ mime ++ text ++ blob ++ meta)
 
   given JsonEncoder[ToolContent] = JsonEncoder[Json.Obj].contramap:
     case ToolContent.Text(text, ann) =>

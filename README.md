@@ -1,6 +1,8 @@
 zio-http-mcp
 ------------
 
+[![javadocs.dev](https://www.javadocs.dev/com.jamesward/zio-http-mcp_3/badge.svg)](https://www.javadocs.dev/com.jamesward/zio-http-mcp_3/latest)
+
 An MCP (Model Context Protocol) server and client library for Scala 3, ZIO, and ZIO HTTP.
 
 Implements the [MCP 2025-11-25 specification](https://modelcontextprotocol.io) with Streamable HTTP transport, SSE streaming, tools, resources, prompts, sampling, elicitation, and progress notifications. The client supports the Streamable HTTP transport and OAuth 2.1 authorization — both `client_credentials` and the MCP-spec `authorization_code` + PKCE flow with Client ID Metadata Documents (CIMD).
@@ -380,6 +382,76 @@ val config = McpClientConfig(
 
 `client.protocolVersion` reports the negotiated revision.
 
+## Protocol extensions
+
+The generalized extension kernel registers a capability and all of its typed operations atomically. Ordinary request/result types use `Schema`-derived wire codecs; an extension can encapsulate a custom `McpWireCodec` when its semantic JSON shape requires one.
+
+```scala
+case class SearchParams(query: String) derives Schema
+case class SearchResult(matches: Chunk[String]) derives Schema
+
+val registered = for
+  id     <- McpExtensionId.parse("dev.example/search")
+  method <- McpMethodName.parse("search/query")
+  operation = McpOperation[SearchParams, SearchResult](id, method)
+  extension = McpServerExtension(
+    id,
+    Chunk(McpBoundOperation(operation): (params, _) =>
+      ZIO.succeed(SearchResult(Chunk(params.query)))
+    ),
+    Json.Obj("version" -> Json.Num(1)),
+  )
+  registry <- McpExtensions(extension)
+yield McpServer("search", "1.0.0").withExtensions(registry)
+```
+
+### Skills over MCP
+
+`McpSkills(...)` always installs `skills/list` and `skills/get` together. `withDirectory` additionally installs `resources/directory/read` and advertises `directoryRead=true`; actual files continue to use core `resources/read`.
+
+```scala
+val skillsRegistry = McpSkills.withDirectory(skillsSource, directorySource)
+val skillsServer = McpServer("skills", "1.0.0").withExtensions(skillsRegistry)
+
+val useSkills = ZIO.scoped:
+  for
+    client <- McpSkillsClient.connect(McpClientConfig("https://example.com/mcp"))
+    page   <- client.list()
+    listed <- ZIO.fromOption(page.skills.headOption)
+                .orElseFail(McpClientError.Protocol("No listed skills"))
+    entry  <- client.get(listed.uri)
+    body   <- client.readSkill(entry.uri) // core resources/read
+  yield body
+```
+
+`McpSkillUri`, `McpSkillDigest`, and `McpSkillSize` are parsed values. Construct static entries with `McpSkillEntry.static`; it enforces the 512-resource and 16 MiB limits, unique in-skill URIs, and exactly one manifest entry for the skill's `SKILL.md`.
+
+### MCP Apps
+
+Apps support is capability-only on the server. Typed helpers emit only the stable nested `_meta.ui` form, preserve unrelated metadata, and guarantee a meaningful text fallback for clients that do not render Apps.
+
+```scala
+val app = for
+  uri      <- McpUiUri.parse("ui://weather/dashboard")
+  fallback <- McpAppsFallbackText.parse("Weather is sunny")
+yield
+  val tool = McpApps.tool(
+    McpTool("weather").handle(ZIO.succeed(McpApps.result(fallback))),
+    McpAppsToolMeta(uri),
+  )
+  val resource = McpApps.resourceHandler(uri, "weather", McpAppsResourceMeta())(
+    ZIO.succeed("<!doctype html><h1>Weather</h1>")
+  )
+  for
+    registry <- McpExtensions(McpApps.serverExtension)
+  yield McpServer("weather", "1.0.0")
+    .withExtensions(registry)
+    .tool(tool)
+    .resource(resource)
+```
+
+Apps-aware clients advertise `McpApps.clientExtension(McpAppsClientSettings.Html)`. The HTTP server intentionally does not route iframe-host `ui/*` methods; those belong to the host/view `postMessage` transport.
+
 ## Authorization
 
 Authorization is opt-in. A server with no `.auth(...)` call behaves exactly as the examples above — no new headers, no new endpoints, no `R` requirement changes. Add `.auth(...)` to enable OAuth 2.1 bearer-token validation conforming to the [MCP authorization spec](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization) (compatible with `2025-06-18`, `2025-11-25`, and `2026-07-28` — the resource-server requirements are the same across all three).
@@ -390,6 +462,7 @@ The library acts as an **OAuth 2.1 Resource Server**. It does not host an author
 
 ```scala
 import com.jamesward.ziohttp.mcp.*
+
 import com.jamesward.ziohttp.mcp.auth.*
 import zio.*
 import zio.http.*

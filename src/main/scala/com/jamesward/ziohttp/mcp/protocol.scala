@@ -183,6 +183,7 @@ case class CallToolResult(
   content: Chunk[ToolContent] = Chunk.empty,
   structuredContent: Option[Json] = None,
   isError: Option[Boolean] = None,
+  @jsonField("_meta") meta: Option[Json.Obj] = None,
 )
 
 object CallToolResult:

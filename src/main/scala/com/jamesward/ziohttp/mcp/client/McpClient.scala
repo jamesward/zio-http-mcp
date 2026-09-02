@@ -111,6 +111,18 @@ trait McpClient:
   /** Release the server session (best effort). Called automatically on scope close. */
   def close: IO[McpClientError, Unit]
 
+trait McpExtensionClient extends McpClient:
+  def request[Params, Result](
+    operation: McpOperation[Params, Result],
+    params: Params,
+  ): IO[McpClientError, Result]
+
+  def requestRaw(
+    method: McpMethodName,
+    params: Json.Obj,
+    routingName: Option[McpRoutingName] = None,
+  ): IO[McpClientError, Json]
+
 /**
  * Connection configuration.
  *
@@ -154,11 +166,24 @@ object McpClient:
 
   /** Connect to an MCP server with full configuration. */
   def connect(config: McpClientConfig): ZIO[Client & Scope, McpClientError, McpClient] =
+    connectInternal(config, McpClientExtensions.empty)
+
+  /** Connect while advertising immutable vendor-extension declarations. */
+  def connect(
+    config: McpClientConfig,
+    extensions: McpClientExtensions,
+  ): ZIO[Client & Scope, McpClientError, McpExtensionClient] =
+    connectInternal(config, extensions)
+
+  private def connectInternal(
+    config: McpClientConfig,
+    extensions: McpClientExtensions,
+  ): ZIO[Client & Scope, McpClientError, McpExtensionClient] =
     for
       zclient    <- ZIO.service[Client]
       stateRef   <- Ref.make(ClientState.initial)
       idRef      <- Ref.make(0L)
-      transport   = Transport(config, zclient, stateRef, idRef)
+      transport   = Transport(config, extensions, zclient, stateRef, idRef)
       negotiated <- transport.negotiate
       _          <- ZIO.addFinalizer(transport.close.ignore)
     yield Live(transport, negotiated)
@@ -257,6 +282,7 @@ object McpClient:
 
   private final class Transport(
     config: McpClientConfig,
+    extensions: McpClientExtensions,
     zclient: Client,
     stateRef: Ref[ClientState],
     idRef: Ref[Long],
@@ -334,7 +360,11 @@ object McpClient:
         if config.preferredVersion.isStateless then McpProtocol.Version else config.preferredVersion.wire
       for
         _      <- stateRef.update(_.copy(modern = false, sessionId = None))
-        params  = asObj(InitializeParams(requestedVersion, Json.Obj(), config.clientInfo))
+        params  = asObj(InitializeParams(
+                    requestedVersion,
+                    McpExtensionCapabilities.toClientCapabilities(extensions.capabilities),
+                    config.clientInfo,
+                  ))
         result <- rpc[InitializeResult]("initialize", params)
         _      <- stateRef.update(_.copy(protocolVersion = Some(result.protocolVersion)))
         _      <- notifyInitialized
@@ -353,7 +383,11 @@ object McpClient:
 
     /** Send a request and return its raw `result` JSON, applying modern
       * metadata/headers when the negotiated era is modern. */
-    def rpcRaw(method: String, params: Json.Obj): IO[McpClientError, Json] =
+    def rpcRaw(
+      method: String,
+      params: Json.Obj,
+      routingName: Option[McpRoutingName] = None,
+    ): IO[McpClientError, Json] =
       for
         st     <- stateRef.get
         n      <- idRef.updateAndGet(_ + 1)
@@ -361,7 +395,7 @@ object McpClient:
         version = st.protocolVersion.flatMap(ProtocolVersion.parse).getOrElse(config.preferredVersion)
         effParams = if st.modern then withModernMeta(params, version) else params
         body    = (JsonRpcMessage.Request(id, method, Some(effParams)): JsonRpcMessage).toJson
-        extra   = if st.modern then modernHeaders(version, method, effParams) else Headers.empty
+        extra   = if st.modern then modernHeaders(version, method, effParams, routingName) else Headers.empty
         result <- withAuthRetry(Outgoing(body, id, extra, sendSession = !st.modern))
       yield result
 
@@ -526,11 +560,17 @@ object McpClient:
 
     /** Modern per-request routing headers: `MCP-Protocol-Version`, `Mcp-Method`,
       * and `Mcp-Name` (mirroring `params.name` / `params.uri`). */
-    private def modernHeaders(version: ProtocolVersion, method: String, params: Json.Obj): Headers =
-      val nameValue = method match
-        case "tools/call" | "prompts/get" => params.get("name").flatMap(_.asString)
-        case "resources/read"             => params.get("uri").flatMap(_.asString)
-        case _                            => None
+    private def modernHeaders(
+      version: ProtocolVersion,
+      method: String,
+      params: Json.Obj,
+      routingName: Option[McpRoutingName],
+    ): Headers =
+      val nameValue = routingName.map(_.value).orElse:
+        method match
+          case "tools/call" | "prompts/get" => params.get("name").flatMap(_.asString)
+          case "resources/read"             => params.get("uri").flatMap(_.asString)
+          case _                            => None
       val base = Headers(Negotiation.ProtocolVersionHeader, version.wire) ++
         Headers(Negotiation.MethodHeader, method)
       nameValue.fold(base)(n => base ++ Headers(Negotiation.NameHeader, encodeHeaderValue(n)))
@@ -540,15 +580,12 @@ object McpClient:
     private def withModernMeta(params: Json.Obj, version: ProtocolVersion): Json.Obj =
       val modernMeta = Chunk[(String, Json)](
         McpMeta.ProtocolVersion -> Json.Str(version.wire),
-        McpMeta.ClientInfo -> Json.Obj(
-          "name" -> Json.Str(config.clientInfo.name),
-          "version" -> Json.Str(config.clientInfo.version),
-        ),
-        McpMeta.ClientCapabilities -> Json.Obj(),
+        McpMeta.ClientInfo -> asObj(config.clientInfo),
+        McpMeta.ClientCapabilities -> McpExtensionCapabilities.toClientCapabilities(extensions.capabilities),
       )
+      val reserved = modernMeta.map(_._1).toSet
       val existing = params.get("_meta").flatMap(_.asObject).map(_.fields).getOrElse(Chunk.empty)
-      val merged = modernMeta.foldLeft(existing): (acc, kv) =>
-        if acc.exists(_._1 == kv._1) then acc else acc :+ kv
+      val merged = existing.filterNot((key, _) => reserved.contains(key)) ++ modernMeta
       Json.Obj(params.fields.filterNot(_._1 == "_meta") :+ ("_meta" -> (Json.Obj(merged): Json)))
 
     /** Encode a header value using the Base64 sentinel form when it is not a
@@ -641,7 +678,7 @@ object McpClient:
 
   // --- high-level client backed by the transport ---
 
-  private final class Live(transport: Transport, negotiated: Negotiated) extends McpClient:
+  private final class Live(transport: Transport, negotiated: Negotiated) extends McpExtensionClient:
     def serverInfo: Implementation = negotiated.serverInfo
     def serverCapabilities: ServerCapabilities = negotiated.capabilities
     def protocolVersion: String = negotiated.version.wire
@@ -696,6 +733,36 @@ object McpClient:
 
     def getPrompt(name: String): IO[McpClientError, PromptGetResult] =
       getPrompt(name, Map.empty)
+
+    def request[Params, Result](
+      operation: McpOperation[Params, Result],
+      params: Params,
+    ): IO[McpClientError, Result] =
+      if !operation.protocolSupport.supports(negotiated.version) then
+        ZIO.fail(McpClientError.Protocol(
+          s"Extension method '${operation.method.value}' is unavailable for ${negotiated.version.wire}"
+        ))
+      else
+        for
+          paramsJson <- ZIO.fromEither(operation.paramsCodec.encode(params))
+                          .mapError(message => McpClientError.Decode(
+                            s"Failed to encode params of '${operation.method.value}': $message"
+                          ))
+          paramsObj  <- ZIO.fromOption(paramsJson.asObject)
+                          .orElseFail(McpClientError.Decode("Extension params must encode to an object"))
+          resultJson <- transport.rpcRaw(operation.method.value, paramsObj, operation.routingName(params))
+          result     <- ZIO.fromEither(operation.resultCodec.decode(resultJson))
+                          .mapError(message => McpClientError.Decode(
+                            s"Failed to decode result of '${operation.method.value}': $message"
+                          ))
+        yield result
+
+    def requestRaw(
+      method: McpMethodName,
+      params: Json.Obj,
+      routingName: Option[McpRoutingName],
+    ): IO[McpClientError, Json] =
+      transport.rpcRaw(method.value, params, routingName)
 
     def close: IO[McpClientError, Unit] =
       transport.close

@@ -88,6 +88,10 @@ object McpOutput:
     def toResult(output: Chunk[ToolContent]): CallToolResult =
       CallToolResult(content = output)
 
+  given McpOutput[CallToolResult] with
+    val outputSchema: Option[Json.Obj] = None
+    def toResult(output: CallToolResult): CallToolResult = output
+
 // --- Tool handler with environment requirement (contravariant, like ZIO/Routes) ---
 
 trait McpToolHandlerR[-R]:

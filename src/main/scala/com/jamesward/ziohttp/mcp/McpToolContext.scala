@@ -58,19 +58,19 @@ object ElicitationResult:
 
 // --- Tool context for emitting notifications during tool execution ---
 
-trait McpToolContext:
+trait McpToolContext extends McpRequestContext:
   def log(level: LogLevel, message: String): UIO[Unit]
   def progress(current: Double, total: Double, message: Option[String] = None): UIO[Unit]
   def sample(prompt: String, maxTokens: Int = 100): ZIO[Any, ToolError, SamplingResult]
   def elicit(message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult]
   /** The authenticated principal for this request, if `.auth(...)` is configured. */
-  def principal: Option[Principal] = None
+  override def principal: Option[Principal] = None
   /**
    * Path parameters captured by a parameterised mount (see `McpServer.mountedAtParam`).
    * Empty for a fixed-path mount. A dynamic source reads e.g. `pathParams("slug")` to
    * learn which mount the request arrived on.
    */
-  def pathParams: Map[String, String] = Map.empty
+  override def pathParams: Map[String, String] = Map.empty
 
 object McpToolContext:
   private val requestIdCounter = new java.util.concurrent.atomic.AtomicInteger(0)
