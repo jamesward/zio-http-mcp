@@ -35,7 +35,7 @@ object InstructionsSource:
 
 /**
  * A dynamic provider of the handshake `serverInfo` ([[Implementation]]) — the
- * server identity (name, title, icons per SEP-973, websiteUrl) a client MAY
+ * server identity (name, title, description, icons per SEP-973, websiteUrl) a client MAY
  * surface (e.g. a connector icon). Consulted by [[McpServer]] on every
  * `initialize` and `server/discover` with the request's [[McpToolContext]] in
  * hand, so the identity can vary per caller (`ctx.principal`) and — the point

@@ -9,26 +9,64 @@ import zio.json.ast.Json
 /**
  * An icon descriptor (SEP-973), advertised in `serverInfo.icons`. `src` is an
  * absolute `https://` URL or a `data:` URI; `mimeType` (e.g. `image/png`),
- * `sizes` (e.g. `"48x48"` or `"any"`), and `theme` (`"light"`/`"dark"`) are
- * optional hints a client MAY use to pick the best rendition.
+ * `sizes` (e.g. `List("48x48", "96x96")` or `List("any")`), and
+ * `theme` (`"light"`/`"dark"`) are optional hints a client MAY use to pick
+ * the best rendition.
  */
 case class Icon(
   src: String,
   mimeType: Option[String] = None,
-  sizes: Option[String] = None,
+  sizes: List[String] = Nil,
   theme: Option[String] = None,
 )
 
 object Icon:
   given CanEqual[Icon, Icon] = CanEqual.derived
-  given JsonCodec[Icon] = DeriveJsonCodec.gen[Icon]
+
+  // Source compatibility for 0.6.0 callers that supplied one scalar size.
+  def apply(src: String, mimeType: Option[String], sizes: Option[String]): Icon =
+    Icon(src, mimeType, sizes.toList, None)
+
+  def apply(src: String, mimeType: Option[String], sizes: Option[String], theme: Option[String]): Icon =
+    Icon(src, mimeType, sizes.toList, theme)
+
+  given JsonEncoder[Icon] = JsonEncoder[Json].contramap: icon =>
+    val base = Chunk[(String, Json)]("src" -> Json.Str(icon.src))
+    val withMime = icon.mimeType.fold(base)(value => base :+ ("mimeType" -> Json.Str(value)))
+    val withSizes =
+      if icon.sizes.isEmpty then withMime
+      else withMime :+ ("sizes" -> Json.Arr(Chunk.fromIterable(icon.sizes.map(Json.Str(_)))))
+    val withTheme = icon.theme.fold(withSizes)(value => withSizes :+ ("theme" -> Json.Str(value)))
+    Json.Obj(withTheme)
+
+  // Accept 0.6.0's scalar `sizes` on input, but always encode the MCP-standard array.
+  given JsonDecoder[Icon] = JsonDecoder[Json.Obj].mapOrFail: obj =>
+    for
+      src <- obj.get("src").flatMap(_.asString).toRight("Icon.src must be a string")
+      mimeType <- optionalString(obj, "mimeType")
+      sizes <- obj.get("sizes") match
+                 case None            => Right(Nil)
+                 case Some(Json.Str(value)) => Right(List(value))
+                 case Some(Json.Arr(values)) =>
+                   values.toList.foldRight[Either[String, List[String]]](Right(Nil)):
+                     case (Json.Str(value), acc) => acc.map(value :: _)
+                     case (_, _)                 => Left("Icon.sizes entries must be strings")
+                 case Some(_) => Left("Icon.sizes must be an array of strings")
+      theme <- optionalString(obj, "theme")
+    yield Icon(src, mimeType, sizes, theme)
+
+  private def optionalString(obj: Json.Obj, field: String): Either[String, Option[String]] =
+    obj.get(field) match
+      case None                  => Right(None)
+      case Some(Json.Str(value)) => Right(Some(value))
+      case Some(_)                => Left(s"Icon.$field must be a string")
 
 /**
  * MCP handshake identity (`serverInfo` / `clientInfo`). `name` + `version` are
- * required; the optional `title` (human display name), `icons` (SEP-973 — a
- * client MAY surface one as the connector icon), and `websiteUrl` are branding
- * a server can advertise. The encoder OMITS an unset `title`/`websiteUrl` and
- * empty `icons`, so a plain identity still serializes to exactly
+ * required; the optional `title` (human display name), `description`, `icons`
+ * (SEP-973 — a client MAY surface one as the connector icon), and `websiteUrl`
+ * are branding a server can advertise. The encoder OMITS unset optional fields
+ * and empty `icons`, so a plain identity still serializes to exactly
  * `{"name":…,"version":…}` (backward-compatible wire format).
  */
 case class Implementation(
@@ -37,6 +75,7 @@ case class Implementation(
   title: Option[String] = None,
   icons: List[Icon] = Nil,
   websiteUrl: Option[String] = None,
+  description: Option[String] = None,
 )
 
 object Implementation:
@@ -48,9 +87,10 @@ object Implementation:
       "version" -> Json.Str(impl.version),
     )
     val withTitle = impl.title.fold(base)(t => base :+ ("title" -> Json.Str(t)))
+    val withDescription = impl.description.fold(withTitle)(d => withTitle :+ ("description" -> Json.Str(d)))
     val withIcons =
-      if impl.icons.isEmpty then withTitle
-      else withTitle :+ ("icons" -> JsonEncoder[List[Icon]].toJsonAST(impl.icons).getOrElse(Json.Arr()))
+      if impl.icons.isEmpty then withDescription
+      else withDescription :+ ("icons" -> JsonEncoder[List[Icon]].toJsonAST(impl.icons).getOrElse(Json.Arr()))
     val withSite  = impl.websiteUrl.fold(withIcons)(u => withIcons :+ ("websiteUrl" -> Json.Str(u)))
     Json.Obj(withSite)
 

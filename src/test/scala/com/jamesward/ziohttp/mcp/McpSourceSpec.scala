@@ -60,10 +60,16 @@ object McpSourceSpec extends ZIOSpecDefault:
   private val serverInfoSource: ServerInfoSource[Any] = ServerInfoSource { ctx =>
     val slug = ctx.pathParams.getOrElse("slug", "none")
     ZIO.succeed(Implementation(
-      name    = "dyn",
-      version = "0.1.0",
-      title   = Some(s"Toolbook $slug"),
-      icons   = List(Icon(src = s"https://example.test/$slug/icon.png", mimeType = Some("image/png"), sizes = Some("48x48"))),
+      name        = "dyn",
+      version     = "0.1.0",
+      title       = Some(s"Toolbook $slug"),
+      icons       = List(Icon(
+        src = s"https://example.test/$slug/icon.png",
+        mimeType = Some("image/png"),
+        sizes = List("48x48", "96x96"),
+      )),
+      websiteUrl  = Some(s"https://example.test/$slug"),
+      description = Some(s"Dynamic server for $slug"),
     ))
   }
 
@@ -129,6 +135,37 @@ object McpSourceSpec extends ZIOSpecDefault:
         ))
       ,
 
+      test("Implementation and Icon codecs emit the MCP schema and accept 0.6.0 scalar sizes"):
+        val minimal = Implementation("plain", "1.0.0")
+        val full = Implementation(
+          name = "full",
+          version = "2.0.0",
+          title = Some("Full Server"),
+          icons = List(Icon(
+            "https://example.test/icon.png",
+            mimeType = Some("image/png"),
+            sizes = List("48x48", "96x96"),
+          )),
+          websiteUrl = Some("https://example.test"),
+          description = Some("A fully described server"),
+        )
+        val fullJson = full.toJson
+        val fullAst = fullJson.fromJson[Json.Obj].toOption
+        val sizes = fullAst.flatMap(_.get("icons")).flatMap(_.asArray).flatMap(_.headOption)
+          .flatMap(_.asObject).flatMap(_.get("sizes")).flatMap(_.asArray)
+          .map(_.flatMap(_.asString).toList)
+        val legacy =
+          """{"src":"https://example.test/legacy.png","mimeType":"image/png","sizes":"48x48"}"""
+            .fromJson[Icon]
+        ZIO.succeed(assertTrue(
+          minimal.toJson == """{"name":"plain","version":"1.0.0"}""",
+          fullJson.fromJson[Implementation] == Right(full),
+          fullJson.contains("\"description\":\"A fully described server\""),
+          sizes.contains(List("48x48", "96x96")),
+          legacy.exists(_.sizes == List("48x48")),
+        ))
+      ,
+
       test("(c)+(b)+(d) dynamic tools carry the slug + _meta through tools/list and tools/call"):
         ZIO.scoped:
           for
@@ -165,7 +202,7 @@ object McpSourceSpec extends ZIOSpecDefault:
           )
       ,
 
-      test("(c) serverInfo metadata provider brands the mount per slug (title + SEP-973 icons)"):
+      test("(c) serverInfo metadata provider brands the mount with all implementation metadata"):
         ZIO.scoped:
           for
             port   <- Server.install(dynServer.statelessRoutes)
@@ -174,8 +211,11 @@ object McpSourceSpec extends ZIOSpecDefault:
             val info = client.serverInfo
             assertTrue(
               info.title.contains("Toolbook xyz789"),
+              info.description.contains("Dynamic server for xyz789"),
+              info.websiteUrl.contains("https://example.test/xyz789"),
               info.icons.map(_.src) == List("https://example.test/xyz789/icon.png"),
               info.icons.headOption.flatMap(_.mimeType).contains("image/png"),
+              info.icons.headOption.map(_.sizes).contains(List("48x48", "96x96")),
             )
       ,
 

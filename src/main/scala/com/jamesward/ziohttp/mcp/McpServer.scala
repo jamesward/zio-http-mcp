@@ -152,7 +152,7 @@ final class McpServer[-R] private (
 
   /**
    * Set a dynamic [[ServerInfoSource]] "metadata provider" for the handshake
-   * `serverInfo` ([[Implementation]] — name/title/icons/websiteUrl), consulted on
+   * `serverInfo` ([[Implementation]] — name/title/description/icons/websiteUrl), consulted on
    * every `initialize` and `server/discover` with the request's [[McpToolContext]]
    * in hand. This is what lets a single path-parameterised mount brand itself per
    * value it serves — e.g. resolve the `<slug>` from `ctx.pathParams` and return an
