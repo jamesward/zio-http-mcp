@@ -547,20 +547,21 @@ object NegotiationSpec extends ZIOSpecDefault:
         val name = result.content.flatMap(_.get("name")).flatMap(_.asString).getOrElse("?")
         Chunk(ToolContent.text(s"hello $name (${result.action})"))
 
-  /** Asks for an elicitation, a sampling and the client's roots in one round trip. */
-  val batchTool: McpToolHandler = McpTool("gather")
-    .description("Gathers several inputs at once")
+  /** Asks for an elicitation, a sampling and the client's roots in one round
+    * trip — the README's `onboard` example. */
+  val batchTool: McpToolHandler = McpTool("onboard")
+    .description("Collects what it needs to onboard someone")
     .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
       ctx.inputs(
-        InputSpec.elicit("who", "Who are you?", Json.Obj("type" -> Json.Str("object"))),
-        InputSpec.sample("greeting", "Greet them", 50),
-        InputSpec.listRoots("roots"),
+        InputSpec.elicit("user_name", "What is your name?", Json.Obj("type" -> Json.Str("object"))),
+        InputSpec.sample("greeting", "Generate a greeting", 50),
+        InputSpec.listRoots("client_roots"),
       ).map: results =>
-        val who = results.elicitation("who").content.flatMap(_.get("name")).flatMap(_.asString).getOrElse("?")
+        val name = results.elicitation("user_name").content.flatMap(_.get("name")).flatMap(_.asString).getOrElse("?")
         val greeting = results.sampling("greeting").content match
           case ToolContent.Text(t, _) => t
           case _                       => ""
-        Chunk(ToolContent.text(s"$greeting $who from ${results.roots("roots").map(_.uri).mkString(",")}"))
+        Chunk(ToolContent.text(s"$greeting $name from ${results.roots("client_roots").map(_.uri).mkString(",")}"))
 
   /** Two rounds of input, resumed from the opaque state rather than by replay. */
   val statefulTool: McpToolHandler = McpTool("two_step")
@@ -690,24 +691,24 @@ object NegotiationSpec extends ZIOSpecDefault:
     ,
 
     test("several inputs of different kinds travel in one round trip"):
-      val call1 = modernBody(1, "tools/call", Chunk("name" -> Json.Str("gather"), "arguments" -> Json.Obj()))
+      val call1 = modernBody(1, "tools/call", Chunk("name" -> Json.Str("onboard"), "arguments" -> Json.Obj()))
       for
         port <- Server.install(mrtrServer.routes)
-        r1   <- postModern(port, call1, "tools/call", name = Some("gather"))
+        r1   <- postModern(port, call1, "tools/call", name = Some("onboard"))
         b1   <- bodyJson(r1)
-        call2 = retryBody(2, "gather", Chunk(
-                  "who" -> elicitedJson("name", "Ada"),
+        call2 = retryBody(2, "onboard", Chunk(
+                  "user_name" -> elicitedJson("name", "Ada"),
                   "greeting" -> sampledJson("Hello"),
-                  "roots" -> rootsJson,
+                  "client_roots" -> rootsJson,
                 ))
-        r2   <- postModern(port, call2, "tools/call", name = Some("gather"))
+        r2   <- postModern(port, call2, "tools/call", name = Some("onboard"))
         b2   <- bodyJson(r2)
       yield assertTrue(
         isInputRequired(b1),
-        inputRequestsOf(b1).map(_._1) == Chunk("who", "greeting", "roots"),
-        methodOfRequest(b1, "who").contains("elicitation/create"),
+        inputRequestsOf(b1).map(_._1) == Chunk("user_name", "greeting", "client_roots"),
+        methodOfRequest(b1, "user_name").contains("elicitation/create"),
         methodOfRequest(b1, "greeting").contains("sampling/createMessage"),
-        methodOfRequest(b1, "roots").contains("roots/list"),
+        methodOfRequest(b1, "client_roots").contains("roots/list"),
         textOf(b2).contains("Hello Ada from file:///test/root"),
       )
     ,

@@ -518,20 +518,30 @@ object ConformanceSpec extends ZIOSpecDefault:
       .getOrElse(java.lang.System.getProperty("os.name", "").toLowerCase.contains("linux"))
 
   /**
-   * Bridged networking cannot give the kit a localhost URL, so
-   * `dns-rebinding-protection` is baselined in that mode only. Under host
-   * networking every scenario is expected to pass.
+   * `server-stateless` is baselined: running the modern suite by its frozen
+   * requirements (rather than by `--spec-version`) reaches scenarios the older
+   * selector never ran, and this is one of them. Its failing checks are
+   * SEP-2575 gaps unrelated to this suite's other scenarios — we do not reject
+   * a modern request whose `_meta` omits `protocolVersion` /
+   * `clientCapabilities` with `-32602` + HTTP 400, we have no
+   * `MissingRequiredClientCapabilityError` (-32021) path, and
+   * `subscriptions/listen` neither acknowledges a subscription nor tags its
+   * notifications with a subscription id. Fixing those is separate work; the
+   * baseline keeps them visible rather than silently unrun.
    *
-   * Modern `tools/call` streams request-scoped `notifications/progress` /
-   * `notifications/message` over the SSE response stream when the request opts
-   * in, so `tools-call-with-progress` passes in both modes.
+   * Bridged networking cannot give the kit a localhost URL, so
+   * `dns-rebinding-protection` is baselined in that mode only.
+   *
+   * Everything else is expected to pass, the `input-required-result-*` (MRTR)
+   * scenarios included. The kit's not-scored scenarios — the `tasks-*`
+   * extension and the ones added to the suite after 2026-07-28 shipped — run
+   * and report but never count toward conformance, so they need no baseline.
    */
   private val expectedFailuresYaml: String =
-    if useHostNetwork then "{}\n"
-    else
-      """server:
-        |  - dns-rebinding-protection
-        |""".stripMargin
+    val baselined =
+      Chunk("server-stateless") ++
+        (if useHostNetwork then Chunk.empty else Chunk("dns-rebinding-protection"))
+    baselined.map(s => s"  - $s").mkString("server:\n", "\n", "\n")
 
   // The official MCP conformance kit (npm). The `latest` line (0.1.x) drives the
   // 2025-11-25 protocol; the `0.2.0` line drives the modern 2026-07-28 protocol

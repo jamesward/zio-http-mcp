@@ -1291,11 +1291,21 @@ final class McpServer[-R] private (
     dynamic.flatMap: extra =>
       resultResponse(id, version, ResourceTemplatesListResult(resourceTemplates = resourceTemplates.map(_.definition) ++ extra), cacheable = true)
 
-  /** Resource-not-found error, using the code appropriate to the negotiated
-    * version (`-32002` legacy, `-32602` modern). */
-  private def resourceNotFoundResponse(id: RequestId, version: ProtocolVersion, message: String): Response =
+  /**
+   * Resource-not-found error, using the code appropriate to the negotiated
+   * version (`-32002` legacy, `-32602` modern) and echoing the URI that was not
+   * found in `data` — a SHOULD in SEP-2164, and the only way a client can tell
+   * which of several in-flight reads failed.
+   */
+  private def resourceNotFoundResponse(
+    id: RequestId,
+    version: ProtocolVersion,
+    message: String,
+    uri: Option[String] = None,
+  ): Response =
     val code = ErrorCode.resourceNotFound(version)
-    Response.json(JsonRpcError(Some(id), ErrorDetail(code, message)).toJson)
+    val data = uri.map(u => Json.Obj(Chunk("uri" -> Json.Str(u))): Json)
+    Response.json(JsonRpcError(Some(id), ErrorDetail(code, message, data)).toJson)
 
   private def handleResourceRead(
     id: RequestId,
@@ -1324,10 +1334,10 @@ final class McpServer[-R] private (
             // No static resource/template matched — fall through to the dynamic source.
             resourceSrc match
               case None =>
-                ZIO.fail(resourceNotFoundResponse(id, version, s"Resource not found: $uri"))
+                ZIO.fail(resourceNotFoundResponse(id, version, s"Resource not found: $uri", Some(uri)))
               case Some(src) =>
                 src.readResource(uri, McpToolContext.noopWith(principal, pathParams)).foldZIO(
-                  err => ZIO.fail(resourceNotFoundResponse(id, version, err.message)),
+                  err => ZIO.fail(resourceNotFoundResponse(id, version, err.message, Some(uri))),
                   contents => resultResponse(id, version, ResourceReadResult(contents = contents), cacheable = true),
                 )
 

@@ -8,8 +8,11 @@ protocol version per connection (dual-era). See the "Protocol version
 negotiation" section of the README and `NegotiationSpec` / `TasksSpec` for the
 modern path: `server/discover`, per-request `_meta` version, the modern result
 envelope (`resultType`, `_meta.serverInfo`, `ttlMs`/`cacheScope`), MRTR
-(`InputRequiredResult`), request-scoped notification streaming, and the
-`io.modelcontextprotocol/tasks` extension.
+(`InputRequiredResult`: `inputRequests` keyed by correlation id, answered by
+`inputResponses` under the same keys, resumed through a server-signed
+`requestState` string, and available on `prompts/get` as well as `tools/call`),
+request-scoped notification streaming, and the `io.modelcontextprotocol/tasks`
+extension.
 https://modelcontextprotocol.io/specification/2026-07-28
 
 Technologies:
