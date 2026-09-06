@@ -343,6 +343,118 @@ object ConformanceSpec extends ZIOSpecDefault:
         ),
       ))
 
+  // --- MRTR fixtures (SEP-2322) ---
+  //
+  // The kit's `input-required-result-*` scenarios drive named tools through the
+  // `input_required` flow, so the names, the input-request keys, and (for the
+  // request-state scenarios) the "state-ok" marker are fixed by the suite —
+  // see the scenario descriptions in `conformance list --verbose`.
+
+  private def objectSchema(property: String, propertyType: String): Json.Obj =
+    Json.Obj(Chunk(
+      "type" -> Json.Str("object"),
+      "properties" -> Json.Obj(Chunk(property -> Json.Obj(Chunk("type" -> Json.Str(propertyType))))),
+      "required" -> Json.Arr(Chunk(Json.Str(property))),
+    ))
+
+  private val nameSchema    = objectSchema("name", "string")
+  private val colorSchema   = objectSchema("color", "string")
+  private val okSchema      = objectSchema("ok", "boolean")
+  private val contextSchema = objectSchema("context", "string")
+
+  private def elicited(result: ElicitationResult, field: String, fallback: String): String =
+    result.content.flatMap(_.get(field)).flatMap(_.asString).getOrElse(fallback)
+
+  private def sampledText(result: SamplingResult): String =
+    result.content match
+      case ToolContent.Text(text, _) => text
+      case _                         => ""
+
+  val testInputRequiredElicitation: McpToolHandler = McpTool("test_input_required_result_elicitation")
+    .description("Asks for a name via elicitation, then greets it")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.elicit("user_name", "What is your name?", nameSchema).map: result =>
+        Chunk(ToolContent.text(s"Hello, ${elicited(result, "name", "stranger")}!"))
+
+  val testInputRequiredSampling: McpToolHandler = McpTool("test_input_required_result_sampling")
+    .description("Asks the client's model a question via sampling")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.sample("capital_question", "What is the capital of France?", 100).map: result =>
+        Chunk(ToolContent.text(s"The model said: ${sampledText(result)}"))
+
+  val testInputRequiredListRoots: McpToolHandler = McpTool("test_input_required_result_list_roots")
+    .description("Asks the client for its roots")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.listRoots("client_roots").map: roots =>
+        Chunk(ToolContent.text(s"Client roots: ${roots.map(_.uri).mkString(", ")}"))
+
+  val testInputRequiredRequestState: McpToolHandler = McpTool("test_input_required_result_request_state")
+    .description("Round-trips opaque requestState alongside an elicitation")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.setRequestState("awaiting-confirmation") *>
+        ctx.elicit("confirm", "Please confirm", okSchema).map: result =>
+          // Reached only on the retry, which carries the state back; saying so
+          // is what the scenario checks.
+          val marker = if ctx.requestState.contains("awaiting-confirmation") then "state-ok" else "state-missing"
+          Chunk(ToolContent.text(s"$marker (${result.action})"))
+
+  val testInputRequiredMultipleInputs: McpToolHandler = McpTool("test_input_required_result_multiple_inputs")
+    .description("Asks for an elicitation, a sampling and the client's roots in one round trip")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.setRequestState("collecting-inputs") *>
+        ctx.inputs(
+          InputSpec.elicit("user_name", "What is your name?", nameSchema),
+          InputSpec.sample("greeting", "Generate a greeting", 50),
+          InputSpec.listRoots("client_roots"),
+        ).map: results =>
+          val name  = elicited(results.elicitation("user_name"), "name", "stranger")
+          val roots = results.roots("client_roots").map(_.uri).mkString(", ")
+          Chunk(ToolContent.text(s"${sampledText(results.sampling("greeting"))} $name (roots: $roots)"))
+
+  val testInputRequiredMultiRound: McpToolHandler = McpTool("test_input_required_result_multi_round")
+    .description("Collects a name, then a colour, over two rounds of evolving requestState")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      val askColour = ctx.elicit("step2", "Step 2: What is your favorite color?", colorSchema)
+      ctx.requestState match
+        case Some("round-2") =>
+          askColour.map(result => Chunk(ToolContent.text(s"Favourite colour: ${elicited(result, "color", "none")}")))
+        case Some("round-1") =>
+          ctx.setRequestState("round-2") *> askColour.map(_ => Chunk(ToolContent.text("colour requested")))
+        case _ =>
+          ctx.setRequestState("round-1") *>
+            ctx.elicit("step1", "Step 1: What is your name?", nameSchema)
+              .map(_ => Chunk(ToolContent.text("name requested")))
+
+  val testInputRequiredTamperedState: McpToolHandler = McpTool("test_input_required_result_tampered_state")
+    .description("Issues integrity-protected requestState; the server rejects it if edited")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.setRequestState("integrity-protected") *>
+        ctx.elicit("confirm", "Please confirm", okSchema).map: result =>
+          Chunk(ToolContent.text(s"confirmed: ${result.action}"))
+
+  val testInputRequiredCapabilities: McpToolHandler = McpTool("test_input_required_result_capabilities")
+    .description("Only asks for input the client declared it can answer")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      val specs = Chunk(
+        Option.when(ctx.clientSupports("elicitation"))(InputSpec.elicit("user_name", "What is your name?", nameSchema)),
+        Option.when(ctx.clientSupports("sampling"))(InputSpec.sample("greeting", "Generate a greeting", 50)),
+      ).flatten
+      ctx.inputs(specs*).map: results =>
+        val name = results.json("user_name").fold("not asked")(_ => elicited(results.elicitation("user_name"), "name", "stranger"))
+        val greeting = results.json("greeting").fold("not asked")(_ => sampledText(results.sampling("greeting")))
+        Chunk(ToolContent.text(s"greeting=$greeting, name=$name"))
+
+  val testInputRequiredPrompt: McpPromptHandler = McpPrompt("test_input_required_result_prompt")
+    .description("Prompt that elicits its context before it renders")
+    .getWithContext: (_, ctx) =>
+      ctx.elicit("user_context", "What context should the prompt use?", contextSchema).map: result =>
+        PromptGetResult(
+          messages = Chunk(PromptMessage(
+            role = Role.User,
+            content = ToolContent.text(s"Context: ${elicited(result, "context", "none")}"),
+          )),
+        )
+
   val testServer = McpServer("test-server", "0.1.0")
     .tool(testSimpleText)
     .tool(testImageContent)
@@ -365,6 +477,15 @@ object ConformanceSpec extends ZIOSpecDefault:
     .prompt(testPromptWithArguments)
     .prompt(testPromptWithEmbeddedResource)
     .prompt(testPromptWithImage)
+    .tool(testInputRequiredElicitation)
+    .tool(testInputRequiredSampling)
+    .tool(testInputRequiredListRoots)
+    .tool(testInputRequiredRequestState)
+    .tool(testInputRequiredMultipleInputs)
+    .tool(testInputRequiredMultiRound)
+    .tool(testInputRequiredTamperedState)
+    .tool(testInputRequiredCapabilities)
+    .prompt(testInputRequiredPrompt)
 
   /**
    * A CA bundle to trust inside the image build, taken from the standard
@@ -414,14 +535,13 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   // The official MCP conformance kit (npm). The `latest` line (0.1.x) drives the
   // 2025-11-25 protocol; the `0.2.0` line drives the modern 2026-07-28 protocol
-  // (`0.2.0-alpha.10` is the release aligned with the finalized 2026-07-28 spec;
-  // move to the stable `0.2.0` once it ships). Our server is dual-era, so each
+  // (move to the stable `0.2.0` once it ships). Our server is dual-era, so each
   // version exercises a different negotiated path against it. The name and
   // version are kept separate and joined with `@` only when building the
   // `npx` invocation.
   private val ConformancePackage = "@modelcontextprotocol/conformance"
   private val LegacyKitVersion   = "0.1.16"
-  private val ModernKitVersion   = "0.2.0-alpha.10"
+  private val ModernKitVersion   = "0.2.0-alpha.11"
 
   /**
    * Build an image with the kit preinstalled, so the test needs Docker and nothing
@@ -451,7 +571,14 @@ object ConformanceSpec extends ZIOSpecDefault:
     else s"http://host.testcontainers.internal:$port/mcp"
 
   /** Run the kit against the server bound on `port` of the host. */
-  def runConformance(image: ImageFromDockerfile, port: Int, specVersion: String, expectedFailures: String, scenario: Option[String] = None): Task[(Long, String)] =
+  def runConformance(
+    image: ImageFromDockerfile,
+    port: Int,
+    specVersion: String,
+    expectedFailures: String,
+    scenario: Option[String] = None,
+    requirementsMode: Boolean = false,
+  ): Task[(Long, String)] =
     ZIO.logInfo(
       s"conformance $specVersion: ${if useHostNetwork then "host" else "bridge"} networking, " +
         s"url=${serverUrlFor(port)}, ca=${hostCaBundle.fold("none")(_.toString)}"
@@ -479,14 +606,22 @@ object ConformanceSpec extends ZIOSpecDefault:
 
       container.withFileSystemBind(expectedFailuresFile.getAbsolutePath, "/tmp/expected-failures.yaml",
         org.testcontainers.containers.BindMode.READ_ONLY)
+      val selection =
+        // `--requirements` (kit 0.2.0-alpha.11+) runs exactly the scenarios a
+        // revision requires, frozen at its release, and is the only mode that
+        // reaches the `input-required-result-*` (MRTR) scenarios — they were
+        // pending in the kit's own suite when 2026-07-28 shipped, so the
+        // default `active` suite still skips them.
+        //
+        // `--spec-version` is the older selector: it picks which protocol era
+        // the kit drives, and without either flag the kit defaults to the
+        // legacy `initialize` handshake even on the 2026-07-28 line.
+        if requirementsMode then Seq("--requirements", specVersion)
+        else Seq("--spec-version", specVersion)
       val baseArgs = Seq(
         "server",
         "--url", serverUrlFor(port),
-        // `--spec-version` picks which protocol era the kit drives: without it
-        // the kit defaults to the legacy `initialize` handshake even on the
-        // 2026-07-28 line, so it must be set explicitly to actually exercise the
-        // modern (server/discover + per-request `_meta`) wire protocol.
-        "--spec-version", specVersion,
+      ) ++ selection ++ Seq(
         "--expected-failures", "/tmp/expected-failures.yaml",
       )
       val args = scenario.fold(baseArgs)(s => baseArgs ++ Seq("--scenario", s))
@@ -525,7 +660,7 @@ object ConformanceSpec extends ZIOSpecDefault:
       test("2026-07-28 (modern) conformance suite passes"):
         for
           port              <- Server.install(testServer.routes)
-          (exitCode, output) <- runConformance(modernImage, port, "2026-07-28", expectedFailuresYaml)
+          (exitCode, output) <- runConformance(modernImage, port, "2026-07-28", expectedFailuresYaml, requirementsMode = true)
           _                 <- ZIO.logInfo(s"Modern conformance exit code: $exitCode")
           _                 <- ZIO.logInfo(s"Modern conformance output:\n$output").when(exitCode != 0)
         yield assertTrue(exitCode == 0L)

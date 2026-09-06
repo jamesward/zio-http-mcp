@@ -518,6 +518,8 @@ final class McpServer[-R] private (
           LogAnnotation("userAgent", request.rawHeader("user-agent").getOrElse("-")),
         )(ZIO.logInfo("MCP server/discover (modern handshake)")) *>
           handleServerDiscover(id, ctx)
+      case Some(McpDispatchMethod.PromptsGet) =>
+        modernHandlePromptsGet(id, version, params, principal, pathParams)
       case Some(dm) =>
         dispatchMethod(id, dm, version, params, principal, pathParams,
           modernHandleToolsCall(request, version, tasks, _, _, principal, pathParams))
@@ -597,6 +599,108 @@ final class McpServer[-R] private (
       case McpMethodError.Domain(code, message, data) =>
         Response.json(JsonRpcError(Some(id), ErrorDetail(code, message, data)).toJson)
   /**
+   * Key for signing the opaque `requestState` this server hands out on an
+   * `input_required` result. It never leaves the process: the state itself
+   * round-trips through the client, and only its signature proves it came from
+   * here unmodified.
+   */
+  private val requestStateKey: Array[Byte] = RequestState.randomKey
+
+  /**
+   * The MRTR input a modern request carries: the answers the client sent keyed
+   * by correlation id, the verified `requestState`, and the capabilities the
+   * client declared (so a handler only asks for input the client can answer).
+   */
+  private final case class ModernInput(
+    responses: Map[String, Json],
+    state: Option[String],
+    capabilities: Option[Json.Obj],
+  ):
+    def context(
+      principal: Option[Principal],
+      pathParams: Map[String, String],
+      notifications: Option[Queue[JsonRpcMessage]] = None,
+      progressToken: Option[Json] = None,
+      logLevel: Option[com.jamesward.ziohttp.mcp.LogLevel] = None,
+    ): McpToolContext =
+      McpToolContext.modern(
+        responses, principal, pathParams, notifications, progressToken, logLevel, state, capabilities,
+      )
+
+  /**
+   * Read the MRTR fields of a modern request: `inputResponses` (an object keyed
+   * by the ids the server asked under) and `requestState` (the signed string it
+   * issued). Both are validated here rather than in the handler — a malformed
+   * `inputResponses`, or state that fails its integrity check, is a protocol
+   * error, not something to answer with another round trip.
+   */
+  private def modernInput(id: RequestId, params: Option[Json.Obj]): ZIO[Any, Response, ModernInput] =
+    val responses: Either[String, Map[String, Json]] =
+      params.flatMap(_.get("inputResponses")) match
+        case None => Right(Map.empty)
+        case Some(json) =>
+          json.asObject.toRight("'inputResponses' must be an object keyed by input request id").flatMap: obj =>
+            val malformed = obj.fields.collect { case (key, value) if value.asObject.isEmpty => key }
+            if malformed.isEmpty then Right(obj.fields.toMap)
+            else Left(s"'inputResponses' entries must be objects: ${malformed.mkString(", ")}")
+
+    val state: Either[String, Option[String]] =
+      params.flatMap(_.get("requestState")) match
+        case None => Right(None)
+        case Some(json) =>
+          json.asString.toRight("'requestState' must be the string the server issued").flatMap: signed =>
+            RequestState.verify(requestStateKey, signed)
+              .toRight("'requestState' failed integrity verification")
+              .map(Some(_))
+
+    val capabilities = McpMeta.raw(McpMeta.of(params), McpMeta.ClientCapabilities).flatMap(_.asObject)
+
+    ZIO.fromEither(responses.flatMap(r => state.map(ModernInput(r, _, capabilities))))
+      .mapError(message => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, message))
+
+  /** The `input_required` result for a handler that stopped for client input,
+    * with the state it set for the next round signed on the way out. */
+  private def inputRequiredJson(signal: McpToolContext.InputRequiredSignal): Json.Obj =
+    InputRequiredResult(
+      signal.requests,
+      signal.requestState.map(RequestState.sign(requestStateKey, _)),
+    ).toResultJson(serverInfo)
+
+  /**
+   * Modern (2026-07-28) `prompts/get`. `input_required` is universal in
+   * SEP-2322, not a `tools/call` special case: a prompt built with
+   * `getWithContext` can ask the client for input and be retried exactly like a
+   * tool. Prompts that do not ask for input never see any of this.
+   */
+  private def modernHandlePromptsGet(
+    id: RequestId,
+    version: ProtocolVersion,
+    params: Option[Json.Obj],
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[Any, Response, Response] =
+    val paramsJson = params.getOrElse(Json.Obj()).toJson
+    ZIO.fromEither(paramsJson.fromJson[PromptGetParams])
+      .mapError(e => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Invalid prompt get params: $e"))
+      .flatMap: getParams =>
+        promptsByName.get(getParams.name) match
+          case None =>
+            ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Unknown prompt: ${getParams.name.value}"))
+          case Some(prompt) =>
+            modernInput(id, params).flatMap: input =>
+              prompt.getWithContext(getParams.arguments.getOrElse(Map.empty), input.context(principal, pathParams))
+                .foldCauseZIO(
+                  cause =>
+                    cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
+                      case Some(signal) => ZIO.succeed(rawResultResponse(id, inputRequiredJson(signal)))
+                      case None =>
+                        val message = cause.failureOption.map(_.message)
+                          .getOrElse("Prompt execution failed")
+                        ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, message)),
+                  result => resultResponse(id, version, result),
+                )
+
+  /**
    * Modern (2026-07-28) `tools/call`. The tool runs against a
    * [[McpToolContext.modern]] context: any `sample` / `elicit` the handler
    * performs is answered from the `inputResponses` the client sent on its retry,
@@ -631,24 +735,19 @@ final class McpServer[-R] private (
             case (true, Some(store)) =>
               runToolAsTask(id, tool, callParams, principal, pathParams, store)
             case _ =>
-              val inputResponses = params
-                .flatMap(_.get("inputResponses")).flatMap(_.asArray)
-                .map(_.flatMap(_.as[InputResponse].toOption))
-                .getOrElse(Chunk.empty)
               val progressToken = McpMeta.raw(meta, McpMeta.ProgressToken)
               val logLevel      = McpMeta.raw(meta, McpMeta.LogLevel)
                 .flatMap(_.as[com.jamesward.ziohttp.mcp.LogLevel].toOption)
-              enforceToolScopes(request, principal, tool) *> {
+              enforceToolScopes(request, principal, tool) *> modernInput(id, params).flatMap: input =>
                 if progressToken.isDefined || logLevel.isDefined then
-                  modernStreamedToolCall(id, tool, callParams, inputResponses, principal, pathParams, progressToken, logLevel)
+                  modernStreamedToolCall(id, tool, callParams, input, principal, pathParams, progressToken, logLevel)
                 else
-                  val ctx = McpToolContext.modern(inputResponses, principal, pathParams)
+                  val ctx = input.context(principal, pathParams)
                   tool.callWithContext(callParams.arguments, ctx)
                     .foldCauseZIO(
                       cause => ZIO.succeed(rawResultResponse(id, modernToolFailureJson(cause))),
                       result => resultResponse(id, version, result),
                     )
-              }
 
   /** The final result object for a failed modern tool call: an
     * [[InputRequiredResult]] when the failure is an MRTR input signal,
@@ -656,7 +755,7 @@ final class McpServer[-R] private (
   private def modernToolFailureJson(cause: Cause[Any]): Json.Obj =
     cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
       case Some(signal) =>
-        InputRequiredResult(Chunk(signal.request)).toResultJson(serverInfo)
+        inputRequiredJson(signal)
       case None =>
         val errorResult = CallToolResult(
           content = Chunk(ToolContent.text("Tool execution failed")),
@@ -672,14 +771,14 @@ final class McpServer[-R] private (
     id: RequestId,
     tool: McpToolHandlerR[R],
     callParams: ToolCallParams,
-    inputResponses: Chunk[InputResponse],
+    input: ModernInput,
     principal: Option[Principal],
     pathParams: Map[String, String],
     progressToken: Option[Json],
     logLevel: Option[com.jamesward.ziohttp.mcp.LogLevel],
   ): ZIO[R, Response, Response] =
     Queue.unbounded[JsonRpcMessage].flatMap: queue =>
-      val ctx = McpToolContext.modern(inputResponses, principal, pathParams, Some(queue), progressToken, logLevel)
+      val ctx = input.context(principal, pathParams, Some(queue), progressToken, logLevel)
       Promise.make[Nothing, Json].flatMap: resultPromise =>
         val runTool = tool.callWithContext(callParams.arguments, ctx)
           .foldCauseZIO(
@@ -711,7 +810,7 @@ final class McpServer[-R] private (
       now    <- Clock.instant.map(_.toEpochMilli)
       record  = TaskRecord.create(now)
       taskId  = record.task.taskId
-      ctx     = McpToolContext.modern(Chunk.empty, principal, pathParams)
+      ctx     = McpToolContext.modern(Map.empty, principal, pathParams)
       run     = tool.callWithContext(callParams.arguments, ctx).flatMap: result =>
                   Clock.instant.map(_.toEpochMilli).flatMap: t =>
                     store.update(_.updatedWith(taskId)(_.map(r => r.copy(
