@@ -407,30 +407,38 @@ object McpClient:
      * their result on the first pass.
      */
     def toolsCall(params: Json.Obj): IO[McpClientError, CallToolResult] =
-      def loop(prior: Chunk[InputResponse], depth: Int): IO[McpClientError, CallToolResult] =
+      def loop(prior: Chunk[InputResponse], state: Option[String], depth: Int): IO[McpClientError, CallToolResult] =
+        // Answers accumulate across rounds rather than replacing one another:
+        // a server that resumes from `requestState` ignores the ones it has
+        // already consumed, and one that replays its handler needs them all.
+        val retryFields = Chunk[(String, Json)]("inputResponses" -> InputResponse.toJson(prior)) ++
+          state.fold(Chunk.empty[(String, Json)])(s => Chunk("requestState" -> Json.Str(s)))
         val callParams =
           if prior.isEmpty then params
-          else Json.Obj(params.fields.filterNot(_._1 == "inputResponses") :+
-            ("inputResponses" -> (Json.Arr(prior.map(_.toJsonAST.getOrElse(Json.Obj()))): Json)))
+          else Json.Obj(
+            params.fields.filterNot((key, _) => key == "inputResponses" || key == "requestState") ++ retryFields
+          )
         rpcRaw("tools/call", callParams).flatMap: result =>
           val resultType = result.asObject.flatMap(_.get("resultType")).flatMap(_.asString)
           if resultType.contains(ModernEnvelope.ResultTypeInputRequired) then
             config.onInputRequest match
               case None =>
                 ZIO.fail(McpClientError.Protocol("Server requested input (MRTR) but no onInputRequest handler is configured"))
-              case Some(handler) if depth >= 32 =>
+              case Some(_) if depth >= 32 =>
                 ZIO.fail(McpClientError.Protocol("MRTR exceeded the maximum number of round trips"))
               case Some(handler) =>
-                val requests = result.asObject.flatMap(_.get("inputRequests")).flatMap(_.asArray)
-                  .map(_.flatMap(_.as[InputRequest].toOption)).getOrElse(Chunk.empty)
+                val requests = result.asObject.flatMap(_.get("inputRequests"))
+                  .fold(Chunk.empty[InputRequest])(InputRequest.parseAll)
+                // The server's opaque state, echoed verbatim on the retry.
+                val nextState = result.asObject.flatMap(_.get("requestState")).flatMap(_.asString).orElse(state)
                 for
                   answers <- ZIO.foreach(requests)(req => handler(req).map(r => InputResponse(req.id, r)))
-                  out     <- loop(prior ++ answers, depth + 1)
+                  out     <- loop(prior ++ answers, nextState, depth + 1)
                 yield out
           else
             ZIO.fromEither(result.as[CallToolResult])
               .mapError(e => McpClientError.Decode(s"Failed to decode tool result: $e"))
-      loop(Chunk.empty, 0)
+      loop(Chunk.empty, None, 0)
 
     def close: IO[McpClientError, Unit] =
       stateRef.get.flatMap: st =>

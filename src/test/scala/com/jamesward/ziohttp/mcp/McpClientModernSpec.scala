@@ -37,10 +37,32 @@ object McpClientModernSpec extends ZIOSpecDefault:
         val t = r.content match { case ToolContent.Text(x, _) => x; case _ => "" }
         Chunk(ToolContent.text(s"summary: $t"))
 
+  /**
+   * Two rounds of input, resumed from the server's opaque `requestState` rather
+   * than by replaying the handler — the client has to echo that state back for
+   * this to get past round two.
+   */
+  val twoStepTool: McpToolHandler = McpTool("two_step")
+    .description("Collects a name, then a colour")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      val askColour = ctx.elicit("step2", "Colour?", Json.Obj("type" -> Json.Str("object")))
+      ctx.requestState match
+        case Some("round-2") =>
+          askColour.map: result =>
+            val colour = result.content.flatMap(_.get("color")).flatMap(_.asString).getOrElse("?")
+            Chunk(ToolContent.text(s"done: $colour"))
+        case Some("round-1") =>
+          ctx.setRequestState("round-2") *> askColour.map(_ => Chunk(ToolContent.text("unreachable")))
+        case _ =>
+          ctx.setRequestState("round-1") *>
+            ctx.elicit("step1", "Name?", Json.Obj("type" -> Json.Str("object")))
+              .map(_ => Chunk(ToolContent.text("unreachable")))
+
   val server = McpServer("modern-server", "2.0.0")
     .instructions("modern hints")
     .tool(addTool)
     .tool(summarizeTool)
+    .tool(twoStepTool)
     .resource(configResource)
 
   private def addArgs(a: Int, b: Int): Json.Obj =
@@ -52,6 +74,15 @@ object McpClientModernSpec extends ZIOSpecDefault:
       "role" -> Json.Str("assistant"),
       "model" -> Json.Str("test"),
       "content" -> Json.Obj("type" -> Json.Str("text"), "text" -> Json.Str("done")),
+    ))
+
+  /** Answers each elicitation by the id the server asked under. */
+  private val elicitationHandler: InputRequest => IO[McpClientError, Json] = request =>
+    val field = if request.id == "step1" then "name" else "color"
+    val value = if request.id == "step1" then "Ada" else "blue"
+    ZIO.succeed(Json.Obj(
+      "action" -> Json.Str("accept"),
+      "content" -> Json.Obj(field -> Json.Str(value)),
     ))
 
   override def spec =
@@ -77,7 +108,7 @@ object McpClientModernSpec extends ZIOSpecDefault:
             tools  <- client.listTools
             result <- client.callToolAs[AddOutput]("add", addArgs(6, 7))
           yield assertTrue(
-            tools.map(_.name.value).toSet == Set("add", "summarize"),
+            tools.map(_.name.value).toSet == Set("add", "summarize", "two_step"),
             result.result == 13,
           )
       ,
@@ -103,6 +134,22 @@ object McpClientModernSpec extends ZIOSpecDefault:
           yield
             val text = result.content.collectFirst { case ToolContent.Text(t, _) => t }
             assertTrue(text.contains("summary: done"))
+      ,
+
+      test("modern client echoes requestState across a multi-round MRTR exchange"):
+        ZIO.scoped:
+          for
+            port   <- Server.install(server.routes)
+            client <- McpClient.connect(McpClientConfig(
+                        s"http://localhost:$port/mcp",
+                        onInputRequest = Some(elicitationHandler),
+                      ))
+            result <- client.callTool("two_step")
+          yield
+            val text = result.content.collectFirst { case ToolContent.Text(t, _) => t }
+            // Only reachable if the client echoed the state the server issued
+            // in round one and again in round two.
+            assertTrue(text.contains("done: blue"))
       ,
 
       test("modern client without an input handler surfaces a clear error on MRTR"):

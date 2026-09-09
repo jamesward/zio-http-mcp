@@ -134,6 +134,105 @@ val statusTool = McpTool("status")
 | `ctx.progress(current, total)` | Send progress notification (requires `progressToken` in request) |
 | `ctx.sample(prompt, maxTokens)` | Request LLM completion from client |
 | `ctx.elicit(message, schema)` | Request user input from client with a JSON Schema form |
+| `ctx.listRoots` | Ask the client which roots it exposes |
+| `ctx.inputs(specs*)` | Ask for several of the above in one round trip |
+| `ctx.requestState` / `ctx.setRequestState(s)` | Resume a modern multi-round call from opaque, server-signed state |
+| `ctx.clientSupports(capability)` | Whether the client declared `"sampling"`, `"elicitation"`, `"roots"` |
+
+### Asking the client for input
+
+`sample`, `elicit` and `listRoots` all ask the client for something. How that
+travels depends on the negotiated revision, and the handler does not have to
+care: on a legacy (`2025-11-25`) connection each one is a server-to-client
+JSON-RPC request on the SSE back-channel, while a modern (`2026-07-28`) server
+is stateless and returns an `input_required` result (MRTR, SEP-2322) that the
+client answers by retrying the call.
+
+Ask for several things at once with `ctx.inputs`, so a modern client can fulfil
+them together instead of one retry per question. Each input is named, and that
+name is the key the client answers under:
+
+```scala
+val onboardTool = McpTool("onboard")
+  .description("Collects what it needs to onboard someone")
+  .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+    ctx.inputs(
+      InputSpec.elicit("user_name", "What is your name?", nameSchema),
+      InputSpec.sample("greeting", "Generate a greeting", 50),
+      InputSpec.listRoots("client_roots"),
+    ).map: results =>
+      val name  = results.elicitation("user_name").content.flatMap(_.get("name")).flatMap(_.asString)
+      val roots = results.roots("client_roots").map(_.uri)
+      Chunk(ToolContent.text(s"Welcome ${name.getOrElse("stranger")} (${roots.mkString(", ")})"))
+```
+
+Under the modern revision the handler is replayed on each retry, so it must be
+safe to re-run up to the point where it asks. When it is not — the work before
+the question is expensive, or has side effects — carry progress in the request
+state instead. The server signs it, so a handler can trust what comes back, and
+the client cannot forge or edit it:
+
+```scala
+val twoStepTool = McpTool("two_step")
+  .description("Collects a name, then a colour")
+  .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+    val askColour = ctx.elicit("step2", "Favourite colour?", colourSchema)
+    ctx.requestState match
+      case Some("round-2") => askColour.map(r => Chunk(ToolContent.text(s"done: $r")))
+      case Some("round-1") => ctx.setRequestState("round-2") *> askColour
+      case _               => ctx.setRequestState("round-1") *> ctx.elicit("step1", "Name?", nameSchema)
+```
+
+#### Sharing request state across servers
+
+The state is opaque to the client, but it does travel through it, so the server
+has to be able to tell its own state from anything else. By default it signs the
+state with a key generated for that server instance — right for a single server,
+wrong for a replicated one: a retry that lands on another replica carries state
+that replica's key cannot verify, and is rejected with `-32602`.
+
+The store is a state provider, so it lives in the `McpServer.State` layer
+alongside the session and task state. Give every replica the same secret and any
+of them can serve any round trip — and note that nothing is stored server-side:
+the state still rides in the client, so there is no store to replicate.
+
+```scala
+Server.serve(server.routes).provide(
+  Server.default,
+  McpServer.State.layer(McpRequestStateStore.signed(sys.env("MCP_STATE_SECRET"))),
+)
+```
+
+`McpServer.State.default` is that layer with a key generated per layer instance.
+Servers sharing a layer share its store. `statelessRoutes` take no layer, so
+configure those on the server itself — which also overrides the layer, if you
+want one server to differ:
+
+```scala
+server.requestStateStore(McpRequestStateStore.signed(sys.env("MCP_STATE_SECRET")))
+```
+
+To keep the state server-side instead — because it is large, or must not be
+visible to the client — implement `McpRequestStateStore` over whatever the
+deployment already runs, and hand the client only a handle:
+
+```scala
+trait McpRequestStateStore:
+  def issue(state: String): UIO[String]           // state -> token the client carries
+  def resolve(token: String): UIO[Option[String]] // token -> state, None if not ours
+```
+
+`McpRequestStateStore.inMemory()` implements that shape (bounded, single
+instance) and is the reference to copy for a Redis or database-backed one.
+
+A client only answers what it can, so ask for what it declared:
+
+```scala
+val specs = Chunk(
+  Option.when(ctx.clientSupports("elicitation"))(InputSpec.elicit("who", "Who are you?", nameSchema)),
+  Option.when(ctx.clientSupports("sampling"))(InputSpec.sample("greeting", "Greet them", 50)),
+).flatten
+```
 
 ### Tools with ZIO Layers
 
@@ -270,6 +369,22 @@ val codeReviewPrompt = McpPrompt("code_review")
     ))
 ```
 
+Use `getWithContext` for a prompt that needs the request context — the caller's
+principal, or client input. `input_required` is not a `tools/call` special case:
+a modern client answers a prompt's question by retrying the `prompts/get`.
+
+```scala
+val contextualPrompt = McpPrompt("contextual")
+  .description("Elicits its context before rendering")
+  .getWithContext: (args, ctx) =>
+    ctx.elicit("user_context", "What context should the prompt use?", contextSchema).map: result =>
+      val context = result.content.flatMap(_.get("context")).flatMap(_.asString).getOrElse("none")
+      PromptGetResult(messages = Chunk(PromptMessage(
+        role = Role.User,
+        content = ToolContent.text(s"Context: $context"),
+      )))
+```
+
 ## Server Assembly
 
 Combine tools, resources, and prompts into a server:
@@ -348,7 +463,7 @@ object Main extends ZIOAppDefault:
 The library supports two protocol revisions and negotiates between them per connection:
 
 - **`2025-11-25` (legacy)** — the `initialize` / `notifications/initialized` handshake, `Mcp-Session-Id` sessions, and server-initiated sampling/elicitation over an SSE back-channel.
-- **`2026-07-28` (modern)** — stateless: no handshake and no session. Every request carries its protocol version and client capabilities in `_meta` (`io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientInfo`, `io.modelcontextprotocol/clientCapabilities`), `server/discover` advertises capabilities on demand, and server-to-client interactions use the Multi Round-Trip Request (MRTR) pattern instead of an SSE back-channel.
+- **`2026-07-28` (modern)** — stateless: no handshake and no session. Every request carries its protocol version and client capabilities in `_meta` (`io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientInfo`, `io.modelcontextprotocol/clientCapabilities`), `server/discover` advertises capabilities on demand, and server-to-client interactions use the Multi Round-Trip Request (MRTR) pattern instead of an SSE back-channel: the server answers with `resultType: "input_required"` and an `inputRequests` object keyed by correlation id, and the client retries the same call with `inputResponses` keyed by those ids plus the `requestState` string the server issued. It applies to `prompts/get` as much as to `tools/call`.
 
 ### Server
 
@@ -370,7 +485,7 @@ ZIO.scoped:
     client.listTools
 ```
 
-Pin the era with `preferredVersion`, and supply an `onInputRequest` handler to satisfy a modern server's MRTR sampling/elicitation requests:
+Pin the era with `preferredVersion`, and supply an `onInputRequest` handler to satisfy a modern server's MRTR sampling, elicitation and `roots/list` requests. The client drives the whole exchange — it answers each request under the id the server asked with, echoes the server's `requestState`, and retries until the call completes:
 
 ```scala
 val config = McpClientConfig(

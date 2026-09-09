@@ -127,42 +127,69 @@ object DiscoverResult:
  * Replaces the server-initiated `sampling/createMessage`, `elicitation/create`,
  * and `roots/list` requests of earlier revisions: instead of the server pushing
  * a JSON-RPC request, it returns the request(s) it needs answered and the
- * client retries the original call with matching [[InputResponse]]s.
+ * client retries the original call with matching input responses.
  *
- * @param id     correlation id, unique within this result; echoed by the client
- * @param method the input method, e.g. `sampling/createMessage`, `elicitation/create`
+ * On the wire the requests are a JSON object keyed by correlation id — the `id`
+ * here is that key, not a field of the value — and the client echoes the same
+ * keys in `inputResponses`:
+ *
+ * {{{
+ * "inputRequests": { "user_name": { "method": "elicitation/create", "params": {...} } }
+ * }}}
+ *
+ * @param id     correlation id, unique within this result; the object key
+ * @param method the input method: `sampling/createMessage`, `elicitation/create`, or `roots/list`
  * @param params the parameters the client needs to fulfil the request
  */
-final case class InputRequest(id: String, method: String, params: Json.Obj)
+final case class InputRequest(id: String, method: String, params: Json.Obj):
+  /** This request as its `inputRequests` entry: the id keys a `{method, params}` value. */
+  def toEntry: (String, Json) =
+    id -> Json.Obj(Chunk("method" -> Json.Str(method), "params" -> (params: Json)))
 
 object InputRequest:
   given CanEqual[InputRequest, InputRequest] = CanEqual.derived
-  given JsonCodec[InputRequest] = DeriveJsonCodec.gen[InputRequest]
+
+  /** Read an `inputRequests` object back into requests, keeping wire order. */
+  def parseAll(inputRequests: Json): Chunk[InputRequest] =
+    inputRequests.asObject.fold(Chunk.empty): obj =>
+      obj.fields.flatMap: (id, value) =>
+        for
+          fields <- value.asObject
+          method <- fields.get("method").flatMap(_.asString)
+        yield InputRequest(id, method, fields.get("params").flatMap(_.asObject).getOrElse(Json.Obj()))
 
 /** A client's answer to one [[InputRequest]], sent back in the retry's
-  * `inputResponses`. `result` is the payload the corresponding server request
-  * would have returned (e.g. the sampled message or the elicitation result). */
+  * `inputResponses` keyed by the request's id. `result` is the payload the
+  * corresponding server request would have returned (e.g. the sampled message
+  * or the elicitation result). */
 final case class InputResponse(id: String, result: Json)
 
 object InputResponse:
   given CanEqual[InputResponse, InputResponse] = CanEqual.derived
-  given JsonCodec[InputResponse] = DeriveJsonCodec.gen[InputResponse]
+
+  /** Render answers as the `inputResponses` object: `{ "<id>": <result> }`. */
+  def toJson(responses: Chunk[InputResponse]): Json.Obj =
+    Json.Obj(responses.map(r => r.id -> r.result))
 
 /**
  * Interim result signalling that the server needs input before it can complete
  * the original request. Carries `resultType: "input_required"` and the
- * `inputRequests` the client must fulfil. `requestState` is opaque server state
- * echoed back on the retry so the server can resume where it left off.
+ * `inputRequests` the client must fulfil.
+ *
+ * `requestState` is opaque server state echoed back verbatim on the retry so a
+ * stateless server can resume where it left off. It is a string on the wire:
+ * the server alone decides what it encodes, and — since it travels through the
+ * client — signs it so tampering is detectable (see `McpServer`).
  */
 final case class InputRequiredResult(
   inputRequests: Chunk[InputRequest],
-  requestState: Option[Json] = None,
+  requestState: Option[String] = None,
 ):
   def toResultJson(serverInfo: Implementation): Json.Obj =
     val base = Chunk[(String, Json)](
       "resultType"    -> Json.Str(ModernEnvelope.ResultTypeInputRequired),
-      "inputRequests" -> Json.Arr(inputRequests.map(_.toJsonAST.getOrElse(Json.Obj()))),
-    ) ++ requestState.fold(Chunk.empty[(String, Json)])(s => Chunk("requestState" -> s))
+      "inputRequests" -> Json.Obj(inputRequests.map(_.toEntry)),
+    ) ++ requestState.fold(Chunk.empty[(String, Json)])(s => Chunk("requestState" -> Json.Str(s)))
     ModernEnvelope.withServerInfo(Json.Obj(base), serverInfo)
 
 object InputRequiredResult:
