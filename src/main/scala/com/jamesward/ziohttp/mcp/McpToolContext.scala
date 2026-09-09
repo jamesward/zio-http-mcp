@@ -166,10 +166,12 @@ trait McpToolContext extends McpRequestContext:
    */
   def requestState: Option[String] = None
   /**
-   * Set the opaque state to carry on the next `input_required` result. The
-   * server signs it on the way out and verifies it on the way back, so a
-   * handler can trust what it reads from [[requestState]] but should still
-   * treat it as visible to the client.
+   * Set the opaque state to carry on the next `input_required` result.
+   *
+   * What the client actually carries is whatever the server's
+   * [[McpRequestStateStore]] issues for it — by default the state itself,
+   * signed. So a handler can trust what comes back in [[requestState]], but
+   * under the default should assume the client can read it.
    */
   def setRequestState(state: String): UIO[Unit] = ZIO.unit
   /**
@@ -196,7 +198,6 @@ trait McpToolContext extends McpRequestContext:
   override def pathParams: Map[String, String] = Map.empty
 
 object McpToolContext:
-  private val requestIdCounter = new java.util.concurrent.atomic.AtomicInteger(0)
 
   // --- Shared decoders for input answers ---
   // The payloads are whatever the client would have returned from the
@@ -223,9 +224,20 @@ object McpToolContext:
     json.asObject.flatMap(_.get("roots")).flatMap(_.asArray)
       .fold(Chunk.empty)(_.flatMap(_.as[Root].toOption))
 
+  /**
+   * A legacy (2025-11-25) tool context, which asks the client for input over the
+   * session's SSE back-channel.
+   *
+   * `requestIds` mints the JSON-RPC ids of those server-to-client requests. It
+   * is deliberately wider than one tool call: ids must be unique per session per
+   * requestor, and concurrent calls on one session share the `pendingRequests`
+   * map they are keyed in, so the counter lives with the session state rather
+   * than with this context.
+   */
   private[mcp] def make(
     outQueue: Queue[JsonRpcMessage],
     pendingRequests: Ref[Map[RequestId, Promise[Nothing, Json]]],
+    requestIds: Ref[Int],
     progressToken: Option[Json],
     callerPrincipal: Option[Principal] = None,
     callerPathParams: Map[String, String] = Map.empty,
@@ -281,7 +293,8 @@ object McpToolContext:
 
       private def ask(spec: InputSpec): ZIO[Any, ToolError, Json] =
         val request = spec.toRequest
-        sendServerRequest(RequestId.Num(requestIdCounter.incrementAndGet()), request.method, request.params)
+        requestIds.updateAndGet(_ + 1).flatMap: next =>
+          sendServerRequest(RequestId.Num(next), request.method, request.params)
 
       private def sendServerRequest(reqId: RequestId, method: String, params: Json.Obj): ZIO[Any, ToolError, Json] =
         for
@@ -337,18 +350,21 @@ object McpToolContext:
     minLogLevel: Option[LogLevel] = None,
     incomingState: Option[String] = None,
     declaredCapabilities: Option[Json.Obj] = None,
-  ): McpToolContext =
-    new McpToolContext:
-      private val counter = new java.util.concurrent.atomic.AtomicInteger(0)
-      private val nextState = new java.util.concurrent.atomic.AtomicReference[Option[String]](None)
-
+  ): UIO[McpToolContext] =
+    for
+      // Both cells are scoped to this one request: the context is rebuilt on
+      // every call, including each retry of an MRTR exchange, which is what
+      // makes the positional ids below line up across a replay.
+      inputIds  <- Ref.make(0)
+      pending   <- Ref.make(Option.empty[String])
+    yield new McpToolContext:
       override val principal: Option[Principal] = callerPrincipal
       override val pathParams: Map[String, String] = callerPathParams
       override val requestState: Option[String] = incomingState
       override val clientCapabilities: Option[Json.Obj] = declaredCapabilities
 
       override def setRequestState(state: String): UIO[Unit] =
-        ZIO.succeed(nextState.set(Some(state)))
+        pending.set(Some(state))
 
       def log(level: LogLevel, message: String): UIO[Unit] =
         (notifications, minLogLevel) match
@@ -372,18 +388,18 @@ object McpToolContext:
           case _ => ZIO.unit
 
       def sample(prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
-        sample(nextId(), prompt, maxTokens)
+        nextId.flatMap(sample(_, prompt, maxTokens))
 
       def sample(id: String, prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
         inputs(InputSpec.sample(id, prompt, maxTokens)).map(_.sampling(id))
 
       def elicit(message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult] =
-        elicit(nextId(), message, schema)
+        nextId.flatMap(elicit(_, message, schema))
 
       def elicit(id: String, message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult] =
         inputs(InputSpec.elicit(id, message, schema)).map(_.elicitation(id))
 
-      def listRoots: ZIO[Any, ToolError, Chunk[Root]] = listRoots(nextId())
+      def listRoots: ZIO[Any, ToolError, Chunk[Root]] = nextId.flatMap(listRoots)
 
       def listRoots(id: String): ZIO[Any, ToolError, Chunk[Root]] =
         inputs(InputSpec.listRoots(id)).map(_.roots(id))
@@ -392,16 +408,32 @@ object McpToolContext:
        * Answer the whole batch from the replayed responses, or abort with an
        * [[InputRequiredSignal]] carrying every input the client has not
        * answered — one round trip, however many inputs the handler wants.
+       *
+       * The pending state is read when this runs, not when the effect is built,
+       * so a handler may hoist the question
+       * (`val ask = ctx.elicit(...)`) and still have a later
+       * `setRequestState` apply to it.
        */
       def inputs(specs: InputSpec*): ZIO[Any, ToolError, InputResults] =
         val asked = Chunk.fromIterable(specs)
         val missing = asked.filterNot(spec => inputResponses.contains(spec.id))
         if missing.nonEmpty then
-          ZIO.die(InputRequiredSignal(missing.map(_.toRequest), nextState.get))
+          pending.get.flatMap(state => ZIO.die(InputRequiredSignal(missing.map(_.toRequest), state)))
         else
           ZIO.succeed(InputResults(asked.map(spec => spec.id -> inputResponses(spec.id)).toMap))
 
-      private def nextId(): String = s"input-${counter.getAndIncrement()}"
+      /**
+       * The next positional id, assigned when the effect runs rather than when
+       * it is built, so ids follow execution order.
+       *
+       * A replay has to hand the same question the same id, which holds as long
+       * as the handler asks in a deterministic order. It does not hold for
+       * questions raced against each other (`ctx.sample(...) <&> ctx.elicit(...)`):
+       * name those inputs explicitly, or ask for them together with [[inputs]],
+       * which is one round trip rather than two anyway.
+       */
+      private def nextId: UIO[String] =
+        inputIds.getAndUpdate(_ + 1).map(next => s"input-$next")
 
   private[mcp] val noop: McpToolContext = noopWith(None)
 

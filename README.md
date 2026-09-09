@@ -183,6 +183,37 @@ val twoStepTool = McpTool("two_step")
       case _               => ctx.setRequestState("round-1") *> ctx.elicit("step1", "Name?", nameSchema)
 ```
 
+#### Sharing request state across servers
+
+The state is opaque to the client, but it does travel through it, so the server
+has to be able to tell its own state from anything else. By default it signs the
+state with a key generated for that server instance — right for a single server,
+wrong for a replicated one: a retry that lands on another replica carries state
+that replica's key cannot verify, and is rejected with `-32602`.
+
+Give every replica the same secret and any of them can serve any round trip.
+Nothing is stored server-side — the state still rides in the client, so there is
+no store to replicate:
+
+```scala
+McpServer("my-server", "1.0.0")
+  .tool(twoStepTool)
+  .requestStateStore(McpRequestStateStore.signed(sys.env("MCP_STATE_SECRET")))
+```
+
+To keep the state server-side instead — because it is large, or must not be
+visible to the client — implement `McpRequestStateStore` over whatever the
+deployment already runs, and hand the client only a handle:
+
+```scala
+trait McpRequestStateStore:
+  def issue(state: String): UIO[String]           // state -> token the client carries
+  def resolve(token: String): UIO[Option[String]] // token -> state, None if not ours
+```
+
+`McpRequestStateStore.inMemory()` implements that shape (bounded, single
+instance) and is the reference to copy for a Redis or database-backed one.
+
 A client only answers what it can, so ask for what it declared:
 
 ```scala

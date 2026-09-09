@@ -35,18 +35,19 @@ final class McpServer[-R] private (
   instructionsSrc: Option[InstructionsSource[R]] = None,
   serverInfoSrc: Option[ServerInfoSource[R]] = None,
   val extensions: McpExtensions[R] = McpExtensions.empty,
+  val requestStateStore: McpRequestStateStore = McpRequestStateStore.ephemeral,
 ):
   def tool[R1](t: McpToolHandlerR[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
+    new McpServer(serverInfo, tools :+ t, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions, requestStateStore)
 
   def resource(r: McpResourceHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
+    new McpServer(serverInfo, tools, resources :+ r, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions, requestStateStore)
 
   def resourceTemplate(rt: McpResourceTemplateHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
+    new McpServer(serverInfo, tools, resources, resourceTemplates :+ rt, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions, requestStateStore)
 
   def prompt(p: McpPromptHandler): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts :+ p, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions, requestStateStore)
 
   /**
    * Register a dynamic [[McpToolSource]] consulted at request time. Its tools are merged
@@ -55,7 +56,7 @@ final class McpServer[-R] private (
    * environment, like [[tool]].
    */
   def toolSource[R1](src: McpToolSource[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, Some(src), resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, Some(src), resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions, requestStateStore)
 
   /**
    * Register a dynamic [[McpResourceSource]] consulted at request time. Its resources and
@@ -63,7 +64,7 @@ final class McpServer[-R] private (
    * it when no static resource/template matched, and `completion/complete` delegates to it.
    */
   def resourceSource[R1](src: McpResourceSource[R1]): McpServer[R & R1] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, Some(src), pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, Some(src), pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions, requestStateStore)
 
   /**
    * Mount the MCP HTTP routes at the given path. Defaults to `/mcp` (matching the
@@ -86,7 +87,7 @@ final class McpServer[-R] private (
    * Mutually exclusive with [[mountedAtParam]]; the last one called wins.
    */
   def mountedAt(path: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, path, toolSrc, resourceSrc, None, instructions, instructionsSrc, serverInfoSrc, extensions)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, path, toolSrc, resourceSrc, None, instructions, instructionsSrc, serverInfoSrc, extensions, requestStateStore)
 
   /**
    * Mount at a single path-parameter segment, so the server serves `/<value>` for any
@@ -104,7 +105,7 @@ final class McpServer[-R] private (
    * Mutually exclusive with [[mountedAt]]; the last one called wins.
    */
   def mountedAtParam(paramName: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, Some(paramName), instructions, instructionsSrc, serverInfoSrc, extensions)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, Some(paramName), instructions, instructionsSrc, serverInfoSrc, extensions, requestStateStore)
 
   /**
    * Enable opt-in OAuth 2.1 authorization for this server.
@@ -120,7 +121,7 @@ final class McpServer[-R] private (
    * @see [[com.jamesward.ziohttp.mcp.auth.McpAuth]]
    */
   def auth[R1](a: McpAuth[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a), mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions)
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, Some(a), mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions, requestStateStore)
 
   /**
    * Set a static `instructions` string returned in the `initialize` result.
@@ -135,7 +136,7 @@ final class McpServer[-R] private (
    * than a combinable collection like tools/resources.
    */
   def instructions(text: String): McpServer[R] =
-    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, Some(text), None, serverInfoSrc, extensions)
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, Some(text), None, serverInfoSrc, extensions, requestStateStore)
 
   /**
    * Set a dynamic [[InstructionsSource]] for the `initialize` result's `instructions`
@@ -148,7 +149,7 @@ final class McpServer[-R] private (
    * widens the server's `R`.
    */
   def instructions[R1](source: InstructionsSource[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, None, Some(source), serverInfoSrc, extensions)
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, None, Some(source), serverInfoSrc, extensions, requestStateStore)
 
   /**
    * Set a dynamic [[ServerInfoSource]] "metadata provider" for the handshake
@@ -165,11 +166,31 @@ final class McpServer[-R] private (
    * registering one widens the server's `R`.
    */
   def serverInfo[R1](source: ServerInfoSource[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, Some(source), extensions)
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, Some(source), extensions, requestStateStore)
+
+  /**
+   * Choose how the opaque `requestState` of a modern (2026-07-28) multi-round
+   * call is issued and validated — see [[McpRequestStateStore]].
+   *
+   * The default signs it with a key generated for this server instance, which a
+   * replicated deployment must replace: a retry that lands on another replica
+   * carries state that replica's key cannot verify, and is rejected as tampered.
+   * Give every replica the same secret instead:
+   *
+   * {{{
+   * McpServer("my-server", "1.0.0")
+   *   .requestStateStore(McpRequestStateStore.signed(sys.env("MCP_STATE_SECRET")))
+   * }}}
+   *
+   * Or pass an implementation of your own to keep the state in a store the
+   * replicas share, rather than in the client.
+   */
+  def requestStateStore(store: McpRequestStateStore): McpServer[R] =
+    new McpServer(serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, extensions, store)
 
   /** Replace this server's registry with an already-validated immutable registry. */
   def withExtensions[R1](registered: McpExtensions[R1]): McpServer[R & R1] =
-    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, registered)
+    new McpServer[R & R1](serverInfo, tools, resources, resourceTemplates, prompts, authConfig, mountPath, toolSrc, resourceSrc, pathParamName, instructions, instructionsSrc, serverInfoSrc, registered, requestStateStore)
 
   /** Validate and immutably register one extension before routes are constructed. */
   def extension[R1](registered: McpServerExtension[R1]): Either[McpExtensionsError, McpServer[R & R1]] =
@@ -599,14 +620,6 @@ final class McpServer[-R] private (
       case McpMethodError.Domain(code, message, data) =>
         Response.json(JsonRpcError(Some(id), ErrorDetail(code, message, data)).toJson)
   /**
-   * Key for signing the opaque `requestState` this server hands out on an
-   * `input_required` result. It never leaves the process: the state itself
-   * round-trips through the client, and only its signature proves it came from
-   * here unmodified.
-   */
-  private val requestStateKey: Array[Byte] = RequestState.randomKey
-
-  /**
    * The MRTR input a modern request carries: the answers the client sent keyed
    * by correlation id, the verified `requestState`, and the capabilities the
    * client declared (so a handler only asks for input the client can answer).
@@ -622,7 +635,7 @@ final class McpServer[-R] private (
       notifications: Option[Queue[JsonRpcMessage]] = None,
       progressToken: Option[Json] = None,
       logLevel: Option[com.jamesward.ziohttp.mcp.LogLevel] = None,
-    ): McpToolContext =
+    ): UIO[McpToolContext] =
       McpToolContext.modern(
         responses, principal, pathParams, notifications, progressToken, logLevel, state, capabilities,
       )
@@ -644,27 +657,27 @@ final class McpServer[-R] private (
             if malformed.isEmpty then Right(obj.fields.toMap)
             else Left(s"'inputResponses' entries must be objects: ${malformed.mkString(", ")}")
 
-    val state: Either[String, Option[String]] =
-      params.flatMap(_.get("requestState")) match
-        case None => Right(None)
-        case Some(json) =>
-          json.asString.toRight("'requestState' must be the string the server issued").flatMap: signed =>
-            RequestState.verify(requestStateKey, signed)
-              .toRight("'requestState' failed integrity verification")
-              .map(Some(_))
-
     val capabilities = McpMeta.raw(McpMeta.of(params), McpMeta.ClientCapabilities).flatMap(_.asObject)
 
-    ZIO.fromEither(responses.flatMap(r => state.map(ModernInput(r, _, capabilities))))
+    val state: ZIO[Any, String, Option[String]] =
+      params.flatMap(_.get("requestState")) match
+        case None => ZIO.none
+        case Some(json) =>
+          ZIO.fromEither(json.asString.toRight("'requestState' must be the string the server issued"))
+            .flatMap: token =>
+              requestStateStore.resolve(token)
+                .someOrFail("'requestState' failed integrity verification")
+                .asSome
+
+    (ZIO.fromEither(responses) <*> state)
+      .map((r, s) => ModernInput(r, s, capabilities))
       .mapError(message => jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, message))
 
   /** The `input_required` result for a handler that stopped for client input,
-    * with the state it set for the next round signed on the way out. */
-  private def inputRequiredJson(signal: McpToolContext.InputRequiredSignal): Json.Obj =
-    InputRequiredResult(
-      signal.requests,
-      signal.requestState.map(RequestState.sign(requestStateKey, _)),
-    ).toResultJson(serverInfo)
+    * with the state it set for the next round issued on the way out. */
+  private def inputRequiredJson(signal: McpToolContext.InputRequiredSignal): UIO[Json.Obj] =
+    ZIO.foreach(signal.requestState)(requestStateStore.issue).map: issued =>
+      InputRequiredResult(signal.requests, issued).toResultJson(serverInfo)
 
   /**
    * Modern (2026-07-28) `prompts/get`. `input_required` is universal in
@@ -688,17 +701,18 @@ final class McpServer[-R] private (
             ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, s"Unknown prompt: ${getParams.name.value}"))
           case Some(prompt) =>
             modernInput(id, params).flatMap: input =>
-              prompt.getWithContext(getParams.arguments.getOrElse(Map.empty), input.context(principal, pathParams))
-                .foldCauseZIO(
-                  cause =>
-                    cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
-                      case Some(signal) => ZIO.succeed(rawResultResponse(id, inputRequiredJson(signal)))
-                      case None =>
-                        val message = cause.failureOption.map(_.message)
-                          .getOrElse("Prompt execution failed")
-                        ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, message)),
-                  result => resultResponse(id, version, result),
-                )
+              input.context(principal, pathParams).flatMap: ctx =>
+                prompt.getWithContext(getParams.arguments.getOrElse(Map.empty), ctx)
+                  .foldCauseZIO(
+                    cause =>
+                      cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
+                        case Some(signal) => inputRequiredJson(signal).map(rawResultResponse(id, _))
+                        case None =>
+                          val message = cause.failureOption.map(_.message)
+                            .getOrElse("Prompt execution failed")
+                          ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InternalError, message)),
+                    result => resultResponse(id, version, result),
+                  )
 
   /**
    * Modern (2026-07-28) `tools/call`. The tool runs against a
@@ -742,17 +756,17 @@ final class McpServer[-R] private (
                 if progressToken.isDefined || logLevel.isDefined then
                   modernStreamedToolCall(id, tool, callParams, input, principal, pathParams, progressToken, logLevel)
                 else
-                  val ctx = input.context(principal, pathParams)
-                  tool.callWithContext(callParams.arguments, ctx)
-                    .foldCauseZIO(
-                      cause => ZIO.succeed(rawResultResponse(id, modernToolFailureJson(cause))),
-                      result => resultResponse(id, version, result),
-                    )
+                  input.context(principal, pathParams).flatMap: ctx =>
+                    tool.callWithContext(callParams.arguments, ctx)
+                      .foldCauseZIO(
+                        cause => modernToolFailureJson(cause).map(rawResultResponse(id, _)),
+                        result => resultResponse(id, version, result),
+                      )
 
   /** The final result object for a failed modern tool call: an
     * [[InputRequiredResult]] when the failure is an MRTR input signal,
     * otherwise a generic `isError` [[CallToolResult]] in the modern envelope. */
-  private def modernToolFailureJson(cause: Cause[Any]): Json.Obj =
+  private def modernToolFailureJson(cause: Cause[Any]): UIO[Json.Obj] =
     cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
       case Some(signal) =>
         inputRequiredJson(signal)
@@ -762,7 +776,7 @@ final class McpServer[-R] private (
           isError = Some(true),
         )
         val obj = callToolResultJson(errorResult).asObject.getOrElse(Json.Obj())
-        ModernEnvelope.complete(obj, serverInfo, cacheable = false)
+        ZIO.succeed(ModernEnvelope.complete(obj, serverInfo, cacheable = false))
 
   /** Modern `tools/call` answered as an SSE stream: the tool runs on a forked
     * fiber feeding request-scoped notifications into the stream, and the final
@@ -778,11 +792,11 @@ final class McpServer[-R] private (
     logLevel: Option[com.jamesward.ziohttp.mcp.LogLevel],
   ): ZIO[R, Response, Response] =
     Queue.unbounded[JsonRpcMessage].flatMap: queue =>
-      val ctx = input.context(principal, pathParams, Some(queue), progressToken, logLevel)
-      Promise.make[Nothing, Json].flatMap: resultPromise =>
+      input.context(principal, pathParams, Some(queue), progressToken, logLevel).flatMap: ctx =>
+       Promise.make[Nothing, Json].flatMap: resultPromise =>
         val runTool = tool.callWithContext(callParams.arguments, ctx)
           .foldCauseZIO(
-            cause => ZIO.succeed(modernToolFailureJson(cause)),
+            cause => modernToolFailureJson(cause),
             result =>
               val obj = callToolResultJson(result).asObject.getOrElse(Json.Obj())
               ZIO.succeed(ModernEnvelope.complete(obj, serverInfo, cacheable = false)),
@@ -810,7 +824,7 @@ final class McpServer[-R] private (
       now    <- Clock.instant.map(_.toEpochMilli)
       record  = TaskRecord.create(now)
       taskId  = record.task.taskId
-      ctx     = McpToolContext.modern(Map.empty, principal, pathParams)
+      ctx    <- McpToolContext.modern(Map.empty, principal, pathParams)
       run     = tool.callWithContext(callParams.arguments, ctx).flatMap: result =>
                   Clock.instant.map(_.toEpochMilli).flatMap: t =>
                     store.update(_.updatedWith(taskId)(_.map(r => r.copy(
@@ -1024,7 +1038,7 @@ final class McpServer[-R] private (
               McpDispatchMethod.parse(method) match
                 case Some(dm) =>
                   dispatchMethod(id, dm, client.protocolVersion, params, principal, pathParams,
-                    handleToolsCall(request, _, _, state.pendingRequests, principal, pathParams))
+                    handleToolsCall(request, _, _, state.pendingRequests, state.serverRequestIds, principal, pathParams))
                 case None =>
                   dispatchExtension(request, id, method, client.protocolVersion, params, ctx)
 
@@ -1218,6 +1232,7 @@ final class McpServer[-R] private (
     id: RequestId,
     params: Option[Json.Obj],
     pendingReqs: Ref[Map[RequestId, Promise[Nothing, Json]]],
+    serverRequestIds: Ref[Int],
     principal: Option[Principal],
     pathParams: Map[String, String],
   ): ZIO[R, Response, Response] =
@@ -1229,7 +1244,7 @@ final class McpServer[-R] private (
           enforceToolScopes(request, principal, tool) *> {
             val progressToken = params.flatMap(_.get("_meta")).flatMap(_.asObject).flatMap(_.get("progressToken"))
             Queue.unbounded[JsonRpcMessage].flatMap: queue =>
-              val ctx = McpToolContext.make(queue, pendingReqs, progressToken, principal, pathParams)
+              val ctx = McpToolContext.make(queue, pendingReqs, serverRequestIds, progressToken, principal, pathParams)
               val toolEffect = tool.callWithContext(callParams.arguments, ctx)
 
               // Fork the tool, stream messages + result as SSE
@@ -1721,22 +1736,38 @@ object McpServer:
     def pendingRequests: Ref[Map[RequestId, Promise[Nothing, Json]]]
     /** In-memory store for the 2026-07-28 Tasks extension. */
     def tasks: Ref[Map[TaskId, TaskRecord]]
+    /**
+     * Ids for the JSON-RPC requests a legacy (2025-11-25) server sends back down
+     * the session's SSE back-channel — sampling, elicitation, `roots/list`. They
+     * must be unique per session per requestor, and concurrent tool calls on one
+     * session are keyed into the same [[pendingRequests]] map, so the counter is
+     * shared rather than per call. Defaults to a process-wide counter, which
+     * satisfies that for any number of sessions in one process.
+     */
+    def serverRequestIds: Ref[Int] = State.processRequestIds
 
     private[mcp] def sessionClient(sessionId: SessionId): UIO[Option[McpSessionClient]] = ZIO.none
     private[mcp] def retainSessionClient(sessionId: SessionId, client: McpSessionClient): UIO[Unit] = ZIO.unit
     private[mcp] def removeSessionClient(sessionId: SessionId): UIO[Unit] = ZIO.unit
 
   object State:
+    /** Fallback for [[State.serverRequestIds]] when an implementation does not
+      * provide one of its own. */
+    private val processRequestIds: Ref[Int] =
+      Unsafe.unsafe(implicit unsafe => Ref.unsafe.make(0))
+
     val default: ULayer[State] = ZLayer.fromZIO:
       for
         s <- Ref.make(Map.empty[SessionId, SessionState])
         p <- Ref.make(Map.empty[RequestId, Promise[Nothing, Json]])
         t <- Ref.make(Map.empty[TaskId, TaskRecord])
         c <- Ref.make(Map.empty[SessionId, McpSessionClient])
+        r <- Ref.make(0)
       yield new State:
         val sessions = s
         val pendingRequests = p
         val tasks = t
+        override val serverRequestIds = r
 
         private[mcp] override def sessionClient(sessionId: SessionId): UIO[Option[McpSessionClient]] =
           c.get.map(_.get(sessionId))

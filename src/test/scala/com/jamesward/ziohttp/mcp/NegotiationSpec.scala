@@ -81,8 +81,9 @@ object NegotiationSpec extends ZIOSpecDefault:
     name: Option[String] = None,
     protocolHeader: Option[String] = Some(Modern),
     methodHeader: Option[String] = None,
+    path: String = "/mcp",
   ): ZIO[Client & Scope, Throwable, Response] =
-    val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
+    val url = URL.decode(s"http://localhost:$port$path").toOption.get
     var req = Request.post(url, Body.fromString(body))
       .addHeader(Header.ContentType(MediaType.application.json))
       .addHeader("accept", "application/json, text/event-stream")
@@ -738,6 +739,78 @@ object NegotiationSpec extends ZIOSpecDefault:
         state2 != state1,
         methodOfRequest(b2, "step2").contains("elicitation/create"),
         textOf(b3).contains("done: blue"),
+      )
+    ,
+
+    test("two servers sharing a secret accept each other's requestState"):
+      // What a replicated deployment does: round one lands on one instance, the
+      // retry on another. Only the secret is shared — no state crosses between
+      // them, it rides in the client.
+      val shared = McpRequestStateStore.signed("shared-signing-secret")
+      // Two independent servers, each with its own store, mounted side by side
+      // so a round trip can be aimed at either.
+      val replicaA = McpServer("replica", "1.0.0").tool(statefulTool).requestStateStore(shared).mountedAt("/a")
+      val replicaB = McpServer("replica", "1.0.0").tool(statefulTool).requestStateStore(shared).mountedAt("/b")
+      val call1 = modernBody(1, "tools/call", Chunk("name" -> Json.Str("two_step"), "arguments" -> Json.Obj()))
+      for
+        port  <- Server.install(replicaA.routes ++ replicaB.routes)
+        r1    <- postModern(port, call1, "tools/call", name = Some("two_step"), path = "/a")
+        b1    <- bodyJson(r1)
+        state1 = stateOf(b1).getOrElse("")
+        // round two on the OTHER instance
+        call2  = retryBody(2, "two_step", Chunk("step1" -> elicitedJson("name", "Ada")), Some(state1))
+        r2    <- postModern(port, call2, "tools/call", name = Some("two_step"), path = "/b")
+        b2    <- bodyJson(r2)
+        state2 = stateOf(b2).getOrElse("")
+        // and round three back on the first
+        call3  = retryBody(3, "two_step", Chunk("step2" -> elicitedJson("color", "blue")), Some(state2))
+        r3    <- postModern(port, call3, "tools/call", name = Some("two_step"), path = "/a")
+        b3    <- bodyJson(r3)
+      yield assertTrue(isInputRequired(b1), isInputRequired(b2), textOf(b3).contains("done: blue"))
+    ,
+
+    test("without a shared secret another instance rejects the state"):
+      // The default signer keys itself per instance, so this is what a
+      // replicated deployment looks like when it forgets to configure one.
+      val instanceA = McpServer("solo", "1.0.0").tool(statefulTool).mountedAt("/solo-a")
+      val instanceB = McpServer("solo", "1.0.0").tool(statefulTool).mountedAt("/solo-b")
+      val call1 = modernBody(1, "tools/call", Chunk("name" -> Json.Str("two_step"), "arguments" -> Json.Obj()))
+      for
+        port  <- Server.install(instanceA.routes ++ instanceB.routes)
+        r1    <- postModern(port, call1, "tools/call", name = Some("two_step"), path = "/solo-a")
+        b1    <- bodyJson(r1)
+        state1 = stateOf(b1).getOrElse("")
+        call2  = retryBody(2, "two_step", Chunk("step1" -> elicitedJson("name", "Ada")), Some(state1))
+        r2    <- postModern(port, call2, "tools/call", name = Some("two_step"), path = "/solo-b")
+        b2    <- bodyJson(r2)
+      yield assertTrue(codeOf(b2).contains(ErrorCode.InvalidParams.code))
+    ,
+
+    test("a server-side store hands out handles and rejects unknown ones"):
+      for
+        store <- McpRequestStateStore.inMemory()
+        server = McpServer("stored", "1.0.0").tool(statefulTool).requestStateStore(store)
+        port  <- Server.install(server.routes)
+        call1  = modernBody(1, "tools/call", Chunk("name" -> Json.Str("two_step"), "arguments" -> Json.Obj()))
+        r1    <- postModern(port, call1, "tools/call", name = Some("two_step"))
+        b1    <- bodyJson(r1)
+        handle = stateOf(b1).getOrElse("")
+        call2  = retryBody(2, "two_step", Chunk("step1" -> elicitedJson("name", "Ada")), Some(handle))
+        r2    <- postModern(port, call2, "tools/call", name = Some("two_step"))
+        b2    <- bodyJson(r2)
+        state2 = stateOf(b2).getOrElse("")
+        call3  = retryBody(3, "two_step", Chunk("step2" -> elicitedJson("color", "blue")), Some(state2))
+        r3    <- postModern(port, call3, "tools/call", name = Some("two_step"))
+        b3    <- bodyJson(r3)
+        // a handle this store never issued
+        call4  = retryBody(4, "two_step", Chunk("step1" -> elicitedJson("name", "Ada")), Some("not-a-handle"))
+        r4    <- postModern(port, call4, "tools/call", name = Some("two_step"))
+        b4    <- bodyJson(r4)
+      yield assertTrue(
+        // the handle carries no state of its own — the state stayed on the server
+        !handle.contains("round-1"),
+        textOf(b3).contains("done: blue"),
+        codeOf(b4).contains(ErrorCode.InvalidParams.code),
       )
     ,
 
