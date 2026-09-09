@@ -191,14 +191,25 @@ state with a key generated for that server instance — right for a single serve
 wrong for a replicated one: a retry that lands on another replica carries state
 that replica's key cannot verify, and is rejected with `-32602`.
 
-Give every replica the same secret and any of them can serve any round trip.
-Nothing is stored server-side — the state still rides in the client, so there is
-no store to replicate:
+The store is a state provider, so it lives in the `McpServer.State` layer
+alongside the session and task state. Give every replica the same secret and any
+of them can serve any round trip — and note that nothing is stored server-side:
+the state still rides in the client, so there is no store to replicate.
 
 ```scala
-McpServer("my-server", "1.0.0")
-  .tool(twoStepTool)
-  .requestStateStore(McpRequestStateStore.signed(sys.env("MCP_STATE_SECRET")))
+Server.serve(server.routes).provide(
+  Server.default,
+  McpServer.State.layer(McpRequestStateStore.signed(sys.env("MCP_STATE_SECRET"))),
+)
+```
+
+`McpServer.State.default` is that layer with a key generated per layer instance.
+Servers sharing a layer share its store. `statelessRoutes` take no layer, so
+configure those on the server itself — which also overrides the layer, if you
+want one server to differ:
+
+```scala
+server.requestStateStore(McpRequestStateStore.signed(sys.env("MCP_STATE_SECRET")))
 ```
 
 To keep the state server-side instead — because it is large, or must not be

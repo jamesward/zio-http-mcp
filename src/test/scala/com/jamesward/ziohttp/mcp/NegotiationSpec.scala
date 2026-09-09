@@ -769,11 +769,30 @@ object NegotiationSpec extends ZIOSpecDefault:
       yield assertTrue(isInputRequired(b1), isInputRequired(b2), textOf(b3).contains("done: blue"))
     ,
 
-    test("without a shared secret another instance rejects the state"):
-      // The default signer keys itself per instance, so this is what a
-      // replicated deployment looks like when it forgets to configure one.
-      val instanceA = McpServer("solo", "1.0.0").tool(statefulTool).mountedAt("/solo-a")
-      val instanceB = McpServer("solo", "1.0.0").tool(statefulTool).mountedAt("/solo-b")
+    test("the State layer supplies the store to every server sharing it"):
+      // No per-server configuration: both read the store from the layer this
+      // suite provides, which is how one deployment's servers agree.
+      val fromLayerA = McpServer("layered", "1.0.0").tool(statefulTool).mountedAt("/layer-a")
+      val fromLayerB = McpServer("layered", "1.0.0").tool(statefulTool).mountedAt("/layer-b")
+      val call1 = modernBody(1, "tools/call", Chunk("name" -> Json.Str("two_step"), "arguments" -> Json.Obj()))
+      for
+        port  <- Server.install(fromLayerA.routes ++ fromLayerB.routes)
+        r1    <- postModern(port, call1, "tools/call", name = Some("two_step"), path = "/layer-a")
+        b1    <- bodyJson(r1)
+        state1 = stateOf(b1).getOrElse("")
+        call2  = retryBody(2, "two_step", Chunk("step1" -> elicitedJson("name", "Ada")), Some(state1))
+        r2    <- postModern(port, call2, "tools/call", name = Some("two_step"), path = "/layer-b")
+        b2    <- bodyJson(r2)
+      yield assertTrue(isInputRequired(b1), isInputRequired(b2))
+    ,
+
+    test("independently keyed stores reject each other's state"):
+      // Two deployments that never agreed on a store — what a replicated one
+      // looks like when each replica keys itself, as the default does.
+      val instanceA = McpServer("solo", "1.0.0").tool(statefulTool)
+        .requestStateStore(McpRequestStateStore.ephemeral).mountedAt("/solo-a")
+      val instanceB = McpServer("solo", "1.0.0").tool(statefulTool)
+        .requestStateStore(McpRequestStateStore.ephemeral).mountedAt("/solo-b")
       val call1 = modernBody(1, "tools/call", Chunk("name" -> Json.Str("two_step"), "arguments" -> Json.Obj()))
       for
         port  <- Server.install(instanceA.routes ++ instanceB.routes)

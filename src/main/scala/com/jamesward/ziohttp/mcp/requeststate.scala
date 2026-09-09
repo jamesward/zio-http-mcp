@@ -119,19 +119,27 @@ object McpRequestStateStore:
    * retry exactly like an expired one.
    */
   def inMemory(capacity: Int = 10000): UIO[McpRequestStateStore] =
-    for
-      entries <- Ref.make(Chunk.empty[(String, String)])
-      counter <- Ref.make(0L)
-    yield new McpRequestStateStore:
-      def issue(state: String): UIO[String] =
-        for
-          next  <- counter.updateAndGet(_ + 1)
-          token  = s"$next-${java.util.UUID.randomUUID()}"
-          _     <- entries.update(kept => (kept :+ (token -> state)).takeRight(capacity))
-        yield token
+    // Eviction is FIFO, which is Queue-shaped, but a Queue cannot hold this on
+    // its own: resolving is a keyed lookup, and `Queue.sliding` drops the oldest
+    // without saying which, so whatever kept the states for lookup would leak
+    // the ones it dropped. One Ref over both the map and the order keeps the
+    // eviction and the lookup table in step, in a single atomic update.
+    Ref.make(Entries(Map.empty, Chunk.empty)).map: entries =>
+      new McpRequestStateStore:
+        def issue(state: String): UIO[String] =
+          ZIO.succeed(java.util.UUID.randomUUID().toString).tap: token =>
+            entries.update(_.add(token, state, capacity))
 
-      def resolve(token: String): UIO[Option[String]] =
-        entries.get.map(_.collectFirst { case (t, state) if t == token => state })
+        def resolve(token: String): UIO[Option[String]] =
+          entries.get.map(_.byToken.get(token))
+
+  private final case class Entries(byToken: Map[String, String], order: Chunk[String]):
+    def add(token: String, state: String, capacity: Int): Entries =
+      val grown = Entries(byToken.updated(token, state), order :+ token)
+      if grown.order.length <= capacity then grown
+      else
+        val (evicted, kept) = grown.order.splitAt(grown.order.length - capacity)
+        Entries(evicted.foldLeft(grown.byToken)(_ - _), kept)
 
   private final case class Signed(key: Array[Byte]) extends McpRequestStateStore:
     def issue(state: String): UIO[String] = ZIO.succeed(RequestState.sign(key, state))
