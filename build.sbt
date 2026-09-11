@@ -19,13 +19,13 @@ val zioVersion = "2.1.26"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                   % zioVersion,
-  "dev.zio" %% "zio-http"              % "3.11.4",
-  "dev.zio" %% "zio-schema-derivation" % "1.8.6",
-  "dev.zio" %% "zio-schema-json"       % "1.8.6",
+  "dev.zio" %% "zio-http"              % "3.11.5",
+  "dev.zio" %% "zio-schema-derivation" % "1.9.0",
+  "dev.zio" %% "zio-schema-json"       % "1.9.0",
 
   "com.guizmaii" %% "scala-nimbus-jose-jwt-zio" % "4.1.5",
 
-  "org.slf4j" % "slf4j-simple" % "2.0.18" % Test,
+  "org.slf4j" % "slf4j-simple" % "2.0.19" % Test,
 
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
@@ -38,7 +38,7 @@ libraryDependencies ++= Seq(
 
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
-  "dev.tachyonmcp" % "tachyon-core" % "1.0.0-beta.23" % Test,
+  "dev.tachyonmcp" % "tachyon-core" % "1.0.0-beta.25" % Test,
 )
 
 fork := true
