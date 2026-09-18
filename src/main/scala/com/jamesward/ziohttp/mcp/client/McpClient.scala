@@ -696,7 +696,21 @@ object McpClient:
       transport.rpc[Json.Obj]("ping", Json.Obj()).unit
 
     def listTools: IO[McpClientError, Chunk[ToolDefinition]] =
-      transport.rpc[ToolsListResult]("tools/list", Json.Obj()).map(_.tools)
+      def loop(
+        cursor: Option[String],
+        seen: Set[String],
+        accumulated: Chunk[ToolDefinition],
+      ): IO[McpClientError, Chunk[ToolDefinition]] =
+        val params = cursor.fold(Json.Obj())(value => asObj(ToolsListParams(Some(value))))
+        transport.rpc[ToolsListResult]("tools/list", params).flatMap: page =>
+          val all = accumulated ++ page.tools
+          page.nextCursor match
+            case None => ZIO.succeed(all)
+            case Some(next) if seen.contains(next) =>
+              ZIO.fail(McpClientError.Protocol(s"tools/list repeated pagination cursor '$next'"))
+            case Some(next) => loop(Some(next), seen + next, all)
+
+      loop(None, Set.empty, Chunk.empty)
 
     def callTool(name: String, arguments: Json.Obj): IO[McpClientError, CallToolResult] =
       val argOpt = if arguments.fields.isEmpty then None else Some(arguments)
