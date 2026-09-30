@@ -559,6 +559,8 @@ val skillsJarsServer =
     .resourceSource(jars.resources)
 ```
 
+Your own project's skills load the same way: put them in the same layout under `src/main/resources/META-INF/skills/` (for example `META-INF/skills/my-skill/SKILL.md`, served as `skill://my-skill/SKILL.md`), and they are served alongside any SkillsJars dependencies.
+
 Skills with invalid `SKILL.md` frontmatter, or that go over the static-entry limits, are left out with a logged warning and listed in `jars.skipped`. `McpSkillsJars.load(classLoader)` scans a specific class loader instead of the thread's context class loader.
 
 ### MCP Apps

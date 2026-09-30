@@ -14,10 +14,14 @@ import java.security.MessageDigest
 
 // Exercises McpSkillsJars against real SkillsJars pulled in as test-scope dependencies
 // (see build.sbt): com.skillsjars:anthropics__skills__pdf and
-// com.skillsjars:anthropics__skills__brand-guidelines.
+// com.skillsjars:anthropics__skills__brand-guidelines, plus same-project skills in the
+// SkillsJars layout under src/test/resources/META-INF/skills/.
 object McpSkillsJarsSpec extends ZIOSpecDefault:
   private val pdfUri = "skill://anthropics/skills/pdf/SKILL.md"
   private val brandUri = "skill://anthropics/skills/brand-guidelines/SKILL.md"
+  private val greetingUri = "skill://local-greeting/SKILL.md"
+  private val releaseNotesUri = "skill://jamesward/zio-http-mcp/release-notes/SKILL.md"
+  private val allUris = Set(pdfUri, brandUri, greetingUri, releaseNotesUri)
 
   private def classpathBytes(path: String): Array[Byte] =
     val stream = getClass.getClassLoader.getResourceAsStream(path)
@@ -72,7 +76,7 @@ object McpSkillsJarsSpec extends ZIOSpecDefault:
       yield
         val bodyText = body.headOption.flatMap(_.text).getOrElse("")
         assertTrue(
-          page.skills.map(_.uri.value).toSet == Set(pdfUri, brandUri),
+          page.skills.map(_.uri.value).toSet == allUris,
           page.nextCursor.isEmpty,
           fetched == jars.entries.find(_.uri.value == pdfUri).get,
           bodyText.startsWith("---"),
@@ -86,7 +90,7 @@ object McpSkillsJarsSpec extends ZIOSpecDefault:
           scripts.resources.exists(_.uri == scriptUri.value),
           script.headOption.flatMap(_.text).exists(_.nonEmpty),
           script.headOption.flatMap(_.mimeType).contains("text/x-python"),
-          listed.map(_.uri).toSet == Set(pdfUri, brandUri),
+          listed.map(_.uri).toSet == allUris,
           listed.find(_.uri == pdfUri).flatMap(_.description).exists(_.contains("PDF")),
           errorCode(unknown).contains(ErrorCode.InvalidParams.code),
           errorCode(notDir).contains(ErrorCode.InvalidParams.code),
@@ -109,7 +113,7 @@ object McpSkillsJarsSpec extends ZIOSpecDefault:
         yield
           val resources = staticResources(pdf)
           assertTrue(
-            jars.entries.map(_.uri.value).toSet == Set(pdfUri, brandUri),
+            jars.entries.map(_.uri.value).toSet == allUris,
             jars.skipped.isEmpty,
             pdf.frontmatter.value.get("name").contains(Json.Str("pdf")),
             pdf.frontmatter.value.get("license").flatMap(_.asString).exists(_.contains("LICENSE.txt")),
@@ -128,6 +132,59 @@ object McpSkillsJarsSpec extends ZIOSpecDefault:
             resource.digest.value == sha256(bytes) && resource.size.bytes == bytes.length.toLong
           assertTrue(checks.size > 1, checks.forall(ok => ok))
       ,
+      test("same-project skills in src/test/resources load alongside the SkillsJars"):
+        for
+          jars     <- McpSkillsJars.load
+          greeting <- entry(jars, greetingUri)
+          release  <- entry(jars, releaseNotesUri)
+        yield
+          val digestsMatch = (staticResources(greeting) ++ staticResources(release)).map: resource =>
+            val bytes = classpathBytes("META-INF/skills/" + resource.uri.value.stripPrefix("skill://"))
+            resource.digest.value == sha256(bytes) && resource.size.bytes == bytes.length.toLong
+          assertTrue(
+            greeting.uri.name.value == "local-greeting",
+            greeting.frontmatter.value.get("license").contains(Json.Str("MIT")),
+            greeting.frontmatter.value.get("metadata").contains(Json.Obj("version" -> Json.Str("1"))),
+            staticResources(greeting).map(_.uri.value) == Chunk(
+              greetingUri,
+              "skill://local-greeting/references/tone.md",
+            ),
+            release.frontmatter.value.get("description").flatMap(_.asString)
+              .exists(_.startsWith("Drafts release notes for zio-http-mcp")),
+            staticResources(release).map(_.uri.value) == Chunk(
+              releaseNotesUri,
+              "skill://jamesward/zio-http-mcp/release-notes/scripts/collect.sh",
+            ),
+            digestsMatch.forall(ok => ok),
+          )
+      ,
+      test("same-project skills are served over MCP"):
+        ZIO.scoped:
+          for
+            jars     <- McpSkillsJars.load
+            server    = McpServer("skills", "1.0.0")
+                          .withExtensions(jars.extensions)
+                          .resourceSource(jars.resources)
+            port     <- Server.install(server.routes)
+            skills   <- McpSkillsClient.connect(config(port, ProtocolVersion.V2026_07_28))
+            uri      <- ZIO.fromEither(McpSkillUri.parse(greetingUri))
+            fetched  <- skills.get(uri)
+            body     <- skills.readSkill(uri)
+            root     <- skills.readDirectory("skill://local-greeting")
+            toneUri  <- ZIO.fromEither(McpSkillResourceUri.parse("skill://local-greeting/references/tone.md"))
+            tone     <- skills.readResource(toneUri)
+            scripts  <- skills.readDirectory("skill://jamesward/zio-http-mcp/release-notes/scripts")
+          yield assertTrue(
+            fetched == jars.entries.find(_.uri.value == greetingUri).get,
+            body.headOption.flatMap(_.text).exists(_.contains("# Local greeting")),
+            root.resources.map(r => r.name -> r.mimeType) == Chunk(
+              "references" -> Some("inode/directory"),
+              "SKILL.md" -> Some("text/markdown"),
+            ),
+            tone.headOption.flatMap(_.text).exists(_.contains("Warm, brief")),
+            scripts.resources.map(r => r.name -> r.mimeType) == Chunk("collect.sh" -> Some("text/x-shellscript")),
+          )
+      ,
       test("legacy loopback: list/get/read/directory over the Skills extension"):
         exercise(ProtocolVersion.V2025_11_25)
       ,
@@ -144,7 +201,7 @@ object McpSkillsJarsSpec extends ZIOSpecDefault:
             port   <- Server.install(server.routes)
             skills <- McpSkillsClient.connect(config(port, ProtocolVersion.V2026_07_28))
             page   <- skills.list()
-          yield assertTrue(page.skills.map(_.uri.name.value).toSet == Set("pdf", "brand-guidelines"))
+          yield assertTrue(page.skills.map(_.uri.name.value).toSet == Set("pdf", "brand-guidelines", "local-greeting", "release-notes"))
       ,
       test("directory classpath entries load, and invalid skills are skipped"):
         ZIO.scoped:
