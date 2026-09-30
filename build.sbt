@@ -28,7 +28,7 @@ libraryDependencies ++= Seq(
   // YAML 1.2 parser for SKILL.md frontmatter in McpSkillsJars.
   "org.snakeyaml" % "snakeyaml-engine" % "3.1.1",
 
-  "org.slf4j" % "slf4j-simple" % "2.0.19" % Test,
+  "org.slf4j" % "slf4j-simple" % "2.0.20" % Test,
 
   "dev.zio" %% "zio-test"           % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt"       % zioVersion % Test,
