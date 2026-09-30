@@ -541,6 +541,28 @@ val useSkills = ZIO.scoped:
 
 `McpSkillUri`, `McpSkillDigest`, and `McpSkillSize` are parsed values. Construct static entries with `McpSkillEntry.static`; it enforces the 512-resource and 16 MiB limits, unique in-skill URIs, and exactly one manifest entry for the skill's `SKILL.md`.
 
+#### SkillsJars
+
+`McpSkillsJars` serves [SkillsJars](https://skillsjars.com) — Agent Skills packaged as JARs on Maven Central under `com.skillsjars` — straight from the classpath. Add the SkillsJars as ordinary dependencies:
+
+```scala
+libraryDependencies += "com.skillsjars" % "anthropics__skills__pdf" % "2026_02_25-3d59511"
+```
+
+Every `META-INF/skills/<owner>/<repo>/<skill>/SKILL.md` becomes the skill `skill://<owner>/<repo>/<skill>/SKILL.md`, and the files next to it become its static resources, each with a SHA-256 digest. They are listed and fetched through `skills/list`/`skills/get`, browsed through `resources/directory/read`, and read through core `resources/read`:
+
+```scala
+val skillsJarsServer =
+  for jars <- McpSkillsJars.load
+  yield McpServer("skills", "1.0.0")
+    .withExtensions(jars.extensions)
+    .resourceSource(jars.resources)
+```
+
+Your own project's skills load the same way: put them in the same layout under `src/main/resources/META-INF/skills/` (for example `META-INF/skills/my-skill/SKILL.md`, served as `skill://my-skill/SKILL.md`), and they are served alongside any SkillsJars dependencies.
+
+Skills with invalid `SKILL.md` frontmatter, or that go over the static-entry limits, are left out with a logged warning and listed in `jars.skipped`. `McpSkillsJars.load(classLoader)` scans a specific class loader instead of the thread's context class loader.
+
 ### MCP Apps
 
 Apps support is capability-only on the server. Typed helpers emit only the stable nested `_meta.ui` form, preserve unrelated metadata, and guarantee a meaningful text fallback for clients that do not render Apps.

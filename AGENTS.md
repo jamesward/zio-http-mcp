@@ -9,6 +9,7 @@ Every code example in README.md must have a corresponding test. Tests live in:
 - `TokenVerifierSpec` — for `TokenVerifier.discoverJwks` / `.jwks` / `.introspection` behavior
 - `LiveAuthSpec` — for end-to-end DCR + token + tool-call validation (raw HTTP) against `login.jamesward.dev`
 - `JavaSdkAuthSpec` — for end-to-end Java MCP SDK interop with a bearer token against `login.jamesward.dev`
+- `McpSkillsJarsSpec` — for the SkillsJars example (`McpSkillsJars.load`, serving classpath skills), exercised against real SkillsJars declared as test-scope dependencies in `build.sbt`
 - `McpClientSpec` — for client examples (`McpClient.connect`, `listTools`, `callTool`, resources, error handling) against our own `McpServer` over loopback HTTP; also covers the legacy-pinned (`preferredVersion = V2025_11_25`) client
 - `McpClientModernSpec` — for the modern (2026-07-28) client examples: `server/discover` negotiation, stateless calls, the `onInputRequest` (MRTR) example, and the multi-round exchange where the client echoes the server's `requestState`
 - `NegotiationSpec` — for protocol version negotiation: era detection, header validation, `server/discover`, the modern result envelope, version/header error responses, modern request-scoped notification streaming (`_meta.progressToken` / `_meta.io.modelcontextprotocol/logLevel` → SSE), and MRTR (SEP-2322) — keyed `inputRequests`/`inputResponses`, `ctx.inputs` batching, signed `requestState` across rounds and its rejection when tampered, `McpRequestStateStore` (a shared secret letting two servers serve each other's rounds, the `McpServer.State` layer supplying one store to every server on it, independently keyed stores refusing each other, and a server-side store handing out handles), capability-gated input, malformed `inputResponses`, and `prompts/get` asking for input
@@ -27,6 +28,7 @@ When adding or modifying a README example, add or update the matching test in th
 - Run `./sbt "testOnly *McpToolSpec*"` for tool DSL unit tests
 - Run `./sbt "testOnly *AuthSpec* *ProtectedResourceMetadataSpec* *TokenVerifierSpec*"` for auth unit tests
 - Run `./sbt "testOnly *LiveAuthSpec* *JavaSdkAuthSpec*"` for end-to-end auth tests against `login.jamesward.dev` (requires network access; tagged `live-auth` for filtering)
+- Run `./sbt "testOnly *McpSkillsJarsSpec*"` for the SkillsJars loader against the `com.skillsjars` test dependencies (loopback HTTP, no network beyond dependency resolution)
 - Run `./sbt "testOnly *McpClientSpec*"` for client unit tests against our own server (loopback HTTP, no network)
 - Run `./sbt "testOnly *McpClientLiveSpec*"` for the no-auth client test against `www.javadocs.dev` (requires network; tagged `live`)
 - Run `./sbt "testOnly *McpClientAuthSpec*"` for the client OAuth `client_credentials` test against our own auth server + `login.jamesward.dev` (requires network; tagged `live-auth`)
