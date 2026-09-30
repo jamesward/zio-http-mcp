@@ -41,7 +41,7 @@ libraryDependencies ++= Seq(
 
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
-  "dev.tachyonmcp" % "tachyon-core" % "1.0.0-beta.28" % Test,
+  "dev.tachyonmcp" % "tachyon-core" % "1.0.0-beta.31" % Test,
 
   // Real SkillsJars (https://skillsjars.com) on the test classpath for McpSkillsJarsSpec.
   "com.skillsjars" % "anthropics__skills__pdf"              % "2026_02_25-3d59511" % Test,
