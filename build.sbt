@@ -2,6 +2,13 @@ organization := "com.jamesward"
 
 name := "zio-http-mcp"
 
+
+// sbt-ci-release/sbt-git consume these from release commands rather than from
+// another setting, so sbt 2's unused-key linter cannot observe the dependency.
+Global / excludeLintKeys ++= Set(
+  com.github.sbt.git.SbtGit.GitKeys.gitUncommittedChanges,
+  com.github.sbt.git.SbtGit.GitKeys.gitDescribedVersion,
+)
 scalaVersion := "3.9.0"
 
 scalacOptions ++= Seq(
@@ -49,6 +56,21 @@ libraryDependencies ++= Seq(
 )
 
 fork := true
+
+// Tests intentionally contain many ZIOSpec entry points plus two runMain helpers;
+// none is the configuration's default application entry point.
+Test / mainClass := None
+
+javaOptions ++= {
+  val feature = java.lang.Runtime.version().feature()
+  if feature >= 24 then Seq(
+    // Scala 3.9's LazyVals runtime still uses sun.misc.Unsafe on current JDKs.
+    "--sun-misc-unsafe-memory-access=allow",
+    // Netty loads its native transport when available.
+    "--enable-native-access=ALL-UNNAMED",
+  )
+  else Seq.empty
+}
 
 javaOptions += "-Djava.net.preferIPv4Stack=true"
 

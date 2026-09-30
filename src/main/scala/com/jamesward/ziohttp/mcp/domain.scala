@@ -22,11 +22,11 @@ object ToolName:
   given JsonEncoder[ToolName] = JsonEncoder.string
   given JsonDecoder[ToolName] = JsonDecoder.string
 
-// --- RequestId (String | Int per JSON-RPC 2.0) ---
+// --- RequestId (String | integer per JSON-RPC 2.0) ---
 
 enum RequestId:
   case Str(value: String)
-  case Num(value: Int)
+  case Num(value: Long)
 
 object RequestId:
   given CanEqual[RequestId, RequestId] = CanEqual.derived
@@ -40,7 +40,9 @@ object RequestId:
   given JsonDecoder[RequestId] = JsonDecoder[Json].mapOrFail:
     case Json.Str(s) => Right(RequestId.Str(s))
     case Json.Num(n) =>
-      Right(RequestId.Num(n.intValueExact()))
+      try Right(RequestId.Num(n.longValueExact()))
+      catch
+        case _: ArithmeticException => Left(s"RequestId must be a signed 64-bit integer, got: $n")
     case other => Left(s"RequestId must be string or integer, got: $other")
 
 // --- Error Codes ---

@@ -133,7 +133,6 @@ object TypeScriptSdkDiscoverySpec extends ZIOSpecDefault:
         )
     ).provide(
       Server.defaultWith(_.onAnyOpenPort),
-      Scope.default,
     ) @@ withLiveClock @@ timeout(6.minutes) @@ sequential
 
   // Detect whether the environment has what this test needs (Node + npm). If so

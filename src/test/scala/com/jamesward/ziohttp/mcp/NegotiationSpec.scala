@@ -62,7 +62,7 @@ object NegotiationSpec extends ZIOSpecDefault:
     Json.Obj(McpMeta.ProtocolVersion -> Json.Str(version))
 
   private def modernBody(
-    id: Int,
+    id: Long,
     method: String,
     extra: Chunk[(String, Json)] = Chunk.empty,
     version: String = Modern,
@@ -248,6 +248,18 @@ object NegotiationSpec extends ZIOSpecDefault:
           r.flatMap(_.get("ttlMs")).isDefined,
           r.flatMap(_.get("cacheScope")).flatMap(_.asString).contains("public"),
         )
+    ,
+
+    test("Date.now-sized numeric request IDs are echoed without overflow"):
+      val id = 1790782840961L
+      for
+        port <- Server.install(testServer.routes)
+        resp <- postModern(port, modernBody(id, "server/discover"), "server/discover")
+        b    <- bodyJson(resp)
+      yield assertTrue(
+        resp.status == Status.Ok,
+        b.get("id").flatMap(_.asNumber).exists(_.value.longValueExact() == id),
+      )
     ,
 
     test("modern tools/list carries resultType, serverInfo _meta, and cache hints"):

@@ -391,7 +391,7 @@ object McpClient:
       for
         st     <- stateRef.get
         n      <- idRef.updateAndGet(_ + 1)
-        id      = RequestId.Num(n.toInt)
+        id      = RequestId.Num(n)
         version = st.protocolVersion.flatMap(ProtocolVersion.parse).getOrElse(config.preferredVersion)
         effParams = if st.modern then withModernMeta(params, version) else params
         body    = (JsonRpcMessage.Request(id, method, Some(effParams)): JsonRpcMessage).toJson
