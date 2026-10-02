@@ -14,3 +14,6 @@ dist
 /RUNNING_PID
 /.settings
 /.bsp/
+
+# Agent Skills extracted by the build
+/.kiro/skills/

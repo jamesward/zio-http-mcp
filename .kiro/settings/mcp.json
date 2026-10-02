@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "sbt-mcp-zio-http-mcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:5120/",
+      "timeout": 1800000,
+      "disabled": false
+    }
+  }
+}

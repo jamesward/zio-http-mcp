@@ -57,3 +57,9 @@ It also provides `retryTransientUpstream`, a `TestAspect` applied to every spec 
 `ConformanceServerMain` (in the test source tree) serves `ConformanceSpec.testServer` on a fixed port so the kit can be pointed at it without Docker.
 
 `ConformanceClientMain` (in the test source tree) is the client-under-test entrypoint for the conformance kit's client mode; it reads `MCP_CONFORMANCE_SCENARIO` / `MCP_CONFORMANCE_CONTEXT` / `MCP_CONFORMANCE_PROTOCOL_VERSION` and picks the matching `McpClientOAuth` config.
+
+## Agent tooling
+
+- Follow the `zen-of-projects` Skill (extract with `./sbt extractSkillsJars` into the gitignored `.kiro/skills/`); this file records only project-specific facts and exceptions.
+- MCP server `sbt-mcp-zio-http-mcp` (sbt-mcp) listens on `http://127.0.0.1:5120/`. Kiro uses the HTTP entry in `.kiro/settings/mcp.json`; start sbt first. Claude Code uses `.mcp.json`, which runs `.claude/sbt-mcp-stdio.sh` (approved in `.claude/settings.json`). That stdio bridge starts a foreground sbt in cloud sessions (`CLAUDE_CODE_REMOTE=true`), and locally only connects to an sbt you already started. Its tools are deferred: load them with ToolSearch (search `sbt-mcp-zio-http-mcp`). Diagnostics go to `/tmp/sbt-mcp-stdio.log` and `/tmp/sbt-mcp-server.log`.
+- Maintenance routine: `.factory/MAINTENANCE.md` (weekly), following the `zen-of-projects` Skill.
