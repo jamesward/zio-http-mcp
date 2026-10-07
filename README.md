@@ -472,7 +472,7 @@ The library supports two protocol revisions and negotiates between them per conn
 - A request carrying modern `_meta` (or naming a modern-only method such as `server/discover`) is validated (the `Mcp-Method`, `Mcp-Name`, and `MCP-Protocol-Version` headers must match the body) and served statelessly. Results are wrapped in the modern envelope (`resultType`, `_meta.io.modelcontextprotocol/serverInfo`, and `ttlMs`/`cacheScope` on cacheable results). An unsupported version returns `400` with `UnsupportedProtocolVersionError` (`-32022`) listing the supported versions; a header mismatch returns `400`/`-32020`; an unknown modern method returns `404`/`-32601`. A modern `tools/call` that opts into request-scoped notifications — a `_meta.progressToken` and/or `_meta.io.modelcontextprotocol/logLevel` — is answered as an SSE stream carrying `notifications/progress` / `notifications/message` (filtered to the requested level) followed by the final result; without the opt-in it stays a single JSON result.
 - An `initialize` request selects the legacy handshake + session path, unchanged.
 
-The server also implements the modern **Tasks extension** (`io.modelcontextprotocol/tasks`): a `tools/call` whose `_meta` carries the tasks marker runs on a background fiber and returns a task handle (`resultType: "task"`) immediately, which the client polls with `tasks/get` and cancels with `tasks/cancel`.
+The server also implements the modern **Tasks extension** — see [Tasks](#tasks).
 
 ### Client
 
@@ -496,6 +496,100 @@ val config = McpClientConfig(
 ```
 
 `client.protocolVersion` reports the negotiated revision.
+
+## Tasks
+
+The [Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview) (`io.modelcontextprotocol/tasks`, 2026-07-28) lets a long-running `tools/call` answer at once with a durable task handle that the client polls, instead of holding the request open.
+
+Like other extensions, tasks are off until you register them. `McpTasks.inMemory` keeps tasks in a `Ref` in this process:
+
+```scala
+val server =
+  for tasks <- McpTasks.inMemory
+  yield McpServer("my-server", "1.0.0")
+    .withExtensions(tasks)
+    .tool(deepResearch)
+    .tool(bookFlight)
+```
+
+`withExtensions` takes one registry, so combine it with others first: `McpSkills(source) ++ tasks` (an `Either`, failing on a duplicate extension or method).
+
+Task creation is server-directed. A client only declares that it can handle tasks, and the tool decides:
+
+```scala
+case class ResearchInput(topic: String) derives Schema
+
+val deepResearch = McpTool("deep_research")
+  .description("Researches a topic. Slow, so it runs as a task.")
+  .taskExecution(TaskExecution.WhenSupported)
+  .handleWithContext[Any, ToolError, ResearchInput, String]: (in, ctx) =>
+    ZIO.foreachDiscard(1 to 3): step =>
+      ctx.progress(step, 3, Some(s"researching ${in.topic} ($step/3)")) *> ZIO.sleep(100.millis)
+    .as(s"Research on ${in.topic}: done")
+```
+
+| `TaskExecution` | Client declared the extension | Client did not (or is legacy) |
+|---|---|---|
+| `Never` (default) | synchronous result | synchronous result |
+| `WhenSupported` | task | synchronous result |
+| `Required` | task | `-32021` naming the extension (legacy sessions still run it synchronously) |
+
+Without the extension registered, `taskExecution` is ignored: every tool answers synchronously and the `tasks/...` methods do not exist (`404`/`-32601`). `taskExecution` also takes the task's `ttl` (default one hour, `None` keeps it until restart) and the `pollInterval` suggested to the client (default 500 ms). The extension is advertised in `server/discover`, and not to legacy `2025-11-25` sessions, which cannot use it.
+
+Inside a task the handler runs on a background fiber with the same `McpToolContext`, adapted to the task:
+
+- `ctx.progress(...)` becomes the task's `statusMessage`; `ctx.log` is dropped, since tasks carry no notifications.
+- `ctx.elicit` / `ctx.sample` / `ctx.listRoots` / `ctx.inputs` move the task to `input_required` with the requests in `inputRequests`, and the fiber resumes when the client answers through `tasks/update`. The handler is not replayed, unlike MRTR, so it needs no `requestState`.
+- A result — including one with `isError: true` — completes the task with that result inlined in `tasks/get`. A defect fails it with a `-32603` JSON-RPC `error`.
+
+```scala
+val bookFlight = McpTool("book_flight")
+  .description("Books a flight once the user confirms")
+  .taskExecution(TaskExecution.WhenSupported)
+  .handleWithContext[Any, ToolError, String]: ctx =>
+    ctx.elicit("confirm", "Book the flight for $420?", confirmSchema).map: answer =>
+      if answer.content.flatMap(_.get("confirm")).contains(Json.Bool(true)) then "Booked"
+      else s"Not booked (${answer.action})"
+```
+
+The server answers `tasks/get`, `tasks/update`, and `tasks/cancel` (cooperative: the fiber is interrupted and the task ends `cancelled`). Each of them requires the client to declare the extension (`-32021` otherwise), checks `Mcp-Name` against `params.taskId`, and only finds tasks the same caller created — with `.auth(...)`, a task is bound to the principal that started it, and another caller gets the same `-32602` as for an unknown id. Per-tool scopes are checked before a task is created. `notifications/tasks` are not sent — clients poll.
+
+### Task storage
+
+Task state goes through an `McpTaskStore`. The in-memory one serves a single process; for a replicated deployment, implement the store over shared storage and pass it to `McpTasks(store)`, so any replica can answer a task's `tasks/get`, `tasks/update`, and `tasks/cancel`:
+
+```scala
+trait McpTaskStore:
+  def create(record: McpTaskRecord): UIO[Unit]
+  def get(taskId: TaskId): UIO[Option[McpTaskRecord]]
+  def update(taskId: TaskId)(f: McpTaskRecord => McpTaskRecord): UIO[Option[McpTaskRecord]] // atomic
+  def delete(taskId: TaskId): UIO[Unit]
+
+val server =
+  for tasks <- McpTasks(myRedisTaskStore)
+  yield McpServer("my-server", "1.0.0").withExtensions(tasks).tool(deepResearch)
+```
+
+An `McpTaskRecord` is plain data — the `McpTask`, its owner, its expiry, and the input answers received — so it serializes anywhere. The handler itself keeps running in the process that started it: a task waiting for input re-reads the store every `pollInterval`, so an answer that lands on another replica still resumes it, and a cancellation recorded elsewhere ends it on its next read. Interrupting the running fiber right away only happens on the replica that runs it; route `tasks/cancel` there (the `Mcp-Name: <taskId>` header is for that) when prompt cancellation matters.
+
+### Client
+
+`McpClient` always declares the extension on a modern connection, and `callTool` follows a task transparently: it polls `tasks/get` at the server's suggested interval, answers the task's input requests through `onInputRequest` and `tasks/update`, and returns the final `CallToolResult`. Interrupting the call sends `tasks/cancel`.
+
+To work with the task itself — persist its id, poll on your own schedule — use the lower-level operations:
+
+```scala
+for
+  outcome <- client.startTool("deep_research", Json.Obj("topic" -> Json.Str("Rome")))
+  result  <- outcome match
+               case ToolCallOutcome.Completed(r) => ZIO.succeed(r)       // the server answered synchronously
+               case ToolCallOutcome.Started(task) =>
+                 client.getTask(task.taskId) *>                           // tasks/get: an McpTask snapshot
+                   client.awaitTask(task.taskId)                          // poll to the end, as callTool does
+yield result
+```
+
+`updateTask(taskId, responses)` and `cancelTask(taskId)` send `tasks/update` and `tasks/cancel`. `awaitTask` fails with `McpClientError.JsonRpc` when the task `failed`, and with `McpClientError.TaskCancelled` when it was cancelled.
 
 ## Protocol extensions
 
@@ -835,6 +929,8 @@ The client exposes the core MCP operations:
 | `client.callTool(name, args)` / `client.callTool(name)` | `tools/call` |
 | `client.callTool(name, a)` (typed `a: A` via `Schema`) | `tools/call` |
 | `client.callToolAs[B](name, args)` / `callToolAs[A, B](name, a)` | `tools/call` (result decoded into `B`) |
+| `client.startTool(name, args)` | `tools/call`, stopping at a task handle ([Tasks](#tasks)) |
+| `client.getTask(id)` / `updateTask(id, responses)` / `cancelTask(id)` / `awaitTask(id)` | `tasks/get` / `tasks/update` / `tasks/cancel` |
 | `client.listResources` | `resources/list` |
 | `client.listResourceTemplates` | `resources/templates/list` |
 | `client.readResource(uri)` | `resources/read` |
@@ -852,6 +948,7 @@ Errors surface as a typed `McpClientError`:
 | `Decode` | the `result` payload didn't match the expected type |
 | `Auth` | the OAuth flow failed, or a 401 persisted after refreshing the token |
 | `ToolFailed` | a typed `callToolAs` call ran but the tool reported `isError: true` |
+| `TaskCancelled` | a call the server ran as a task ended `cancelled` |
 
 ### Typed tool calls
 

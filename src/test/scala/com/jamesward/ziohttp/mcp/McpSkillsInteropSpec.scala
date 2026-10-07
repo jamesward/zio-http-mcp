@@ -88,6 +88,7 @@ object McpSkillsInteropSpec extends ZIOSpecDefault:
     case McpClientError.Decode(_)            => None
     case McpClientError.Auth(_)              => None
     case McpClientError.ToolFailed(_)        => None
+    case McpClientError.TaskCancelled(_, _)  => None
 
   private def exercise(version: ProtocolVersion): ZIO[Server & Client & McpServer.State, Any, TestResult] =
     ZIO.scoped:

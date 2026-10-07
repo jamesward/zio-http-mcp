@@ -52,7 +52,17 @@ trait McpClient:
   /** `tools/list` — the tools the server exposes. */
   def listTools: IO[McpClientError, Chunk[ToolDefinition]]
 
-  /** `tools/call` with JSON arguments. */
+  /**
+   * `tools/call` with JSON arguments.
+   *
+   * Against a modern (2026-07-28) server the call may come back as a task
+   * (the `io.modelcontextprotocol/tasks` extension, which the client always
+   * declares): the client then polls `tasks/get` at the server's suggested
+   * interval, answers the task's input requests through `onInputRequest` and
+   * `tasks/update`, and returns the final result — the same result a
+   * synchronous call would have. Interrupting the call sends `tasks/cancel`.
+   * Use [[startTool]] to get hold of the task instead.
+   */
   def callTool(name: String, arguments: Json.Obj): IO[McpClientError, CallToolResult]
 
   /** `tools/call` with no arguments. */
@@ -80,6 +90,32 @@ trait McpClient:
 
   /** `tools/call` with a typed argument `A`, returning the result decoded into `B`. */
   def callToolAs[A: Schema, B: Schema](name: String, arguments: A): IO[McpClientError, B]
+
+  /**
+   * `tools/call` that does not wait for a task: a result the server answers
+   * synchronously comes back as [[ToolCallOutcome.Completed]], a task as
+   * [[ToolCallOutcome.Started]] for the caller to follow with [[getTask]] /
+   * [[awaitTask]], or to persist and resume later. A multi-round (MRTR)
+   * exchange before the server answers is still driven to the end.
+   */
+  def startTool(name: String, arguments: Json.Obj): IO[McpClientError, ToolCallOutcome]
+
+  /** `tasks/get` — a task's current state, including its result once completed. */
+  def getTask(taskId: TaskId): IO[McpClientError, McpTask]
+
+  /** `tasks/update` — answers to an `input_required` task's input requests, keyed as the server asked. */
+  def updateTask(taskId: TaskId, responses: Chunk[InputResponse]): IO[McpClientError, Unit]
+
+  /** `tasks/cancel` — ask the server to stop a task. Cooperative: the task may still finish. */
+  def cancelTask(taskId: TaskId): IO[McpClientError, Unit]
+
+  /**
+   * Follow a task to its end, as [[callTool]] does: poll `tasks/get`, answer
+   * input requests through `onInputRequest`, and return the tool's result.
+   * Fails with [[McpClientError.JsonRpc]] when the task `failed` and with
+   * [[McpClientError.TaskCancelled]] when it was cancelled.
+   */
+  def awaitTask(taskId: TaskId): IO[McpClientError, CallToolResult]
 
   /** `resources/list` — the concrete resources the server exposes. */
   def listResources: IO[McpClientError, Chunk[ResourceDefinition]]
@@ -123,6 +159,16 @@ trait McpExtensionClient extends McpClient:
     routingName: Option[McpRoutingName] = None,
   ): IO[McpClientError, Json]
 
+/** How the server answered a [[McpClient.startTool]] call. */
+enum ToolCallOutcome:
+  /** The server answered synchronously. */
+  case Completed(result: CallToolResult)
+  /** The server runs the call as a task; follow it with `getTask` / `awaitTask`. */
+  case Started(task: McpTask)
+
+object ToolCallOutcome:
+  given CanEqual[ToolCallOutcome, ToolCallOutcome] = CanEqual.derived
+
 /**
  * Connection configuration.
  *
@@ -153,11 +199,12 @@ final case class McpClientConfig(
    */
   preferredVersion: ProtocolVersion = ProtocolVersion.latest,
   /**
-   * Handler invoked to satisfy a modern server's Multi Round-Trip Request: given
-   * an [[InputRequest]] (a `sampling/createMessage` or `elicitation/create` the
-   * server needs answered), it returns the result JSON to send back in
-   * `inputResponses`. When unset, a server that asks for input fails the call
-   * with [[McpClientError.Protocol]].
+   * Handler invoked to satisfy a modern server's request for input: given an
+   * [[InputRequest]] (a `sampling/createMessage`, `elicitation/create`, or
+   * `roots/list` the server needs answered), it returns the result JSON to send
+   * back in `inputResponses` — on the retry of a Multi Round-Trip Request, or
+   * in `tasks/update` for a task that is `input_required`. When unset, a server
+   * that asks for input fails the call with [[McpClientError.Protocol]].
    */
   onInputRequest: Option[InputRequest => IO[McpClientError, Json]] = None,
 )
@@ -244,6 +291,9 @@ object McpClient:
     extraHeaders: Headers,
     sendSession: Boolean,
   )
+
+  private val TaskResultType: String = "task"
+  private val DefaultPollIntervalMs: Long = 500L
 
   private enum Attempt:
     case Ok(result: Json)
@@ -407,7 +457,13 @@ object McpClient:
      * their result on the first pass.
      */
     def toolsCall(params: Json.Obj): IO[McpClientError, CallToolResult] =
-      def loop(prior: Chunk[InputResponse], state: Option[String], depth: Int): IO[McpClientError, CallToolResult] =
+      toolsCallOutcome(params).flatMap:
+        case ToolCallOutcome.Completed(result) => ZIO.succeed(result)
+        case ToolCallOutcome.Started(task)     => awaitTask(task)
+
+    /** As [[toolsCall]], stopping at a task handle rather than following it. */
+    def toolsCallOutcome(params: Json.Obj): IO[McpClientError, ToolCallOutcome] =
+      def loop(prior: Chunk[InputResponse], state: Option[String], depth: Int): IO[McpClientError, ToolCallOutcome] =
         // Answers accumulate across rounds rather than replacing one another:
         // a server that resumes from `requestState` ignores the ones it has
         // already consumed, and one that replays its handler needs them all.
@@ -435,10 +491,70 @@ object McpClient:
                   answers <- ZIO.foreach(requests)(req => handler(req).map(r => InputResponse(req.id, r)))
                   out     <- loop(prior ++ answers, nextState, depth + 1)
                 yield out
+          else if resultType.contains(TaskResultType) then
+            ZIO.fromEither(McpTask.fromJson(result))
+              .mapBoth(e => McpClientError.Decode(s"Failed to decode task: $e"), ToolCallOutcome.Started(_))
           else
-            ZIO.fromEither(result.as[CallToolResult])
-              .mapError(e => McpClientError.Decode(s"Failed to decode tool result: $e"))
+            decodeToolResult(result).map(ToolCallOutcome.Completed(_))
       loop(Chunk.empty, None, 0)
+
+    private def decodeToolResult(json: Json): IO[McpClientError, CallToolResult] =
+      ZIO.fromEither(json.as[CallToolResult])
+        .mapError(e => McpClientError.Decode(s"Failed to decode tool result: $e"))
+
+    def getTask(taskId: TaskId): IO[McpClientError, McpTask] =
+      rpcRaw("tasks/get", taskParams(taskId)).flatMap: json =>
+        ZIO.fromEither(McpTask.fromJson(json))
+          .mapError(e => McpClientError.Decode(s"Failed to decode result of 'tasks/get': $e"))
+
+    def updateTask(taskId: TaskId, responses: Chunk[InputResponse]): IO[McpClientError, Unit] =
+      val params = Json.Obj(taskParams(taskId).fields :+ ("inputResponses" -> (InputResponse.toJson(responses): Json)))
+      rpcRaw("tasks/update", params).unit
+
+    def cancelTask(taskId: TaskId): IO[McpClientError, Unit] =
+      rpcRaw("tasks/cancel", taskParams(taskId)).unit
+
+    private def taskParams(taskId: TaskId): Json.Obj =
+      Json.Obj("taskId" -> Json.Str(taskId.value))
+
+    /**
+     * Poll a task to a terminal status at the interval the server suggests,
+     * answering each input request once (requests repeat across polls until
+     * the server has the answer, so they are deduplicated by key). Interrupting
+     * this — a timeout, a cancelled caller — cancels the task on the server.
+     */
+    def awaitTask(initial: McpTask): IO[McpClientError, CallToolResult] =
+      val taskId = initial.taskId
+      def poll(task: McpTask, answered: Set[String]): IO[McpClientError, CallToolResult] =
+        val interval = Duration.fromMillis(task.pollIntervalMs.getOrElse(DefaultPollIntervalMs).max(0L))
+        ZIO.sleep(interval) *> getTask(taskId).flatMap(follow(_, answered))
+      def follow(task: McpTask, answered: Set[String]): IO[McpClientError, CallToolResult] =
+        task.status match
+          case TaskStatus.Completed =>
+            task.result match
+              case Some(result) => decodeToolResult(result)
+              case None => ZIO.fail(McpClientError.Protocol(s"Task ${taskId.value} completed without a result"))
+          case TaskStatus.Failed =>
+            val error = task.error.getOrElse(ErrorDetail(ErrorCode.InternalError.code, "Task failed"))
+            ZIO.fail(McpClientError.JsonRpc(error.code, error.message, error.data))
+          case TaskStatus.Cancelled =>
+            ZIO.fail(McpClientError.TaskCancelled(taskId.value, task.statusMessage))
+          case TaskStatus.Working =>
+            poll(task, answered)
+          case TaskStatus.InputRequired =>
+            val fresh = task.inputRequests.filterNot(req => answered.contains(req.id))
+            if fresh.isEmpty then poll(task, answered)
+            else config.onInputRequest match
+              case None =>
+                ZIO.fail(McpClientError.Protocol(
+                  s"Task ${taskId.value} needs input but no onInputRequest handler is configured"))
+              case Some(handler) =>
+                for
+                  answers <- ZIO.foreach(fresh)(req => handler(req).map(InputResponse(req.id, _)))
+                  _       <- updateTask(taskId, answers)
+                  out     <- poll(task, answered ++ fresh.map(_.id))
+                yield out
+      follow(initial, Set.empty).onInterrupt(cancelTask(taskId).ignore)
 
     def close: IO[McpClientError, Unit] =
       stateRef.get.flatMap: st =>
@@ -578,10 +694,18 @@ object McpClient:
         method match
           case "tools/call" | "prompts/get" => params.get("name").flatMap(_.asString)
           case "resources/read"             => params.get("uri").flatMap(_.asString)
+          case "tasks/get" | "tasks/update" | "tasks/cancel" => params.get("taskId").flatMap(_.asString)
           case _                            => None
       val base = Headers(Negotiation.ProtocolVersionHeader, version.wire) ++
         Headers(Negotiation.MethodHeader, method)
       nameValue.fold(base)(n => base ++ Headers(Negotiation.NameHeader, encodeHeaderValue(n)))
+
+    /** The client capabilities sent on every modern request: the declared
+      * vendor extensions, plus the Tasks extension, which the client always
+      * handles (see [[toolsCall]]). */
+    private val modernCapabilities: Json.Obj =
+      val tasks = McpExtensionId.parse(McpMeta.Tasks).toOption.map(_ -> (Json.Obj(): Json))
+      McpExtensionCapabilities.toClientCapabilities(tasks.toMap ++ extensions.capabilities)
 
     /** Merge the modern `_meta` (protocol version, client info, client
       * capabilities) into a request's params, preserving any existing `_meta`. */
@@ -589,7 +713,7 @@ object McpClient:
       val modernMeta = Chunk[(String, Json)](
         McpMeta.ProtocolVersion -> Json.Str(version.wire),
         McpMeta.ClientInfo -> asObj(config.clientInfo),
-        McpMeta.ClientCapabilities -> McpExtensionCapabilities.toClientCapabilities(extensions.capabilities),
+        McpMeta.ClientCapabilities -> modernCapabilities,
       )
       val reserved = modernMeta.map(_._1).toSet
       val existing = params.get("_meta").flatMap(_.asObject).map(_.fields).getOrElse(Chunk.empty)
@@ -724,6 +848,28 @@ object McpClient:
 
     def callToolAs[B: Schema](name: String, arguments: Json.Obj): IO[McpClientError, B] =
       callTool(name, arguments).flatMap(decodeResultAs[B])
+
+    def startTool(name: String, arguments: Json.Obj): IO[McpClientError, ToolCallOutcome] =
+      val argOpt = if arguments.fields.isEmpty then None else Some(arguments)
+      transport.toolsCallOutcome(asObj(ToolCallParams(ToolName(name), argOpt)))
+
+    def getTask(taskId: TaskId): IO[McpClientError, McpTask] =
+      requireModern("tasks/get") *> transport.getTask(taskId)
+
+    def updateTask(taskId: TaskId, responses: Chunk[InputResponse]): IO[McpClientError, Unit] =
+      requireModern("tasks/update") *> transport.updateTask(taskId, responses)
+
+    def cancelTask(taskId: TaskId): IO[McpClientError, Unit] =
+      requireModern("tasks/cancel") *> transport.cancelTask(taskId)
+
+    def awaitTask(taskId: TaskId): IO[McpClientError, CallToolResult] =
+      getTask(taskId).flatMap(transport.awaitTask)
+
+    /** The Tasks extension exists only from 2026-07-28. */
+    private def requireModern(method: String): IO[McpClientError, Unit] =
+      ZIO.unless(negotiated.modern)(ZIO.fail(McpClientError.Protocol(
+        s"'$method' needs a 2026-07-28 server; negotiated ${negotiated.version.wire}"
+      ))).unit
 
     def callToolAs[B: Schema](name: String): IO[McpClientError, B] =
       callToolAs[B](name, Json.Obj())

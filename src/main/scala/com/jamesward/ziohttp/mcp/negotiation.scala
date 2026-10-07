@@ -53,6 +53,10 @@ object Negotiation:
     "tools/call"     -> "name",
     "resources/read" -> "uri",
     "prompts/get"    -> "name",
+    // Tasks extension: routes follow-up requests to the instance holding the task.
+    "tasks/get"      -> "taskId",
+    "tasks/update"   -> "taskId",
+    "tasks/cancel"   -> "taskId",
   )
 
   /** The protocol version declared in the request body's `_meta`, if any. */
@@ -103,7 +107,8 @@ object Negotiation:
    *   - `MCP-Protocol-Version`, when present, must equal the body's `_meta`
    *     protocol version (when the body declares one).
    *   - `Mcp-Name`, when present, must equal `params.name` / `params.uri` for
-   *     the data methods, decoding the Base64 sentinel form first.
+   *     the data methods (`params.taskId` for the `tasks/...` methods), decoding the Base64
+   *     sentinel form first.
    *   - the resolved version must be one the server supports.
    */
   def resolveModern(

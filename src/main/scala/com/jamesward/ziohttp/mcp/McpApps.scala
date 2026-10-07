@@ -76,6 +76,7 @@ object McpApps:
     def name: ToolName = delegate.name
     def definition: ToolDefinition = withToolMetadata(delegate.definition, metadata)
     override def requiredScopes: Set[auth.OauthScope] = delegate.requiredScopes
+    override def taskPolicy: TaskPolicy = delegate.taskPolicy
     def call(args: Option[Json.Obj]): ZIO[R, Nothing, CallToolResult] = delegate.call(args)
     override def callWithContext(
       args: Option[Json.Obj],

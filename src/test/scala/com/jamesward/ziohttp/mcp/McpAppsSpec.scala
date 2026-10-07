@@ -188,7 +188,8 @@ object McpAppsSpec extends ZIOSpecDefault:
               case McpClientError.Protocol(_)          => false
               case McpClientError.Decode(_)            => false
               case McpClientError.Auth(_)              => false
-              case McpClientError.ToolFailed(_)        => false,
+              case McpClientError.ToolFailed(_)        => false
+              case McpClientError.TaskCancelled(_, _)  => false,
           )
       ,
     ).provide(

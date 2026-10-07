@@ -354,10 +354,10 @@ object McpToolContext:
     for
       // Both cells are scoped to this one request: the context is rebuilt on
       // every call, including each retry of an MRTR exchange, which is what
-      // makes the positional ids below line up across a replay.
+      // makes the positional ids line up across a replay.
       inputIds  <- Ref.make(0)
       pending   <- Ref.make(Option.empty[String])
-    yield new McpToolContext:
+    yield new InputDriven(inputIds):
       override val principal: Option[Principal] = callerPrincipal
       override val pathParams: Map[String, String] = callerPathParams
       override val requestState: Option[String] = incomingState
@@ -387,23 +387,6 @@ object McpToolContext:
             queue.offer(JsonRpcMessage.Notification("notifications/progress", Some(Json.Obj(fields)))).unit
           case _ => ZIO.unit
 
-      def sample(prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
-        nextId.flatMap(sample(_, prompt, maxTokens))
-
-      def sample(id: String, prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
-        inputs(InputSpec.sample(id, prompt, maxTokens)).map(_.sampling(id))
-
-      def elicit(message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult] =
-        nextId.flatMap(elicit(_, message, schema))
-
-      def elicit(id: String, message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult] =
-        inputs(InputSpec.elicit(id, message, schema)).map(_.elicitation(id))
-
-      def listRoots: ZIO[Any, ToolError, Chunk[Root]] = nextId.flatMap(listRoots)
-
-      def listRoots(id: String): ZIO[Any, ToolError, Chunk[Root]] =
-        inputs(InputSpec.listRoots(id)).map(_.roots(id))
-
       /**
        * Answer the whole batch from the replayed responses, or abort with an
        * [[InputRequiredSignal]] carrying every input the client has not
@@ -422,18 +405,39 @@ object McpToolContext:
         else
           ZIO.succeed(InputResults(asked.map(spec => spec.id -> inputResponses(spec.id)).toMap))
 
-      /**
-       * The next positional id, assigned when the effect runs rather than when
-       * it is built, so ids follow execution order.
-       *
-       * A replay has to hand the same question the same id, which holds as long
-       * as the handler asks in a deterministic order. It does not hold for
-       * questions raced against each other (`ctx.sample(...) <&> ctx.elicit(...)`):
-       * name those inputs explicitly, or ask for them together with [[inputs]],
-       * which is one round trip rather than two anyway.
-       */
-      private def nextId: UIO[String] =
-        inputIds.getAndUpdate(_ + 1).map(next => s"input-$next")
+  /**
+   * A context whose single-input methods (`sample`, `elicit`, `listRoots`) are
+   * one-element [[McpToolContext.inputs]] calls: the modern MRTR context and the
+   * task context, which differ only in how a batch of inputs is obtained.
+   *
+   * Unnamed inputs get positional ids (`input-0`, `input-1`, …), assigned when
+   * the effect runs rather than when it is built, so ids follow execution
+   * order. An MRTR replay has to hand the same question the same id, which
+   * holds as long as the handler asks in a deterministic order. It does not
+   * hold for questions raced against each other
+   * (`ctx.sample(...) <&> ctx.elicit(...)`): name those inputs explicitly, or
+   * ask for them together with `inputs`, which is one round trip anyway.
+   */
+  private[mcp] abstract class InputDriven(inputIds: Ref[Int]) extends McpToolContext:
+    def sample(prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
+      nextId.flatMap(sample(_, prompt, maxTokens))
+
+    def sample(id: String, prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
+      inputs(InputSpec.sample(id, prompt, maxTokens)).map(_.sampling(id))
+
+    def elicit(message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult] =
+      nextId.flatMap(elicit(_, message, schema))
+
+    def elicit(id: String, message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult] =
+      inputs(InputSpec.elicit(id, message, schema)).map(_.elicitation(id))
+
+    def listRoots: ZIO[Any, ToolError, Chunk[Root]] = nextId.flatMap(listRoots)
+
+    def listRoots(id: String): ZIO[Any, ToolError, Chunk[Root]] =
+      inputs(InputSpec.listRoots(id)).map(_.roots(id))
+
+    private def nextId: UIO[String] =
+      inputIds.getAndUpdate(_ + 1).map(next => s"input-$next")
 
   private[mcp] val noop: McpToolContext = noopWith(None)
 

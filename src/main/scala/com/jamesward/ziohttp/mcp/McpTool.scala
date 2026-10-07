@@ -99,6 +99,8 @@ trait McpToolHandlerR[-R]:
   def definition: ToolDefinition
   /** Per-tool scope requirements. Empty for tools that don't restrict scopes. */
   def requiredScopes: Set[OauthScope] = Set.empty
+  /** Whether calls to this tool run as Tasks-extension tasks. */
+  def taskPolicy: TaskPolicy = TaskPolicy.never
   def call(args: Option[Json.Obj]): ZIO[R, Nothing, CallToolResult]
   def callWithContext(args: Option[Json.Obj], ctx: McpToolContext): ZIO[R, Nothing, CallToolResult] =
     call(args)
@@ -113,9 +115,10 @@ final class McpTool private (
   val toolDescription: Option[String],
   val toolAnnotations: Option[ToolAnnotations],
   val toolRequiredScopes: Set[OauthScope],
+  val toolTaskPolicy: TaskPolicy,
 ):
   def description(d: String): McpTool =
-    new McpTool(toolName, Some(d), toolAnnotations, toolRequiredScopes)
+    new McpTool(toolName, Some(d), toolAnnotations, toolRequiredScopes, toolTaskPolicy)
 
   def annotations(
     title: Option[String] = None,
@@ -124,7 +127,7 @@ final class McpTool private (
     idempotent: OptBool = OptBool.Unset,
     openWorld: OptBool = OptBool.Unset,
   ): McpTool =
-    new McpTool(toolName, toolDescription, Some(ToolAnnotations(title, readOnly.toOption, destructive.toOption, idempotent.toOption, openWorld.toOption)), toolRequiredScopes)
+    new McpTool(toolName, toolDescription, Some(ToolAnnotations(title, readOnly.toOption, destructive.toOption, idempotent.toOption, openWorld.toOption)), toolRequiredScopes, toolTaskPolicy)
 
   /**
    * Add OAuth scope requirements for this tool. Server-wide [[com.jamesward.ziohttp.mcp.auth.McpAuth.requiredScopes]]
@@ -134,7 +137,31 @@ final class McpTool private (
    * keeping authoring fully opt-in.
    */
   def requireScopes(scopes: OauthScope*): McpTool =
-    new McpTool(toolName, toolDescription, toolAnnotations, toolRequiredScopes ++ scopes)
+    new McpTool(toolName, toolDescription, toolAnnotations, toolRequiredScopes ++ scopes, toolTaskPolicy)
+
+  /**
+   * Run calls to this tool as tasks (the `io.modelcontextprotocol/tasks`
+   * extension, 2026-07-28): the server answers `tools/call` at once with a task
+   * handle, runs the handler in the background, and the client polls
+   * `tasks/get` for the result.
+   *
+   * Task creation is server-directed — a client only declares that it handles
+   * tasks — so this is where the decision lives. With
+   * [[TaskExecution.WhenSupported]] a client that did not declare the extension
+   * (and every legacy `2025-11-25` client) gets an ordinary synchronous answer;
+   * with [[TaskExecution.Required]] a modern client that did not declare it
+   * gets a `-32021` error instead.
+   *
+   * @param ttl          how long the server keeps the task after creating it;
+   *                     `None` keeps it until the server restarts
+   * @param pollInterval the polling interval suggested to the client
+   */
+  def taskExecution(
+    execution: TaskExecution,
+    ttl: Option[Duration] = TaskPolicy.DefaultTtl,
+    pollInterval: Duration = TaskPolicy.DefaultPollInterval,
+  ): McpTool =
+    new McpTool(toolName, toolDescription, toolAnnotations, toolRequiredScopes, TaskPolicy(execution, ttl, pollInterval))
 
   // --- handle: typed input/output ---
 
@@ -170,10 +197,12 @@ final class McpTool private (
 
     val capturedName = toolName
     val capturedScopes = toolRequiredScopes
+    val capturedTaskPolicy = toolTaskPolicy
     new McpToolHandlerR[R]:
       def name: ToolName = capturedName
       def definition: ToolDefinition = toolDef
       override def requiredScopes: Set[OauthScope] = capturedScopes
+      override def taskPolicy: TaskPolicy = capturedTaskPolicy
 
       def call(args: Option[Json.Obj]): ZIO[R, Nothing, CallToolResult] =
         callWithContext(args, McpToolContext.noop)
@@ -218,4 +247,4 @@ final class McpTool private (
 
 object McpTool:
   def apply(name: String): McpTool =
-    new McpTool(ToolName(name), None, None, Set.empty)
+    new McpTool(ToolName(name), None, None, Set.empty, TaskPolicy.never)

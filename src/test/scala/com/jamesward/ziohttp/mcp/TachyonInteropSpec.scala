@@ -8,8 +8,15 @@ import zio.json.ast.Json
 import zio.test.*
 import zio.test.TestAspect.*
 
+import dev.tachyonmcp.api.server.domain.{FormInputRequest, InputRequestBundle, TaskResult}
+import dev.tachyonmcp.api.server.features.tasks.{TaskConnector, TaskNotFoundException, TaskSnapshot, TaskState, TaskSupport}
 import dev.tachyonmcp.api.server.features.tools.ToolResult
 import dev.tachyonmcp.core.server.TachyonServer
+import dev.tachyonmcp.extensions.tasks.TasksExtension
+
+import java.time.{Duration as JDuration, Instant}
+import java.util.concurrent.ConcurrentHashMap
+import scala.jdk.CollectionConverters.*
 
 given canEqualStatusTachyon: CanEqual[Status, Status] = CanEqual.derived
 
@@ -37,6 +44,84 @@ object TachyonInteropSpec extends ZIOSpecDefault:
                 b.description("Greets the caller")
               ,
               (_, _) => ToolResult.text("hello from tachyon")
+            )
+          .port(0)
+          .build()
+        server.start()
+        server
+    )(server => ZIO.attemptBlocking(server.close()).ignore)
+
+  /**
+   * A tachyon server whose tools run as Tasks-extension tasks (SEP-2663). Tachyon
+   * leaves task storage to the application through a `TaskConnector`; this one
+   * keeps snapshots in a map. `research` finishes on a background thread;
+   * `confirm` waits in `input_required` until `tasks/update` answers it.
+   */
+  private def tachyonTaskServer: ZIO[Scope, Throwable, TachyonServer] =
+    ZIO.acquireRelease(
+      ZIO.attemptBlocking:
+        val tasks = ConcurrentHashMap[String, TaskSnapshot]()
+        def lookup(id: String): TaskSnapshot =
+          Option(tasks.get(id)).getOrElse(throw TaskNotFoundException(id))
+        def advance(id: String)(f: TaskSnapshot.Builder => TaskSnapshot.Builder): Unit =
+          tasks.computeIfPresent(id, (_, s) =>
+            if s.status.isTerminal then s
+            else f(TaskSnapshot.builder().from(s).lastUpdatedAt(Instant.now()).pendingInput(null)
+              .revision(s.revision + 1)).build())
+        def created(id: String, status: TaskState, pending: InputRequestBundle | Null): TaskSnapshot =
+          val now = Instant.now()
+          val snapshot = TaskSnapshot.builder().taskId(id).status(status).createdAt(now).lastUpdatedAt(now)
+            .ttl(JDuration.ofMinutes(5)).pollInterval(JDuration.ofMillis(100))
+            .pendingInput(pending).revision(0).build()
+          tasks.put(id, snapshot)
+          snapshot
+        val confirmSchema: java.util.Map[String, Object] = Map[String, Object](
+          "type" -> "object",
+          "properties" -> Map("confirm" -> Map("type" -> "boolean").asJava).asJava,
+        ).asJava
+
+        val connector = TaskConnector.builder()
+          .get((_, req) => lookup(req.taskId))
+          .cancel((_, req) => { lookup(req.taskId); advance(req.taskId)(_.status(TaskState.CANCELLED)) })
+          .update: (_, req) =>
+            lookup(req.taskId)
+            val answer = Option(req.inputResponses.get("confirm")).map(_.toString).getOrElse("none")
+            advance(req.taskId)(_.status(TaskState.COMPLETED)
+              .result(TaskResult.completed(ToolResult.text(s"confirmed: $answer"))))
+          .build()
+
+        val server = TachyonServer.builder()
+          .name("tachyon-tasks")
+          .version("1.0.0")
+          .withExtension(classOf[TasksExtension], _.connector(connector))
+          .withTools: tools =>
+            tools.register(
+              b =>
+                b.name("research")
+                b.description("Researches in the background")
+                b.taskSupport(TaskSupport.OPTIONAL)
+              ,
+              (_, _) =>
+                val id = java.util.UUID.randomUUID().toString
+                val snapshot = created(id, TaskState.WORKING, null)
+                val worker = Thread: () =>
+                  Thread.sleep(300)
+                  advance(id)(_.status(TaskState.COMPLETED)
+                    .result(TaskResult.completed(ToolResult.text("research done"))))
+                worker.setDaemon(true)
+                worker.start()
+                ToolResult.task(snapshot)
+            )
+            tools.register(
+              b =>
+                b.name("confirm")
+                b.description("Asks for confirmation through the task")
+                b.taskSupport(TaskSupport.OPTIONAL)
+              ,
+              (_, _) =>
+                val pending = InputRequestBundle(
+                  Map("confirm" -> FormInputRequest.of("Proceed?", dev.tachyonmcp.api.json.JsonSchema.from(confirmSchema))).asJava, null)
+                ToolResult.task(created(java.util.UUID.randomUUID().toString, TaskState.INPUT_REQUIRED, pending))
             )
           .port(0)
           .build()
@@ -143,6 +228,75 @@ object TachyonInteropSpec extends ZIOSpecDefault:
               r.flatMap(_.get("resultType")).flatMap(_.asString).contains("complete"),
               r.flatMap(_.get("tools")).flatMap(_.asArray).exists(_.nonEmpty),
             )
+      ,
+
+      // Tasks extension (SEP-2663): tachyon creates the tasks, our client follows them.
+      test("callTool follows a tachyon task to its result"):
+        ZIO.scoped:
+          for
+            server <- tachyonTaskServer
+            client <- McpClient.connect(s"http://localhost:${server.port()}/mcp")
+            result <- client.callTool("research")
+          yield
+            val text = result.content.collectFirst { case ToolContent.Text(t, _) => t }
+            assertTrue(text.contains("research done"))
+      ,
+
+      test("startTool returns tachyon's CreateTaskResult and getTask reads it"):
+        ZIO.scoped:
+          for
+            server  <- tachyonTaskServer
+            client  <- McpClient.connect(s"http://localhost:${server.port()}/mcp")
+            started <- client.startTool("research", Json.Obj())
+            task    <- started match
+                         case ToolCallOutcome.Started(t)   => ZIO.succeed(t)
+                         case ToolCallOutcome.Completed(_) => ZIO.dieMessage("expected a task")
+            polled  <- client.getTask(task.taskId)
+          yield assertTrue(
+            task.status == TaskStatus.Working,
+            task.pollIntervalMs.contains(100L),
+            task.ttlMs.contains(300000L),
+            polled.taskId == task.taskId,
+          )
+      ,
+
+      test("the client answers a tachyon task's inputRequests with tasks/update"):
+        ZIO.scoped:
+          for
+            server <- tachyonTaskServer
+            asked  <- Ref.make(Chunk.empty[String])
+            client <- McpClient.connect(McpClientConfig(
+                        s"http://localhost:${server.port()}/mcp",
+                        onInputRequest = Some(req =>
+                          asked.update(_ :+ s"${req.id}:${req.method}").as(Json.Obj(
+                            "action"  -> Json.Str("accept"),
+                            "content" -> Json.Obj("confirm" -> Json.Bool(true)),
+                          ))),
+                      ))
+            result <- client.callTool("confirm")
+            seen   <- asked.get
+          yield
+            val text = result.content.collectFirst { case ToolContent.Text(t, _) => t }
+            assertTrue(
+              seen == Chunk("confirm:elicitation/create"),
+              text.exists(_.startsWith("confirmed:")),
+            )
+      ,
+
+      test("cancelTask against tachyon ends the task cancelled"):
+        ZIO.scoped:
+          for
+            server <- tachyonTaskServer
+            client <- McpClient.connect(s"http://localhost:${server.port()}/mcp")
+            task   <- client.startTool("confirm", Json.Obj()).flatMap:
+                        case ToolCallOutcome.Started(t)   => ZIO.succeed(t)
+                        case ToolCallOutcome.Completed(_) => ZIO.dieMessage("expected a task")
+            _      <- client.cancelTask(task.taskId)
+            out    <- client.awaitTask(task.taskId).either
+          yield assertTrue(out match
+            case Left(McpClientError.TaskCancelled(id, _)) => id == task.taskId.value
+            case _                                         => false
+          )
       ,
 
     ).provide(Client.default) @@

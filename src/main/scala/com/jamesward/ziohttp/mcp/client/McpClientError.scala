@@ -20,6 +20,8 @@ import zio.json.ast.Json
  *     [[CallToolResult]] so callers can inspect `isError` themselves.
  *   - [[McpClientError.Auth]] — the OAuth client-credentials flow failed
  *     (discovery, token endpoint, or repeated 401 after a fresh token).
+ *   - [[McpClientError.TaskCancelled]] — a call the server ran as a task
+ *     (Tasks extension) ended `cancelled` rather than with a result.
  */
 enum McpClientError extends Throwable:
   case Transport(message: String, cause: Option[Throwable] = None)
@@ -28,6 +30,7 @@ enum McpClientError extends Throwable:
   case Decode(message: String)
   case Auth(message: String)
   case ToolFailed(message: String)
+  case TaskCancelled(taskId: String, message: Option[String] = None)
 
   override def getMessage: String = this match
     case Transport(m, _) => s"Transport error: $m"
@@ -36,6 +39,7 @@ enum McpClientError extends Throwable:
     case Decode(m)       => s"Decode error: $m"
     case Auth(m)         => s"Auth error: $m"
     case ToolFailed(m)   => s"Tool returned an error: $m"
+    case TaskCancelled(t, m) => s"Task $t was cancelled${m.fold("")(r => s": $r")}"
 
   override def getCause: Throwable = this match
     case Transport(_, Some(c)) => c

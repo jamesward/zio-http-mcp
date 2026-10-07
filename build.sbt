@@ -42,6 +42,8 @@ libraryDependencies ++= Seq(
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
   "dev.tachyonmcp" % "tachyon-core" % "1.0.0" % Test,
+  // tachyon's SEP-2663 Tasks extension, for task interop with our client.
+  "dev.tachyonmcp" % "tachyon-extensions-tasks" % "1.0.0" % Test,
 
   // Real SkillsJars (https://skillsjars.com) on the test classpath for McpSkillsJarsSpec.
   "com.skillsjars" % "anthropics__skills__pdf"              % "2026_02_25-3d59511" % Test,
@@ -105,7 +107,10 @@ Compile / doc / scalacOptions ++= Seq("-doc-root-content", (baseDirectory.value 
 ThisBuild / versionScheme := Some("semver-spec")
 
 // sbt-mcp (loopback-only: its tools can execute build tasks)
-Global / mcpEnabled := true
+// Only when this is the root build: another build that loads this one (an sbt
+// ProjectRef, e.g. a demo depending on the library from source) would otherwise
+// start a second server on the same port and fail with "Address already in use".
+Global / mcpEnabled := (LocalRootProject / thisProjectRef).value.build == loadedBuild.value.root
 Global / mcpHost := "127.0.0.1"
 Global / mcpPort := 5120
 

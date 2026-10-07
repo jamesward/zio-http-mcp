@@ -370,6 +370,61 @@ object ConformanceSpec extends ZIOSpecDefault:
       case ToolContent.Text(text, _) => text
       case _                         => ""
 
+  // --- Tasks extension fixtures (the kit's `tasks-*` scenarios fix these names) ---
+
+  case class GreetInput(name: String) derives Schema
+  case class SlowComputeInput(seconds: Double, label: Option[String] = None) derives Schema
+  case class FilenameInput(filename: String) derives Schema
+
+  private val confirmSchema = objectSchema("confirm", "boolean")
+
+  val tasksGreet: McpToolHandler = McpTool("greet")
+    .description("Sync-only greeting")
+    .handle((in: GreetInput) => ZIO.succeed(s"Hello, ${in.name}!"))
+
+  val tasksSlowCompute: McpToolHandler = McpTool("slow_compute")
+    .description("Sleeps for `seconds`, then answers; runs as a task")
+    .taskExecution(TaskExecution.WhenSupported)
+    .handle: (in: SlowComputeInput) =>
+      ZIO.sleep(Duration.fromMillis((in.seconds * 1000).toLong))
+        .as(s"computed ${in.label.getOrElse("result")} after ${in.seconds}s")
+
+  val tasksFailingJob: McpToolHandler = McpTool("failing_job")
+    .description("Always reports a tool error; must run as a task")
+    .taskExecution(TaskExecution.Required)
+    .handle[Any, ToolError, String](ZIO.sleep(1.second) *> ZIO.fail(ToolError("job failed")))
+
+  /** A protocol-level failure: the handler dies outside the builder's
+    * tool-error mapping, so the task ends `failed` with a JSON-RPC error. */
+  val tasksProtocolErrorJob: McpToolHandler = new McpToolHandlerR[Any]:
+    def name: ToolName = ToolName("protocol_error_job")
+    def definition: ToolDefinition = ToolDefinition(
+      name = name,
+      description = Some("Fails with a protocol error; runs as a task"),
+      inputSchema = Json.Obj("type" -> Json.Str("object")),
+    )
+    override def taskPolicy: TaskPolicy = TaskPolicy(TaskExecution.WhenSupported)
+    def call(args: Option[Json.Obj]): ZIO[Any, Nothing, CallToolResult] =
+      ZIO.dieMessage("internal failure")
+
+  val tasksConfirmDelete: McpToolHandler = McpTool("confirm_delete")
+    .description("Asks for confirmation before deleting; runs as a task")
+    .taskExecution(TaskExecution.WhenSupported)
+    .handleWithContext[Any, ToolError, FilenameInput, String]: (in, ctx) =>
+      ctx.elicit("confirm", s"Delete ${in.filename}?", confirmSchema).map: answer =>
+        if answer.content.flatMap(_.get("confirm")).contains(Json.Bool(true)) then s"Deleted ${in.filename}"
+        else s"Kept ${in.filename}"
+
+  val tasksMultiInput: McpToolHandler = McpTool("multi_input")
+    .description("Asks two questions at once; runs as a task")
+    .taskExecution(TaskExecution.WhenSupported)
+    .handleWithContext[Any, ToolError, String]: ctx =>
+      ctx.inputs(
+        InputSpec.elicit("first", "First name?", nameSchema),
+        InputSpec.elicit("second", "Second name?", nameSchema),
+      ).map: results =>
+        s"${elicited(results.elicitation("first"), "name", "?")} and ${elicited(results.elicitation("second"), "name", "?")}"
+
   val testInputRequiredElicitation: McpToolHandler = McpTool("test_input_required_result_elicitation")
     .description("Asks for a name via elicitation, then greets it")
     .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
@@ -455,7 +510,12 @@ object ConformanceSpec extends ZIOSpecDefault:
           )),
         )
 
+  /** The Tasks extension, which the `tasks-*` scenarios need registered. */
+  private val tasksExtension: McpExtensions[Any] =
+    Unsafe.unsafe(implicit unsafe => Runtime.default.unsafe.run(McpTasks.inMemory).getOrThrowFiberFailure())
+
   val testServer = McpServer("test-server", "0.1.0")
+    .withExtensions(tasksExtension)
     .tool(testSimpleText)
     .tool(testImageContent)
     .tool(testAudioContent)
@@ -486,6 +546,12 @@ object ConformanceSpec extends ZIOSpecDefault:
     .tool(testInputRequiredTamperedState)
     .tool(testInputRequiredCapabilities)
     .prompt(testInputRequiredPrompt)
+    .tool(tasksGreet)
+    .tool(tasksSlowCompute)
+    .tool(tasksFailingJob)
+    .tool(tasksProtocolErrorJob)
+    .tool(tasksConfirmDelete)
+    .tool(tasksMultiInput)
 
   /**
    * A CA bundle to trust inside the image build, taken from the standard
@@ -543,6 +609,38 @@ object ConformanceSpec extends ZIOSpecDefault:
         (if useHostNetwork then Chunk.empty else Chunk("dns-rebinding-protection"))
     baselined.map(s => s"  - $s").mkString("server:\n", "\n", "\n")
 
+  /**
+   * The kit's `tasks-*` scenarios we hold ourselves to. Left out:
+   *
+   *   - `tasks-mrtr-composition` — a tool that gathers input over MRTR and only
+   *     then escalates to a task. Our task tools become tasks on the first call
+   *     and take input through `tasks/update` instead; the spec makes the
+   *     MRTR-first ordering a SHOULD for servers that combine the two.
+   *   - `tasks-status-notifications` — the kit skips it itself (pending a rewrite
+   *     onto `subscriptions/listen`), and we do not push `notifications/tasks`.
+   */
+  private val TasksScenarios = Chunk(
+    "tasks-lifecycle",
+    "tasks-capability-negotiation",
+    "tasks-dispatch-and-envelope",
+    "tasks-mrtr-input",
+    "tasks-request-headers",
+    "tasks-request-state-removal",
+    "tasks-required-task-error",
+    "tasks-wire-fields",
+  )
+
+  /**
+   * The failed checks in a scenario's output, except `wire-schema-valid`: the
+   * kit validates every `tools/call` result against the core `CallToolResult`
+   * schema, special-casing only `input_required`, so a spec-shaped
+   * `CreateTaskResult` (`Result & Task`, no `content`) always trips it. The
+   * scenario checks themselves assert the task shapes.
+   */
+  private def taskCheckFailures(output: String): Chunk[String] =
+    Chunk.fromIterable(output.linesIterator.toSeq)
+      .filter(line => line.contains("FAILURE") && line.contains("[") && !line.contains("wire-schema-valid"))
+
   // The official MCP conformance kit (npm). The `latest` line (0.1.x) drives the
   // 2025-11-25 protocol; the `0.2.0` line drives the modern 2026-07-28 protocol
   // (move to the stable `0.2.0` once it ships). Our server is dual-era, so each
@@ -588,6 +686,7 @@ object ConformanceSpec extends ZIOSpecDefault:
     expectedFailures: String,
     scenario: Option[String] = None,
     requirementsMode: Boolean = false,
+    extraArgs: Seq[String] = Seq.empty,
   ): Task[(Long, String)] =
     ZIO.logInfo(
       s"conformance $specVersion: ${if useHostNetwork then "host" else "bridge"} networking, " +
@@ -634,7 +733,7 @@ object ConformanceSpec extends ZIOSpecDefault:
       ) ++ selection ++ Seq(
         "--expected-failures", "/tmp/expected-failures.yaml",
       )
-      val args = scenario.fold(baseArgs)(s => baseArgs ++ Seq("--scenario", s))
+      val args = scenario.fold(baseArgs)(s => baseArgs ++ Seq("--scenario", s)) ++ extraArgs
       container.withCommand(args*)
       container.withStartupCheckStrategy(
         // The kit runs ~30 scenarios in one shot; allow generous headroom so a
@@ -674,6 +773,19 @@ object ConformanceSpec extends ZIOSpecDefault:
           _                 <- ZIO.logInfo(s"Modern conformance exit code: $exitCode")
           _                 <- ZIO.logInfo(s"Modern conformance output:\n$output").when(exitCode != 0)
         yield assertTrue(exitCode == 0L)
+      ,
+      test("Tasks extension (io.modelcontextprotocol/tasks) scenarios pass"):
+        // Extension scenarios are off the spec timeline, so the kit only runs
+        // them under `--force`, one at a time.
+        ZIO.foreach(TasksScenarios): scenario =>
+          for
+            port              <- Server.install(testServer.routes)
+            (_, output)       <- runConformance(modernImage, port, "2026-07-28", expectedFailuresYaml,
+                                   scenario = Some(scenario), extraArgs = Seq("--force"))
+            failures           = taskCheckFailures(output)
+            _                 <- ZIO.logInfo(s"$scenario output:\n$output").when(failures.nonEmpty)
+          yield assertTrue(output.contains("SUCCESS"), failures.isEmpty)
+        .map(_.reduce(_ && _))
     ).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@
       withLiveClock @@
       timeout(5.minutes) @@

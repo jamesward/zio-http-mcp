@@ -50,6 +50,11 @@ sealed trait McpExtensions[-R]:
   final def add[R1](extension: McpServerExtension[R1]): Either[McpExtensionsError, McpExtensions[R & R1]] =
     McpExtensions.fromChunk(values :+ extension)
 
+  /** Both registries in one, e.g. `McpSkills(...) ++ tasks`; fails on a
+    * duplicate extension id or method, like building one. */
+  final def ++[R1](other: McpExtensions[R1]): Either[McpExtensionsError, McpExtensions[R & R1]] =
+    McpExtensions.fromChunk(values ++ other.values)
+
   private[mcp] final def settings(ctx: McpRequestContext): URIO[R, Map[McpExtensionId, Json]] =
     ZIO.foreach(values)(extension => extension.settings.resolve(ctx).map(extension.id -> _)).map(_.toMap)
 
