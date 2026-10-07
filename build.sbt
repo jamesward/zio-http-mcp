@@ -2,14 +2,7 @@ organization := "com.jamesward"
 
 name := "zio-http-mcp"
 
-
-// sbt-ci-release/sbt-git consume these from release commands rather than from
-// another setting, so sbt 2's unused-key linter cannot observe the dependency.
-Global / excludeLintKeys ++= Set(
-  com.github.sbt.git.SbtGit.GitKeys.gitUncommittedChanges,
-  com.github.sbt.git.SbtGit.GitKeys.gitDescribedVersion,
-)
-scalaVersion := "3.9.0"
+scalaVersion := "3.10.0"
 
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
@@ -33,7 +26,7 @@ libraryDependencies ++= Seq(
   "com.guizmaii" %% "scala-nimbus-jose-jwt-zio" % "4.2.1",
 
   // YAML 1.2 parser for SKILL.md frontmatter in McpSkillsJars.
-  "org.snakeyaml" % "snakeyaml-engine" % "3.1.1",
+  "org.snakeyaml" % "snakeyaml-engine" % "3.2",
 
   "org.slf4j" % "slf4j-simple" % "2.0.20" % Test,
 
@@ -48,7 +41,7 @@ libraryDependencies ++= Seq(
 
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
-  "dev.tachyonmcp" % "tachyon-core" % "1.0.0-beta.31" % Test,
+  "dev.tachyonmcp" % "tachyon-core" % "1.0.0" % Test,
 
   // Real SkillsJars (https://skillsjars.com) on the test classpath for McpSkillsJarsSpec.
   "com.skillsjars" % "anthropics__skills__pdf"              % "2026_02_25-3d59511" % Test,
@@ -119,4 +112,4 @@ Global / mcpPort := 5120
 // SkillsJars: extract agent Skills with `./sbt extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.10" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.11" % Skills
