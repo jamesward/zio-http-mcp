@@ -110,9 +110,9 @@ ThisBuild / versionScheme := Some("semver-spec")
 // Only when this is the root build: another build that loads this one (an sbt
 // ProjectRef, e.g. a demo depending on the library from source) would otherwise
 // start a second server on the same port and fail with "Address already in use".
-Global / mcpEnabled := (LocalRootProject / thisProjectRef).value.build == loadedBuild.value.root
-Global / mcpHost := "127.0.0.1"
-Global / mcpPort := 5120
+ThisBuild / mcpEnabled := (LocalRootProject / thisProjectRef).value.build == loadedBuild.value.root
+ThisBuild / mcpHost := "127.0.0.1"
+ThisBuild / mcpPort := 5120
 
 // SkillsJars: extract agent Skills with `./sbt extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
