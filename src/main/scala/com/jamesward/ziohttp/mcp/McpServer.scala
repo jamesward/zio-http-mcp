@@ -252,6 +252,41 @@ final class McpServer[-R] private (
       else baseRoutes ++ Routes(Method.GET / mountPathCodec / trailing -> Handler.notFound)
     (prmRoutes ++ mcpRoutes).sandbox
 
+  /**
+   * Serve this server over the stdio transport's framing on any byte stream:
+   * newline-delimited JSON-RPC read from `input` and written to `output`, e.g. a
+   * socket connection to a long-running server. Returns when `input` ends. See
+   * [[McpStreamServer]]; `principal` is who every request acts as when [[auth]] is
+   * configured (there is no HTTP authentication on a stream).
+   */
+  def serveStream(
+    input: java.io.InputStream,
+    output: java.io.OutputStream,
+    principal: Option[Principal] = None,
+  ): ZIO[R, Throwable, Unit] =
+    McpStreamServer.serve(this, input, output, principal)
+
+  /**
+   * Serve this server over stdio, as a subprocess an MCP client launched: requests
+   * on stdin, messages on stdout, until stdin ends. stdout must carry nothing but
+   * MCP messages, so while serving, ZIO's default loggers are replaced by one that
+   * writes to stderr, and `System.out` is pointed at stderr. (Output already bound
+   * to the original stdout, such as `scala.Console.out` once initialized, is not
+   * redirected: log with ZIO or to stderr.)
+   */
+  def serveStdio: ZIO[R, Throwable, Unit] =
+    val stdout = java.io.FileOutputStream(java.io.FileDescriptor.out)
+    val toStderr = Runtime.removeDefaultLoggers ++
+      Runtime.addLogger(ZLogger.default.map(line => java.lang.System.err.println(line)))
+    ZIO.scoped:
+      for
+        _ <- toStderr.build
+        _ <- ZIO.acquireRelease(ZIO.succeed { val previous = java.lang.System.out; java.lang.System.setOut(java.lang.System.err); previous })(
+               previous => ZIO.succeed(java.lang.System.setOut(previous))
+             )
+        _ <- serveStream(java.lang.System.in, stdout)
+      yield ()
+
   def statelessRoutes: Routes[R, Response] =
     (prmRoutes ++ mcpStatelessRoutes).sandbox
 
@@ -455,6 +490,29 @@ final class McpServer[-R] private (
       body      <- request.body.asString.orElseFail(badRequest("Failed to read request body"))
       bodyJson  <- ZIO.fromEither(body.fromJson[Json.Obj])
                      .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
+      response  <- statelessDispatch(request, bodyJson, principal, pathParams)
+    yield response
+
+  /**
+   * Serve one JSON-RPC message from a byte-stream transport ([[McpStreamServer]]):
+   * the stateless dispatch, without the HTTP layer's origin check and authentication.
+   * The answer is a `Response` like an HTTP POST's (a JSON body, or an SSE stream of
+   * messages); the stream transport writes its messages to the connection.
+   */
+  private[mcp] def streamDispatch(
+    message: Json.Obj,
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Nothing, Response] =
+    statelessDispatch(Request.post(URL.root, Body.empty), message, principal, pathParams).merge
+
+  private def statelessDispatch(
+    request: Request,
+    bodyJson: Json.Obj,
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+  ): ZIO[R, Response, Response] =
+    for
       message   <- ZIO.fromEither(bodyJson.toJson.fromJson[JsonRpcMessage])
                      .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
       response  <- message match
@@ -1485,9 +1543,12 @@ final class McpServer[-R] private (
   // Task status notifications are not offered (polling is the baseline), so the
   // acknowledgement agrees to no task ids.
   private def listen(id: RequestId): ZIO[Any, Response, Response] =
-    val subscriptionId = SessionId.generate.value
+    // The subscription id is the `subscriptions/listen` request's own JSON-RPC id,
+    // which clients use to tell subscriptions apart (on stdio they share one channel).
+    // The server agrees to no notification types (it emits none).
     val ackParams = Json.Obj(Chunk(
-      McpMeta.SubscriptionId -> Json.Str(subscriptionId),
+      "_meta"         -> Json.Obj(Chunk(McpMeta.SubscriptionId -> id.asJson)),
+      "notifications" -> Json.Obj(),
     ))
     val ack = (JsonRpcMessage.Notification("notifications/subscriptions/acknowledged", Some(ackParams)): JsonRpcMessage).toJson
     val ackEvent = ZStream.succeed(sseEvent(ack))

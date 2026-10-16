@@ -589,10 +589,8 @@ object ConformanceSpec extends ZIOSpecDefault:
    * selector never ran, and this is one of them. Its failing checks are
    * SEP-2575 gaps unrelated to this suite's other scenarios — we do not reject
    * a modern request whose `_meta` omits `protocolVersion` /
-   * `clientCapabilities` with `-32602` + HTTP 400, we have no
-   * `MissingRequiredClientCapabilityError` (-32021) path, and
-   * `subscriptions/listen` neither acknowledges a subscription nor tags its
-   * notifications with a subscription id. Fixing those is separate work; the
+   * `clientCapabilities` with `-32602` + HTTP 400, and we have no
+   * `MissingRequiredClientCapabilityError` (-32021) path. Fixing those is separate work; the
    * baseline keeps them visible rather than silently unrun.
    *
    * Bridged networking cannot give the kit a localhost URL, so

@@ -22,6 +22,8 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-http"              % "3.11.6",
   "dev.zio" %% "zio-schema-derivation" % "1.9.0",
   "dev.zio" %% "zio-schema-json"       % "1.9.0",
+  // Subprocesses for the stdio client transport.
+  "dev.zio" %% "zio-process"           % "0.8.1",
 
   "com.guizmaii" %% "scala-nimbus-jose-jwt-zio" % "4.2.1",
 
@@ -88,6 +90,14 @@ javaOptions += "-Djava.net.preferIPv4Stack=true"
 // shutdown hook). ConformanceSpec already stops each container in a `finally`
 // and uses a one-shot startup check, so cleanup is unaffected.
 Test / envVars += "TESTCONTAINERS_RYUK_DISABLED" -> "true"
+
+// McpClientStdioSpec launches stdio MCP servers from the test sources as
+// subprocesses, on the test runtime classpath.
+Test / javaOptions += Def.uncached {
+  val converter = fileConverter.value
+  val files = (Test / fullClasspath).value.map(entry => converter.toPath(entry.data).toFile)
+  s"-Dtest.classpath=${files.mkString(java.io.File.pathSeparator)}"
+}
 
 licenses := Seq("MIT License" -> uri("https://opensource.org/licenses/MIT"))
 

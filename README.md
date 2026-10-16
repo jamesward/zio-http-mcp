@@ -5,7 +5,7 @@ zio-http-mcp
 
 An MCP (Model Context Protocol) server and client library for Scala 3, ZIO, and ZIO HTTP.
 
-Implements the [MCP 2025-11-25 specification](https://modelcontextprotocol.io) with Streamable HTTP transport, SSE streaming, tools, resources, prompts, sampling, elicitation, and progress notifications. The client supports the Streamable HTTP transport and OAuth 2.1 authorization — both `client_credentials` and the MCP-spec `authorization_code` + PKCE flow with Client ID Metadata Documents (CIMD).
+Implements the [MCP 2025-11-25 specification](https://modelcontextprotocol.io) with the Streamable HTTP and [stdio](#stdio) transports, SSE streaming, tools, resources, prompts, sampling, elicitation, and progress notifications. The client supports the Streamable HTTP and [stdio](#stdio-servers) transports and OAuth 2.1 authorization — both `client_credentials` and the MCP-spec `authorization_code` + PKCE flow with Client ID Metadata Documents (CIMD).
 
 The library is **dual-era**: it also implements the stateless [MCP 2026-07-28 specification](https://modelcontextprotocol.io/specification/2026-07-28) (final) and negotiates the protocol version per connection. See [Protocol version negotiation](#protocol-version-negotiation).
 
@@ -458,6 +458,19 @@ object Main extends ZIOAppDefault:
     Server.serve(server.statelessRoutes).provide(Server.default)
 ```
 
+### stdio
+
+`server.serveStdio` serves the [stdio transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio), for a server an MCP client launches as a subprocess: newline-delimited JSON-RPC on stdin and stdout, until stdin closes.
+
+```scala
+object Main extends ZIOAppDefault:
+  def run = server.serveStdio
+```
+
+Requests are served statelessly, as in stateless mode, and concurrently. A tool call's progress and log notifications are written before its response, and `notifications/cancelled` interrupts the request it names. Both the `initialize` revisions and 2026-07-28 are served. stdout must carry only MCP messages, so while serving, ZIO's default loggers are replaced by one writing to stderr and `System.out` points at stderr (output already bound to the original stdout, like an initialized `scala.Console.out`, is not redirected).
+
+`server.serveStream(input, output)` speaks the same framing over any `InputStream` / `OutputStream`, e.g. a Unix domain socket connection to a long-running server, which the transport specification recommends for custom transports. It returns when `input` ends, interrupting requests still running. Neither has an HTTP layer, so origin checks and HTTP authorization don't apply: with `.auth(...)` configured, pass the `principal` every request acts as.
+
 ## Protocol version negotiation
 
 The library supports two protocol revisions and negotiates between them per connection:
@@ -896,7 +909,7 @@ Server.serve(server.routes).provide(
 
 ## Client
 
-The library also ships an MCP **client** for the Streamable HTTP transport. Connect to a server, and the client performs the `initialize` handshake, sends `notifications/initialized`, tracks the `Mcp-Session-Id`, and sends the negotiated `MCP-Protocol-Version` on every subsequent request. Responses are read whether the server replies with `application/json` or streams a `text/event-stream` (SSE).
+The library also ships an MCP **client** for the Streamable HTTP transport and for [stdio servers](#stdio-servers). Connect to a server, and the client performs the `initialize` handshake, sends `notifications/initialized`, tracks the `Mcp-Session-Id`, and sends the negotiated `MCP-Protocol-Version` on every subsequent request. Responses are read whether the server replies with `application/json` or streams a `text/event-stream` (SSE).
 
 `McpClient.connect` requires a `Client` and a `Scope`. The connection — including any OAuth token and the server session — lives for the duration of the scope; on scope close the client issues a best-effort `DELETE` to release the session.
 
@@ -942,7 +955,7 @@ Errors surface as a typed `McpClientError`:
 
 | Case | Meaning |
 |------|---------|
-| `Transport` | the HTTP request itself failed (connection, timeout, TLS, IO) |
+| `Transport` | the HTTP request itself failed (connection, timeout, TLS, IO), or a stdio server couldn't start or exited |
 | `Protocol` | a Streamable HTTP / JSON-RPC framing violation (bad status, garbled body) |
 | `JsonRpc(code, message, data)` | the server returned a JSON-RPC error object |
 | `Decode` | the `result` payload didn't match the expected type |
@@ -1057,6 +1070,30 @@ ZIO.scoped:
   yield tools
 .provide(Client.default)
 ```
+
+### stdio servers
+
+`McpClient.connectStdio` launches an MCP server as a subprocess and speaks the [stdio transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio): newline-delimited JSON-RPC over the process's stdin and stdout. It needs only a `Scope`, which owns the process: closing it closes the server's stdin, waits for it to exit, and terminates it (then kills it) if it doesn't within `shutdownTimeout`.
+
+```scala
+import com.jamesward.ziohttp.mcp.client.*
+import zio.*
+import zio.json.ast.Json
+
+ZIO.scoped:
+  for
+    client <- McpClient.connectStdio(McpStdioConfig(
+                command = "/usr/local/bin/my-mcp-server",
+                args = Chunk("--stdio"),
+                env = Map("API_TOKEN" -> "…"),
+                stderr = line => ZIO.logInfo(s"server: $line"),
+              ))
+    tools  <- client.listTools
+    result <- client.callTool("echo", Json.Obj("text" -> Json.Str("hi")))
+  yield result
+```
+
+The protocol is the same as over HTTP. With the default `preferredVersion` the client probes with `server/discover` and falls back to the `initialize` handshake for a legacy server, including one that never answers the probe: after `discoverTimeout` it tries the handshake while the probe stays open, so a modern server that is just slow to start (a JVM, say) still ends up modern. Request metadata rides in the message body, an interrupted call sends `notifications/cancelled`, a legacy server's `ping` is answered, and once the server's stdout ends every pending and later call fails with `McpClientError.Transport`.
 
 ## Dynamic tool & resource sources
 
