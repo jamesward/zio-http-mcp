@@ -16,8 +16,8 @@ jobs:
           cache: 'sbt'
 
       - run: |
-          ./sbt test
-          ./sbt ci-release
+          ./sbta test
+          ./sbta ci-release
         env:
           SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
           SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
