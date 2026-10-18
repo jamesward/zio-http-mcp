@@ -116,15 +116,7 @@ Compile / doc / scalacOptions ++= Seq("-doc-root-content", (baseDirectory.value 
 
 ThisBuild / versionScheme := Some("semver-spec")
 
-// sbt-mcp (loopback-only: its tools can execute build tasks)
-// Only when this is the root build: another build that loads this one (an sbt
-// ProjectRef, e.g. a demo depending on the library from source) would otherwise
-// start a second server on the same port and fail with "Address already in use".
-ThisBuild / mcpEnabled := (LocalRootProject / thisProjectRef).value.build == loadedBuild.value.root
-ThisBuild / mcpHost := "127.0.0.1"
-ThisBuild / mcpPort := 5120
-
-// SkillsJars: extract agent Skills with `./sbt extractSkillsJars`
+// SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
 libraryDependencies += "com.jamesward" % "skills" % "0.0.11" % Skills
