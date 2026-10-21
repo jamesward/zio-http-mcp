@@ -15,7 +15,7 @@ scalacOptions ++= Seq(
   "-release", "17",
 )
 
-val zioVersion = "2.1.26"
+val zioVersion = "2.1.27"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                   % zioVersion,
@@ -38,14 +38,14 @@ libraryDependencies ++= Seq(
 
   "org.testcontainers" % "testcontainers" % "2.0.5" % Test,
 
-  "io.modelcontextprotocol.sdk" % "mcp-core"           % "2.0.1" % Test,
-  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "2.0.1" % Test,
+  "io.modelcontextprotocol.sdk" % "mcp-core"           % "2.1.0" % Test,
+  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "2.1.0" % Test,
 
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
-  "dev.tachyonmcp" % "tachyon-core" % "1.0.0" % Test,
+  "dev.tachyonmcp" % "tachyon-core" % "1.0.1" % Test,
   // tachyon's SEP-2663 Tasks extension, for task interop with our client.
-  "dev.tachyonmcp" % "tachyon-extensions-tasks" % "1.0.0" % Test,
+  "dev.tachyonmcp" % "tachyon-extensions-tasks" % "1.0.1" % Test,
 
   // Real SkillsJars (https://skillsjars.com) on the test classpath for McpSkillsJarsSpec.
   "com.skillsjars" % "anthropics__skills__pdf"              % "2026_02_25-3d59511" % Test,
@@ -119,4 +119,4 @@ ThisBuild / versionScheme := Some("semver-spec")
 // SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.11" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.17" % Skills
