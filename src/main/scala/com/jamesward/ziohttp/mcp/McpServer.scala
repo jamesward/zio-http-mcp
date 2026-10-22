@@ -504,20 +504,23 @@ final class McpServer[-R] private (
     principal: Option[Principal],
     pathParams: Map[String, String],
   ): ZIO[R, Nothing, Response] =
-    statelessDispatch(Request.post(URL.root, Body.empty), message, principal, pathParams).merge
+    // A byte stream has no HTTP headers to mirror the body into, so the routing
+    // headers the Streamable HTTP binding requires are not required here.
+    statelessDispatch(Request.post(URL.root, Body.empty), message, principal, pathParams, httpBinding = false).merge
 
   private def statelessDispatch(
     request: Request,
     bodyJson: Json.Obj,
     principal: Option[Principal],
     pathParams: Map[String, String],
+    httpBinding: Boolean = true,
   ): ZIO[R, Response, Response] =
     for
       message   <- ZIO.fromEither(bodyJson.toJson.fromJson[JsonRpcMessage])
                      .mapError(e => jsonRpcErrorResponse(None, ErrorCode.ParseError, s"Parse error: $e"))
       response  <- message match
         case JsonRpcMessage.Request(id, method, params) =>
-          negotiateEra(request, Some(id), method, params) match
+          negotiateEra(request, Some(id), method, params, httpBinding) match
             case Left(resp) =>
               ZIO.succeed(resp)
             case Right(ProtocolEra.Modern(version)) =>
@@ -546,19 +549,22 @@ final class McpServer[-R] private (
    * Classify a Streamable HTTP request and, for modern requests, validate its
    * routing headers and resolve the protocol version. Returns the negotiated
    * [[ProtocolEra]], or a ready-made `400 Bad Request` response on a modern
-   * header/version failure.
+   * header/version failure. `httpBinding` is false for the stdio/stream
+   * transport, which carries no headers, so the Streamable HTTP binding's
+   * required routing headers are only enforced over HTTP.
    */
   private def negotiateEra(
     request: Request,
     id: Option[RequestId],
     method: String,
     params: Option[Json.Obj],
+    httpBinding: Boolean = true,
   ): Either[Response, ProtocolEra] =
     val protoHeader = request.rawHeader(Negotiation.ProtocolVersionHeader)
     if Negotiation.isModernRequest(method, params, protoHeader) then
       val methodHeader = request.rawHeader(Negotiation.MethodHeader)
       val nameHeader   = request.rawHeader(Negotiation.NameHeader)
-      Negotiation.resolveModern(method, params, protoHeader, methodHeader, nameHeader) match
+      Negotiation.resolveModern(method, params, protoHeader, methodHeader, nameHeader, requireHeaders = httpBinding) match
         case Left(err)      => Left(negotiationErrorResponse(id, err))
         case Right(version) => Right(ProtocolEra.Modern(version))
     else

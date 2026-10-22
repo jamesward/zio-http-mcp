@@ -144,10 +144,10 @@ object NegotiationSpec extends ZIOSpecDefault:
       assertTrue(r == Right(ProtocolVersion.V2026_07_28))
     ,
 
-    test("resolveModern: missing Mcp-Method is accepted (lenient about absence)"):
+    test("resolveModern: missing Mcp-Method is a header mismatch (the header is REQUIRED)"):
       val params = Some(Json.Obj("_meta" -> meta(Modern)))
       val r = Negotiation.resolveModern("tools/list", params, Some(Modern), None, None)
-      assertTrue(r == Right(ProtocolVersion.V2026_07_28))
+      assertTrue(r.left.exists { case NegotiationError.HeaderMismatch(_) => true; case _ => false })
     ,
 
     test("resolveModern: Mcp-Method disagreeing with body is a header mismatch"):
@@ -168,23 +168,29 @@ object NegotiationSpec extends ZIOSpecDefault:
       assertTrue(r == Right(ProtocolVersion.V2026_07_28))
     ,
 
-    test("resolveModern: tools/call validates a present Mcp-Name but accepts a missing one"):
+    test("resolveModern: tools/call requires Mcp-Name and validates it against params.name"):
       val params = Some(Json.Obj("name" -> Json.Str("add"), "_meta" -> meta(Modern)))
       val missing = Negotiation.resolveModern("tools/call", params, Some(Modern), Some("tools/call"), None)
       val wrong   = Negotiation.resolveModern("tools/call", params, Some(Modern), Some("tools/call"), Some("subtract"))
       val ok      = Negotiation.resolveModern("tools/call", params, Some(Modern), Some("tools/call"), Some("add"))
       assertTrue(
-        // absent → accepted (lenient)
-        missing == Right(ProtocolVersion.V2026_07_28),
+        // absent → rejected (REQUIRED for tools/call)
+        missing.left.exists { case NegotiationError.HeaderMismatch(_) => true; case _ => false },
         // present but wrong → rejected
         wrong.left.exists { case NegotiationError.HeaderMismatch(_) => true; case _ => false },
         ok == Right(ProtocolVersion.V2026_07_28),
       )
     ,
 
-    test("resolveModern: a request with no routing headers at all is accepted"):
+    test("resolveModern: only Mcp-Method is needed when the method has no Mcp-Name source"):
       val params = Some(Json.Obj("_meta" -> meta(Modern)))
-      val r = Negotiation.resolveModern("server/discover", params, None, None, None)
+      val r = Negotiation.resolveModern("server/discover", params, None, Some("server/discover"), None)
+      assertTrue(r == Right(ProtocolVersion.V2026_07_28))
+    ,
+
+    test("resolveModern: tasks methods mirror Mcp-Name but do not require it"):
+      val params = Some(Json.Obj("taskId" -> Json.Str("t1"), "_meta" -> meta(Modern)))
+      val r = Negotiation.resolveModern("tasks/get", params, Some(Modern), Some("tasks/get"), None)
       assertTrue(r == Right(ProtocolVersion.V2026_07_28))
     ,
 
@@ -387,16 +393,16 @@ object NegotiationSpec extends ZIOSpecDefault:
       )
     ,
 
-    test("missing Mcp-Name on modern tools/call is accepted (lenient about absent headers)"):
+    test("missing Mcp-Name on modern tools/call -> 400 with -32020 (the header is REQUIRED)"):
       val extra = Chunk[(String, Json)]("name" -> Json.Str("add"), "arguments" -> Json.Obj("a" -> Json.Num(1), "b" -> Json.Num(1)))
       for
         port <- Server.install(testServer.routes)
         resp <- postModern(port, modernBody(1, "tools/call", extra), "tools/call", name = None)
         b    <- bodyJson(resp)
-      yield
-        val text = resultOf(b).flatMap(_.get("content")).flatMap(_.asArray).flatMap(_.headOption)
-          .flatMap(_.asObject).flatMap(_.get("text")).flatMap(_.asString)
-        assertTrue(resp.status == Status.Ok, text.contains("2"))
+      yield assertTrue(
+        resp.status == Status.BadRequest,
+        codeOf(b).contains(ErrorCode.HeaderMismatch.code),
+      )
     ,
 
     test("present-but-wrong Mcp-Name on modern tools/call -> 400 with -32020"):
@@ -916,13 +922,13 @@ object NegotiationSpec extends ZIOSpecDefault:
       val call1 = modernBody(1, "prompts/get", Chunk("name" -> Json.Str("contextual")))
       for
         port <- Server.install(mrtrServer.routes)
-        r1   <- postModern(port, call1, "prompts/get")
+        r1   <- postModern(port, call1, "prompts/get", name = Some("contextual"))
         b1   <- bodyJson(r1)
         call2 = modernBody(2, "prompts/get", Chunk(
                   "name" -> Json.Str("contextual"),
                   "inputResponses" -> Json.Obj("user_context" -> elicitedJson("context", "test context")),
                 ))
-        r2   <- postModern(port, call2, "prompts/get")
+        r2   <- postModern(port, call2, "prompts/get", name = Some("contextual"))
         b2   <- bodyJson(r2)
       yield
         val text = resultOf(b2).flatMap(_.get("messages")).flatMap(_.asArray).flatMap(_.headOption)

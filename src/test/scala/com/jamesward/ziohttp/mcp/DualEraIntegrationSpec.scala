@@ -61,7 +61,7 @@ object DualEraIntegrationSpec extends ZIOSpecDefault:
 
   // --- minimal new-protocol client: raw modern POST WITHOUT routing headers ---
 
-  private def rawModernNoHeaders(port: Int, id: Int, method: String, extra: Chunk[(String, Json)]): ZIO[Client & Scope, Throwable, Json.Obj] =
+  private def rawModernNoHeaders(port: Int, id: Int, method: String, extra: Chunk[(String, Json)]): ZIO[Client & Scope, Throwable, (Status, Json.Obj)] =
     val meta = Json.Obj(
       McpMeta.ProtocolVersion    -> Json.Str(ProtocolVersion.V2026_07_28.wire),
       McpMeta.ClientInfo         -> Json.Obj("name" -> Json.Str("minimal"), "version" -> Json.Str("1")),
@@ -75,7 +75,7 @@ object DualEraIntegrationSpec extends ZIOSpecDefault:
       .addHeader(Header.ContentType(MediaType.application.json))
       .addHeader("accept", "application/json, text/event-stream")
     ZClient.batched(req).flatMap: r =>
-      r.body.asString.flatMap(s => ZIO.fromEither(s.fromJson[Json.Obj]).mapError(e => RuntimeException(s"$e: $s"))).map(j => (r.status, j)).map(_._2)
+      r.body.asString.flatMap(s => ZIO.fromEither(s.fromJson[Json.Obj]).mapError(e => RuntimeException(s"$e: $s"))).map(j => (r.status, j))
 
   override def spec =
     suite("DualEraIntegrationSpec (one server, old + new clients)")(
@@ -143,22 +143,21 @@ object DualEraIntegrationSpec extends ZIOSpecDefault:
         )
       ,
 
-      test("a minimal new-protocol client with no routing headers is served"):
+      test("a new-protocol request without the required routing headers is rejected with HeaderMismatch"):
+        // The 2026-07-28 Streamable HTTP binding makes Mcp-Method (and Mcp-Name for
+        // tools/call) REQUIRED and lists a missing one as a validation failure.
         for
-          port      <- Server.install(server.routes)
-          discover  <- rawModernNoHeaders(port, 1, "server/discover", Chunk.empty)
-          call      <- rawModernNoHeaders(port, 2, "tools/call",
+          port                      <- Server.install(server.routes)
+          (discoverStatus, discover) <- rawModernNoHeaders(port, 1, "server/discover", Chunk.empty)
+          (callStatus, call)         <- rawModernNoHeaders(port, 2, "tools/call",
                          Chunk("name" -> Json.Str("add"), "arguments" -> Json.Obj("a" -> Json.Num(7), "b" -> Json.Num(8))))
         yield
-          val supported = discover.get("result").flatMap(_.asObject).flatMap(_.get("supportedVersions"))
-            .flatMap(_.asArray).map(_.flatMap(_.asString).toList).getOrElse(Nil)
-          val callText = call.get("result").flatMap(_.asObject).flatMap(_.get("content")).flatMap(_.asArray)
-            .flatMap(_.headOption).flatMap(_.asObject).flatMap(_.get("text")).flatMap(_.asString)
+          def code(b: Json.Obj) = b.get("error").flatMap(_.asObject).flatMap(_.get("code")).flatMap(_.asNumber).map(_.value.intValue)
           assertTrue(
-            // discover succeeds and offers the modern version, even with no Mcp-Method header
-            supported.contains(ProtocolVersion.V2026_07_28.wire),
-            // and a tool call with no Mcp-Name header is accepted
-            callText.exists(_.contains("15")),
+            discoverStatus == Status.BadRequest,
+            code(discover).contains(ErrorCode.HeaderMismatch.code),
+            callStatus == Status.BadRequest,
+            code(call).contains(ErrorCode.HeaderMismatch.code),
           )
       ,
 

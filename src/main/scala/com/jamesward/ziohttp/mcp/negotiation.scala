@@ -90,26 +90,36 @@ object Negotiation:
     modernMethod || bodyModern || headerModern
 
   /**
+   * The methods whose `Mcp-Name` header is REQUIRED by the 2026-07-28 Streamable
+   * HTTP binding ("Standard Request Headers"). The Tasks extension's methods also
+   * mirror a body field into `Mcp-Name` (see [[nameSourceField]]), but the core
+   * spec does not require it there, so for those a missing header stays accepted.
+   */
+  private val nameRequired: Set[String] = Set("tools/call", "resources/read", "prompts/get")
+
+  /**
    * Validate a modern request's routing headers against its body and resolve
    * the negotiated protocol version.
    *
-   * Validation is deliberately lenient about *absence*: the standard routing
-   * headers (`Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version`) exist so that
-   * intermediaries can route/inspect a request without parsing its body, and
-   * the security property they protect is header↔body *agreement* — not their
-   * mere presence. The request body is always the source of truth, so a header
-   * that is simply missing is accepted, while a header that is *present and
-   * disagrees* with the body is rejected (`HeaderMismatch`). This keeps the
-   * server interoperable with the many real clients that do not yet emit the
-   * 2026-07-28 routing headers, without weakening the anti-spoofing guarantee.
+   * The 2026-07-28 Streamable HTTP binding makes the standard request headers
+   * REQUIRED and lists a missing one as a validation failure (400 +
+   * `HeaderMismatch`), so that intermediaries routing on the header and the
+   * server executing the body can never disagree:
    *
-   *   - `Mcp-Method`, when present, must equal the JSON-RPC `method`.
-   *   - `MCP-Protocol-Version`, when present, must equal the body's `_meta`
-   *     protocol version (when the body declares one).
-   *   - `Mcp-Name`, when present, must equal `params.name` / `params.uri` for
-   *     the data methods (`params.taskId` for the `tasks/...` methods), decoding the Base64
+   *   - `Mcp-Method` must be present and equal the JSON-RPC `method`.
+   *   - `Mcp-Name` must be present for `tools/call` / `resources/read` /
+   *     `prompts/get`, and, when present, equal `params.name` / `params.uri`
+   *     (`params.taskId` for the `tasks/...` methods), decoding the Base64
    *     sentinel form first.
+   *   - `MCP-Protocol-Version`, when present, must equal the body's `_meta`
+   *     protocol version (when the body declares one). Its *absence* stays
+   *     accepted: the spec lets a server that still supports pre-2025-06-18
+   *     clients (this one serves 2025-03-26) tolerate a missing header, and the
+   *     body remains the source of truth.
    *   - the resolved version must be one the server supports.
+   *
+   * `requireHeaders = false` checks only header↔body agreement, for a binding
+   * with no headers to mirror into (the stdio/stream transport).
    */
   def resolveModern(
     method: String,
@@ -117,11 +127,14 @@ object Negotiation:
     protocolHeader: Option[String],
     methodHeader: Option[String],
     nameHeader: Option[String],
+    requireHeaders: Boolean = true,
   ): Either[NegotiationError, ProtocolVersion] =
     val bodyVersion = bodyProtocolVersion(params)
 
     // Mcp-Method, when present, must match the JSON-RPC method.
     val methodCheck: Either[NegotiationError, Unit] = methodHeader match
+      case None if requireHeaders =>
+        Left(NegotiationError.HeaderMismatch(s"Missing required Mcp-Method header (body method '$method')"))
       case Some(h) if h != method =>
         Left(NegotiationError.HeaderMismatch(s"Mcp-Method header '$h' does not match body method '$method'"))
       case _ => Right(())
@@ -139,6 +152,8 @@ object Negotiation:
       case Some(field) =>
         val bodyValue = params.flatMap(_.get(field)).flatMap(_.asString)
         (nameHeader, bodyValue) match
+          case (None, _) if requireHeaders && nameRequired.contains(method) =>
+            Left(NegotiationError.HeaderMismatch(s"Missing required Mcp-Name header for '$method'"))
           case (Some(h), Some(b)) if decodeHeaderValue(h) != b =>
             Left(NegotiationError.HeaderMismatch(
               s"Mcp-Name header '${decodeHeaderValue(h)}' does not match body '$field' value '$b'"))
