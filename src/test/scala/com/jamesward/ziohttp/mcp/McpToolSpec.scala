@@ -320,15 +320,21 @@ object McpToolSpec extends ZIOSpecDefault:
           resultText(forbidden) == "Forbidden: classified",
         )
       ,
-      test("handler defect returns error result"):
+      test("handler defect returns a generic error result and does not leak the exception text"):
         val tool = McpTool("boom")
           .description("Dies unexpectedly")
           .handle[Any, String]:
-            ZIO.die(RuntimeException("something broke"))
-        for result <- tool.call(None)
+            ZIO.die(RuntimeException("null: internal.example/10.0.0.1:443"))
+        for
+          result <- tool.call(None)
+          logs   <- ZTestLogger.logOutput
         yield assertTrue(
           result.isError.contains(true),
-          resultText(result) == "something broke",
+          resultText(result) == "Tool 'boom' failed with an internal server error. The failure has been logged on the server.",
+          !resultText(result).contains("internal.example"),
+          // the full cause is logged instead
+          logs.exists(e => e.message() == "MCP tool defect" && e.logLevel.ordinal == LogLevel.Error.ordinal &&
+            e.cause.prettyPrint.contains("internal.example")),
         )
     ),
 

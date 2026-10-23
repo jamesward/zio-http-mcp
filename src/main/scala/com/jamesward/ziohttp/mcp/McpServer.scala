@@ -1361,11 +1361,8 @@ final class McpServer[-R] private (
                 val runTool = toolEffect
                   .flatMap(r => resultPromise.succeed(callToolResultJson(r)))
                   .catchAllDefect: defect =>
-                    val errorResult = CallToolResult(
-                      content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
-                      isError = Some(true),
-                    )
-                    resultPromise.succeed(callToolResultJson(errorResult))
+                    McpTool.defectResult(tool.name, Cause.die(defect))
+                      .flatMap(errorResult => resultPromise.succeed(callToolResultJson(errorResult)))
                   .ensuring(drainThenShutdown(queue))
                 runTool.fork.as:
                   sseToolCallResponse(id, queue, resultPromise)
@@ -1387,10 +1384,7 @@ final class McpServer[-R] private (
           enforceToolScopes(request, principal, tool) *>
             tool.callWithContext(callParams.arguments, McpToolContext.noopWith(principal, pathParams))
               .catchAllDefect: defect =>
-                ZIO.succeed(CallToolResult(
-                  content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
-                  isError = Some(true),
-                ))
+                McpTool.defectResult(tool.name, Cause.die(defect))
               .flatMap(result => resultResponse(id, version, result))
 
   private def handleResourcesList(

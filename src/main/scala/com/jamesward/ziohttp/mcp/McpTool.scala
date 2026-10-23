@@ -228,10 +228,7 @@ final class McpTool private (
               case signal: McpToolContext.InputRequiredSignal =>
                 ZIO.die(signal)
               case defect =>
-                ZIO.succeed(CallToolResult(
-                  content = Chunk(ToolContent.text(Option(defect.getMessage).getOrElse(defect.toString))),
-                  isError = Some(true),
-                ))
+                McpTool.defectResult(capturedName, Cause.die(defect))
 
   // No error
   def handleWithContext[R, In: McpInput, Out: McpOutput](f: (In, McpToolContext) => ZIO[R, Nothing, Out]): McpToolHandlerR[R] =
@@ -248,3 +245,20 @@ final class McpTool private (
 object McpTool:
   def apply(name: String): McpTool =
     new McpTool(ToolName(name), None, None, Set.empty, TaskPolicy.never)
+
+  /**
+   * The result for a tool handler that died. A defect is a bug or an unexpected
+   * failure, not an answer, so the client gets a generic message: the raw
+   * exception text says nothing actionable to an agent (a netty connect failure
+   * reads `null: host/ip:443`) and can leak internals. The full cause is logged
+   * at ERROR instead. Handlers that want to report an expected failure should
+   * fail with a typed error, which [[McpError]] renders.
+   */
+  private[mcp] def defectResult(toolName: ToolName, cause: Cause[Throwable]): UIO[CallToolResult] =
+    ZIO.logAnnotate("tool", toolName.toString)(ZIO.logErrorCause("MCP tool defect", cause))
+      .as(CallToolResult(
+        content = Chunk(ToolContent.text(
+          s"Tool '$toolName' failed with an internal server error. The failure has been logged on the server."
+        )),
+        isError = Some(true),
+      ))
