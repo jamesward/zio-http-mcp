@@ -2,7 +2,8 @@ organization := "com.jamesward"
 
 name := "zio-http-mcp"
 
-scalaVersion := "3.10.0"
+// Scala 3.9 LTS, so the published artifacts are consumable from the LTS line.
+scalaVersion := "3.9.0"
 
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
