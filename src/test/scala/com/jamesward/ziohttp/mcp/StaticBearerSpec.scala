@@ -17,8 +17,9 @@ object StaticBearerSpec extends ZIOSpecDefault:
       ZIO.succeed(s"Hello, ${input.name}!"))
 
   private val routes = server.mcpStatelessRoutes @@ StaticBearer.aspect(token => ZIO.succeed(token == expected))
+  private val openRoutes = server.mcpStatelessRoutes @@ StaticBearer.aspect(token => ZIO.succeed(token == expected), open = StaticBearer.Handshake)
 
-  private def post(body: String, auth: Option[String]) =
+  private def post(body: String, auth: Option[String], routes: Routes[Any, Response] = routes) =
     val headers = Headers("Content-Type", "application/json") ++ Headers("Accept", "application/json, text/event-stream") ++
       auth.fold(Headers.empty)(a => Headers("Authorization", a))
     for
@@ -67,5 +68,20 @@ object StaticBearerSpec extends ZIOSpecDefault:
         get <- routes.runZIO(Request.get(url))
         junk <- post("not json", None)
       yield assertTrue(note.status == Status.Accepted, get.status == Status.MethodNotAllowed, junk._1.status == Status.Ok, junk._2.contains("-32001"))
+    },
+    test("with open = Handshake the handshake works without a token and everything else still needs one") {
+      for
+        (init, initText) <- post(initialize, None, openRoutes)
+        (ping, pingText) <- post("""{"jsonrpc":"2.0","id":5,"method":"ping"}""", None, openRoutes)
+        (list, listText) <- post("""{"jsonrpc":"2.0","id":6,"method":"tools/list"}""", None, openRoutes)
+        (_, wrongText) <- post(initialize, Some("Bearer nope"), openRoutes)
+        (_, goodText) <- post("""{"jsonrpc":"2.0","id":8,"method":"tools/list"}""", Some(s"Bearer $expected"), openRoutes)
+      yield assertTrue(
+        init.status == Status.Ok, initText.contains("\"result\""), initText.contains("bearer-only"), initText.contains("\"id\":7"),
+        ping.status == Status.Ok, pingText.contains("\"result\""),
+        list.status == Status.Ok, listText.contains("-32001"), !listText.contains("greet"), list.headers.get("WWW-Authenticate").isEmpty,
+        wrongText.contains("was not accepted"),
+        goodText.contains("greet"),
+      )
     },
   )

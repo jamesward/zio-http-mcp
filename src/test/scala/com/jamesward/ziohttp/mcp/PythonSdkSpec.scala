@@ -30,6 +30,7 @@ object PythonSdkSpec extends ZIOSpecDefault:
       ZIO.succeed(s"Hello, ${input.name}!"))
 
   private val routes = server.mcpStatelessRoutes @@ StaticBearer.aspect(token => ZIO.succeed(token == expected))
+  private val openRoutes = server.mcpStatelessRoutes @@ StaticBearer.aspect(token => ZIO.succeed(token == expected), open = StaticBearer.Handshake)
 
   private val probe =
     """import asyncio, sys
@@ -117,6 +118,16 @@ object PythonSdkSpec extends ZIOSpecDefault:
           port <- Server.install(routes)
           lines <- run(port, Some("nope"))
         yield assertTrue(lines.exists(_.contains(StaticBearer.RejectedMessage)))
+      ,
+      test("with open = Handshake and no token it initializes like a plain server, and tools/list raises the McpError"):
+        for
+          port <- Server.install(openRoutes)
+          lines <- run(port, None)
+        yield assertTrue(
+          lines.contains("RESULT initialized bearer-only 2025-11-25"),
+          lines.exists(l => l.startsWith("RESULT error -32001 ") && l.contains(StaticBearer.MissingMessage)),
+          !lines.exists(_.startsWith("RESULT tools")),
+        )
       ,
       test("with the token it initializes (2025-11-25) and lists the tools"):
         for
