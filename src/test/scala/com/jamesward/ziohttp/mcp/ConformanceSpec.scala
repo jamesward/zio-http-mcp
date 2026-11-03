@@ -554,36 +554,6 @@ object ConformanceSpec extends ZIOSpecDefault:
     .tool(tasksMultiInput)
 
   /**
-   * A CA bundle to trust inside the image build, taken from the standard
-   * environment variables. On an ordinary machine none of these are set and the
-   * image is built unchanged; behind a TLS-intercepting proxy (corporate network,
-   * sandboxed CI) they point at the proxy's bundle, without which `npm install`
-   * fails the build with `SELF_SIGNED_CERT_IN_CHAIN`.
-   */
-  private val hostCaBundle: Option[Path] =
-    List("NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE")
-      .flatMap(sys.env.get)
-      .map(Paths.get(_))
-      .find(Files.isRegularFile(_))
-
-  /**
-   * Run the kit's container in the host network namespace, so it reaches the
-   * server under test at a genuine `localhost` URL. That matters beyond
-   * convenience: `dns-rebinding-protection` asserts the server's `Origin`
-   * handling for localhost callers and cannot run over
-   * `host.testcontainers.internal`.
-   *
-   * Host networking is a Linux capability (and Docker Desktop 4.34+ with the
-   * feature enabled). Elsewhere we fall back to bridged networking, where that
-   * one scenario is baselined as an expected failure. Force either mode with
-   * `CONFORMANCE_HOST_NETWORK=true|false`.
-   */
-  private val useHostNetwork: Boolean =
-    sys.env.get("CONFORMANCE_HOST_NETWORK")
-      .map(_.equalsIgnoreCase("true"))
-      .getOrElse(java.lang.System.getProperty("os.name", "").toLowerCase.contains("linux"))
-
-  /**
    * `server-stateless` is baselined: running the modern suite by its frozen
    * requirements (rather than by `--spec-version`) reaches scenarios the older
    * selector never ran, and this is one of them. Its failing checks are
@@ -604,7 +574,7 @@ object ConformanceSpec extends ZIOSpecDefault:
   private val expectedFailuresYaml: String =
     val baselined =
       Chunk("server-stateless") ++
-        (if useHostNetwork then Chunk.empty else Chunk("dns-rebinding-protection"))
+        (if DockerSupport.useHostNetwork then Chunk.empty else Chunk("dns-rebinding-protection"))
     baselined.map(s => s"  - $s").mkString("server:\n", "\n", "\n")
 
   /**
@@ -657,10 +627,10 @@ object ConformanceSpec extends ZIOSpecDefault:
     val base = ImageFromDockerfile(s"mcp-conformance-$tag", false)
     // The CA has to be baked in rather than mounted: `npm install` runs during the
     // image build, where volumes are not available.
-    val withContext = hostCaBundle.fold(base)(ca => base.withFileFromPath("ca-bundle.crt", ca))
+    val withContext = DockerSupport.hostCaBundle.fold(base)(ca => base.withFileFromPath("ca-bundle.crt", ca))
     withContext.withDockerfileFromBuilder: builder =>
       builder.from("node:22-slim")
-      hostCaBundle.foreach: _ =>
+      DockerSupport.hostCaBundle.foreach: _ =>
         builder.copy("ca-bundle.crt", "/usr/local/share/ca-certificates/proxy-ca.crt")
         builder.env("NODE_EXTRA_CA_CERTS", "/usr/local/share/ca-certificates/proxy-ca.crt")
       builder
@@ -673,7 +643,7 @@ object ConformanceSpec extends ZIOSpecDefault:
 
   /** The URL the kit uses to reach the server, which depends on the networking mode. */
   private def serverUrlFor(port: Int): String =
-    if useHostNetwork then s"http://localhost:$port/mcp"
+    if DockerSupport.useHostNetwork then s"http://localhost:$port/mcp"
     else s"http://host.testcontainers.internal:$port/mcp"
 
   /** Run the kit against the server bound on `port` of the host. */
@@ -687,8 +657,8 @@ object ConformanceSpec extends ZIOSpecDefault:
     extraArgs: Seq[String] = Seq.empty,
   ): Task[(Long, String)] =
     ZIO.logInfo(
-      s"conformance $specVersion: ${if useHostNetwork then "host" else "bridge"} networking, " +
-        s"url=${serverUrlFor(port)}, ca=${hostCaBundle.fold("none")(_.toString)}"
+      s"conformance $specVersion: ${if DockerSupport.useHostNetwork then "host" else "bridge"} networking, " +
+        s"url=${serverUrlFor(port)}, ca=${DockerSupport.hostCaBundle.fold("none")(_.toString)}"
     ) *>
     ZIO.attemptBlocking:
       val expectedFailuresFile = java.io.File.createTempFile("expected-failures", ".yaml")
@@ -703,7 +673,7 @@ object ConformanceSpec extends ZIOSpecDefault:
       // These `with…` builders declare testcontainers' self type, which Scala infers
       // as `Nothing`; keep them in statement position so no cast to `Nothing` is
       // emitted (in value position that throws `ClassCastException` at runtime).
-      if useHostNetwork then
+      if DockerSupport.useHostNetwork then
         container.withNetworkMode("host")
         ()
       else

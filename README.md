@@ -714,6 +714,12 @@ val routes = server.mcpStatelessRoutes @@ StaticBearer.aspect(token => ZIO.succe
 
 A request without an accepted `Authorization: Bearer <token>` gets HTTP 200 and a JSON-RPC error (`-32001`) that says what is missing, never an HTTP 401 and never a `WWW-Authenticate` challenge. A client takes a 401 as "this server uses OAuth": claude.ai offers "Sign in now (Detected)" and probes `/.well-known/oauth-*`, and Claude Code ends in "Dynamic Client Registration rejected". With the JSON-RPC error on `initialize` the client shows the message instead. A notification without a token gets `202` and is dropped; a `GET` or `DELETE` without one gets `405`.
 
+Some clients check a server before they ask for credentials. claude.ai's connector check POSTs `initialize` without a token and, when that fails, reports that it "couldn't determine how this server signs in". Pass `open = StaticBearer.Handshake` to answer the handshake methods (`initialize`, `notifications/initialized`, `ping`, `server/discover`) without a token. Such a client then sees a regular server, and the first request that needs the token (`tools/list`) gets the `-32001` error that says what to send. A request that does carry a token is always verified, so a wrong token is refused even on the handshake.
+
+```scala
+val routes = server.mcpStatelessRoutes @@ StaticBearer.aspect(token => ZIO.succeed(token == expected), open = StaticBearer.Handshake)
+```
+
 ### Quick Start
 
 ```scala
