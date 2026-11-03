@@ -702,6 +702,18 @@ Authorization is opt-in. A server with no `.auth(...)` call behaves exactly as t
 
 The library acts as an **OAuth 2.1 Resource Server**. It does not host an authorization server — point at one (Keycloak, Authentik, Auth0, Spring Authorization Server, etc.). DCR (Dynamic Client Registration), CIMD, and the user-consent flow are AS-side concerns.
 
+### Bearer-only servers (no OAuth)
+
+When callers hold a pre-shared token (a header the client is configured with, or one a proxy adds), don't use `.auth(...)`. Wrap the routes in `StaticBearer.aspect`:
+
+```scala
+import com.jamesward.ziohttp.mcp.auth.StaticBearer
+
+val routes = server.mcpStatelessRoutes @@ StaticBearer.aspect(token => ZIO.succeed(token == expected))
+```
+
+A request without an accepted `Authorization: Bearer <token>` gets HTTP 200 and a JSON-RPC error (`-32001`) that says what is missing, never an HTTP 401 and never a `WWW-Authenticate` challenge. A client takes a 401 as "this server uses OAuth": claude.ai offers "Sign in now (Detected)" and probes `/.well-known/oauth-*`, and Claude Code ends in "Dynamic Client Registration rejected". With the JSON-RPC error on `initialize` the client shows the message instead. A notification without a token gets `202` and is dropped; a `GET` or `DELETE` without one gets `405`.
+
 ### Quick Start
 
 ```scala

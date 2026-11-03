@@ -6,6 +6,7 @@ Every code example in README.md must have a corresponding test. Tests live in:
 
 - `McpToolSpec` — for tool DSL examples (`.handle`, `.handleWithContext`, error handling, etc.)
 - `AuthSpec` — for authorization examples (`.auth(...)`, `ctx.principal`, `.requireScopes(...)`)
+- `StaticBearerSpec` — for the bearer-only server example (`StaticBearer.aspect`): JSON-RPC error instead of 401, token accepted and rejected, notifications and GET
 - `TokenVerifierSpec` — for `TokenVerifier.discoverJwks` / `.jwks` / `.introspection` behavior
 - `LiveAuthSpec` — for end-to-end DCR + token + tool-call validation (raw HTTP) against `login.jamesward.dev`
 - `JavaSdkAuthSpec` — for end-to-end Java MCP SDK interop with a bearer token against `login.jamesward.dev`
