@@ -5,9 +5,11 @@ import zio.json.ast.Json
 
 /**
  * A dynamic provider of the `initialize` result's `instructions` string, consulted by
- * [[McpServer]] on every `initialize` with the request's [[McpToolContext]] in hand — so
- * the instructions can vary per caller (`ctx.principal`) and per mount (`ctx.pathParams`,
- * e.g. the `<slug>` of a path-parameterised mount).
+ * [[McpServer]] on every `initialize` and `server/discover` with the request's
+ * [[McpToolContext]] in hand — so the instructions can vary per client (`ctx.clientInfo`,
+ * and the extensions it declared, `ctx.extensionCapabilities`), per caller
+ * (`ctx.principal`) and per mount (`ctx.pathParams`, e.g. the `<slug>` of a
+ * path-parameterised mount).
  *
  * Pass one to the [[McpServer.instructions]] overload (the dynamic analogue of passing a
  * plain `String`). Setting one replaces any static instructions value, and vice versa —

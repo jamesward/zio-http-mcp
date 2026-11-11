@@ -160,6 +160,17 @@ trait McpExtensionClient extends McpClient:
     routingName: Option[McpRoutingName] = None,
   ): IO[McpClientError, Json]
 
+  /**
+   * Call a streaming operation (one the server answers with
+   * [[McpBoundOperation.streaming]]): its notifications as they arrive. The
+   * stream ends when the server sends the result, and fails with an error
+   * response; ending it early abandons the request.
+   */
+  def requestStream[Params, Result](
+    operation: McpOperation[Params, Result],
+    params: Params,
+  ): ZStream[Any, McpClientError, McpStreamNotification]
+
 /** How the server answered a [[McpClient.startTool]] call. */
 enum ToolCallOutcome:
   /** The server answered synchronously. */
@@ -534,6 +545,32 @@ object McpClient:
         result <- wire.request(Outgoing(body, id, extra, sendSession = !st.modern))
       yield result
 
+    /** Send a request answered with a stream: its notifications as they arrive.
+      * The stream ends with the request's result, and fails with its error. */
+    def rpcStream(
+      method: String,
+      params: Json.Obj,
+      routingName: Option[McpRoutingName],
+    ): ZStream[Any, McpClientError, McpStreamNotification] =
+      ZStream.unwrap:
+        for
+          st <- stateRef.get
+          n  <- idRef.updateAndGet(_ + 1)
+        yield
+          val id = RequestId.Num(n)
+          val version = st.protocolVersion.flatMap(ProtocolVersion.parse).getOrElse(config.preferredVersion)
+          val effParams = if st.modern then withModernMeta(params, version) else params
+          val body = (JsonRpcMessage.Request(id, method, Some(effParams)): JsonRpcMessage).toJson
+          val extra = if st.modern then modernHeaders(version, method, effParams, routingName) else Headers.empty
+          wire.stream(Outgoing(body, id, extra, sendSession = !st.modern)).mapZIO: message =>
+            message.get("method").flatMap(_.asString) match
+              case Some(m) =>
+                // A notification whose method isn't a valid name is nothing this client can route: skip it.
+                ZIO.succeed(McpMethodName.parse(m).toOption.map(name =>
+                  McpStreamNotification(name, message.get("params").flatMap(_.asObject).getOrElse(Json.Obj()))))
+              case None => ZIO.fromEither(extractResult(message)).as(None)
+          .collectSome
+
     /**
      * Modern `tools/call` with Multi Round-Trip Request handling. If the server
      * answers `input_required`, the configured `onInputRequest` handler fulfils
@@ -755,6 +792,29 @@ object McpClient:
                          yield json
       yield out
 
+    def stream(o: Outgoing): ZStream[Any, McpClientError, Json.Obj] =
+      ZStream.unwrapScoped:
+        for
+          token <- ensureToken(forceRefresh = false)
+          req   <- buildRequest(o, token)
+          resp  <- streaming(req)
+          _     <- captureSession(resp)
+          out   <-
+            if !resp.status.isSuccess then
+              interpret(resp, o.id).flatMap:
+                case Attempt.Unauthorized(b) => ZIO.fail(McpClientError.Auth(s"Server returned 401 Unauthorized: $b"))
+                case Attempt.Ok(_)           => ZIO.fail(McpClientError.Protocol(s"Request returned ${resp.status.code}"))
+            else if resp.rawHeader("content-type").exists(_.toLowerCase.contains("text/event-stream")) then
+              // The response to this request is the last message: messages after it belong to nothing.
+              ZIO.succeed(sseObjects(resp).takeUntil(isResponseFor(_, o.id)))
+            else
+              resp.body.asString
+                .mapError(t => McpClientError.Transport(s"Failed to read response body: ${t.getMessage}", Some(t)))
+                .flatMap(body => ZIO.fromEither(body.fromJson[Json.Obj])
+                  .mapError(e => McpClientError.Protocol(s"Invalid JSON-RPC response: $e ($body)")))
+                .map(ZStream.succeed(_))
+        yield out
+
     private def attempt(o: Outgoing, token: Option[String]): IO[McpClientError, Attempt] =
       ZIO.scoped:
         for
@@ -860,6 +920,15 @@ object McpClient:
       yield out
 
     private def parseSse(resp: Response, id: RequestId): ZIO[Scope, McpClientError, Json] =
+      sseObjects(resp)
+        .filter(obj => isResponseFor(obj, id))
+        .runHead
+        .flatMap:
+          case Some(obj) => ZIO.fromEither(extractResult(obj))
+          case None      => ZIO.fail(McpClientError.Protocol("SSE stream ended before a matching JSON-RPC response"))
+
+    /** The JSON-RPC messages of an SSE response body, as they arrive. */
+    private def sseObjects(resp: Response): ZStream[Any, McpClientError, Json.Obj] =
       resp.body.asStream
         .via(ZPipeline.utf8Decode)
         .via(ZPipeline.splitLines)
@@ -871,12 +940,7 @@ object McpClient:
         .collectSome
         .map(_.fromJson[Json.Obj])
         .collect { case Right(obj) => obj }
-        .filter(obj => isResponseFor(obj, id))
-        .runHead
         .mapError(t => McpClientError.Transport(s"Failed reading SSE stream: ${t.getMessage}", Some(t)))
-        .flatMap:
-          case Some(obj) => ZIO.fromEither(extractResult(obj))
-          case None      => ZIO.fail(McpClientError.Protocol("SSE stream ended before a matching JSON-RPC response"))
 
     /** True when the object is the JSON-RPC response (result or error) for `id`. */
     private def isResponseFor(obj: Json.Obj, id: RequestId): Boolean =
@@ -995,23 +1059,38 @@ object McpClient:
       params: Params,
     ): IO[McpClientError, Result] =
       if !operation.protocolSupport.supports(negotiated.version) then
-        ZIO.fail(McpClientError.Protocol(
-          s"Extension method '${operation.method.value}' is unavailable for ${negotiated.version.wire}"
-        ))
+        ZIO.fail(unavailable(operation))
       else
         for
-          paramsJson <- ZIO.fromEither(operation.paramsCodec.encode(params))
-                          .mapError(message => McpClientError.Decode(
-                            s"Failed to encode params of '${operation.method.value}': $message"
-                          ))
-          paramsObj  <- ZIO.fromOption(paramsJson.asObject)
-                          .orElseFail(McpClientError.Decode("Extension params must encode to an object"))
+          paramsObj  <- encodeParams(operation, params)
           resultJson <- transport.rpcRaw(operation.method.value, paramsObj, operation.routingName(params))
           result     <- ZIO.fromEither(operation.resultCodec.decode(resultJson))
                           .mapError(message => McpClientError.Decode(
                             s"Failed to decode result of '${operation.method.value}': $message"
                           ))
         yield result
+
+    def requestStream[Params, Result](
+      operation: McpOperation[Params, Result],
+      params: Params,
+    ): ZStream[Any, McpClientError, McpStreamNotification] =
+      if !operation.protocolSupport.supports(negotiated.version) then ZStream.fail(unavailable(operation))
+      else
+        ZStream.fromZIO(encodeParams(operation, params)).flatMap: paramsObj =>
+          transport.rpcStream(operation.method.value, paramsObj, operation.routingName(params))
+
+    private def unavailable(operation: McpOperation[?, ?]): McpClientError =
+      McpClientError.Protocol(
+        s"Extension method '${operation.method.value}' is unavailable for ${negotiated.version.wire}"
+      )
+
+    private def encodeParams[Params](operation: McpOperation[Params, ?], params: Params): IO[McpClientError, Json.Obj] =
+      ZIO.fromEither(operation.paramsCodec.encode(params))
+        .mapError(message => McpClientError.Decode(
+          s"Failed to encode params of '${operation.method.value}': $message"
+        ))
+        .flatMap(json => ZIO.fromOption(json.asObject)
+          .orElseFail(McpClientError.Decode("Extension params must encode to an object")))
 
     def requestRaw(
       method: McpMethodName,

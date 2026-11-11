@@ -80,6 +80,23 @@ object TasksSpec extends ZIOSpecDefault:
         if answer.content.flatMap(_.get("confirm")).contains(Json.Bool(true)) then "Booked"
         else s"Not booked (${answer.action})"
 
+  // WhenSlow: a task only for a call still running after the grace period.
+  val graceQuick: McpToolHandler = McpTool("grace_quick")
+    .taskExecution(TaskExecution.WhenSlow(5.seconds))
+    .handle(ZIO.succeed("quick after all"))
+
+  val graceSlow: McpToolHandler = McpTool("grace_slow")
+    .taskExecution(TaskExecution.WhenSlow(200.millis))
+    .handleWithContext[Any, Nothing, String]: ctx =>
+      ctx.progress(1, None, Some("compiling")) *> ZIO.sleep(1.second).as("slow done")
+
+  /** Set when the work of a `grace_never` call is interrupted. */
+  val graceInterrupted: Promise[Nothing, Unit] = unsafeRun(Promise.make[Nothing, Unit])
+
+  val graceNever: McpToolHandler = McpTool("grace_never")
+    .taskExecution(TaskExecution.WhenSlow(10.seconds))
+    .handle(ZIO.never.onInterrupt(graceInterrupted.succeed(())).as("never"))
+
   /**
    * A custom [[McpTaskStore]]: the in-memory one, plus a record of every task
    * created, so a test can find a task whose id the client never handed back.
@@ -107,6 +124,7 @@ object TasksSpec extends ZIOSpecDefault:
     .withExtensions(tasks)
     .tool(deepResearch).tool(quickTool).tool(syncTool).tool(requiredTool).tool(slowTool)
     .tool(erroringTool).tool(progressTool).tool(shortLivedTool).tool(bookFlight)
+    .tool(graceQuick).tool(graceSlow).tool(graceNever)
 
   // --- wire helpers ---
 
@@ -174,6 +192,33 @@ object TasksSpec extends ZIOSpecDefault:
 
   private def isTerminal(task: Json.Obj): Boolean =
     str(task, "status").exists(Set("completed", "failed", "cancelled"))
+
+  /** `subscriptions/listen` for `notifications/tasks` about `taskIds`: the open SSE response. */
+  private def listen(port: Int, taskIds: Chunk[String], token: Option[String] = None): ZIO[Client & Scope, Throwable, Response] =
+    val url = URL.decode(s"http://localhost:$port/mcp").toOption.get
+    val params = Json.Obj("notifications" -> Json.Obj("taskIds" -> Json.Arr(taskIds.map(Json.Str(_)))))
+    val req = Request.post(url, Body.fromString(body(1, "subscriptions/listen", params, withTasks = true)))
+      .addHeader(Header.ContentType(MediaType.application.json))
+      .addHeader("accept", "application/json, text/event-stream")
+      .addHeader(Negotiation.ProtocolVersionHeader, Modern)
+      .addHeader(Negotiation.MethodHeader, "subscriptions/listen")
+    ZClient.streaming(token.fold(req)(t => req.addHeader(Header.Authorization.Bearer(t))))
+
+  /** The JSON-RPC messages of an SSE response, as they arrive. */
+  private def sseMessages(r: Response): zio.stream.ZStream[Any, Throwable, Json.Obj] =
+    r.body.asStream
+      .via(zio.stream.ZPipeline.utf8Decode >>> zio.stream.ZPipeline.splitLines)
+      .collect { case line if line.startsWith("data:") => line.drop(5).trim }
+      .map(_.fromJson[Json.Obj])
+      .collect { case Right(message) => message }
+
+  private def params(m: Json.Obj): Option[Json.Obj] = m.get("params").flatMap(_.asObject)
+  private def notificationsOf(m: Json.Obj): Option[Json] = params(m).flatMap(_.get("notifications"))
+  /** A `notifications/tasks` message's task (its params, without `_meta`). */
+  private def taskOf(m: Json.Obj): Option[Json.Obj] =
+    Option.when(str(m, "method").contains(McpTasks.StatusNotification))(()).flatMap(_ => params(m))
+  private def subscriptionOf(m: Json.Obj): Option[Json] =
+    params(m).flatMap(_.get("_meta")).flatMap(_.asObject).flatMap(_.get(McpMeta.SubscriptionId))
 
   // --- auth fixtures ---
 
@@ -326,6 +371,59 @@ object TasksSpec extends ZIOSpecDefault:
         ,
       ),
 
+      suite("WhenSlow")(
+        test("a call done within the grace period is answered with its result, and leaves no task"):
+          for
+            port   <- Server.install(server.routes)
+            before <- store.all.map(_.size)
+            b      <- call(port, "grace_quick").flatMap(json)
+            after  <- store.all.map(_.size)
+          yield assertTrue(
+            str(result(b), "resultType").contains("complete"),
+            contentText(result(b)).contains("quick after all"),
+            after == before,
+          )
+        ,
+        test("a call still running after it becomes a task, with its progress, that completes"):
+          for
+            port   <- Server.install(server.routes)
+            b      <- call(port, "grace_slow").flatMap(json)
+            taskId  = str(result(b), "taskId").getOrElse("")
+            done   <- pollUntil(port, taskId)(isTerminal)
+          yield assertTrue(
+            str(result(b), "resultType").contains("task"),
+            str(result(b), "status").contains("working"),
+            str(result(b), "statusMessage").contains("compiling"),
+            str(done, "status").contains("completed"),
+            resultText(done).contains("slow done"),
+          )
+        ,
+        test("a client that did not declare the extension waits for the result"):
+          for
+            port <- Server.install(server.routes)
+            b    <- call(port, "grace_slow", withTasks = false).flatMap(json)
+          yield assertTrue(
+            str(result(b), "resultType").contains("complete"),
+            contentText(result(b)).contains("slow done"),
+          )
+        ,
+        test("cancelling the request during the grace period stops the work"):
+          ZIO.scoped:
+            for
+              clientOut <- ZIO.succeed(java.io.PipedOutputStream())
+              serverIn  <- ZIO.succeed(java.io.PipedInputStream(clientOut, 65536))
+              serverOut <- ZIO.succeed(java.io.PipedOutputStream())
+              _         <- ZIO.succeed(java.io.PipedInputStream(serverOut, 65536))
+              _         <- server.serveStream(serverIn, serverOut).forkScoped
+              send       = (line: String) => ZIO.succeedBlocking { clientOut.write((line + "\n").getBytes); clientOut.flush() }
+              _         <- send(body(9, "tools/call", Json.Obj("name" -> Json.Str("grace_never"), "arguments" -> Json.Obj()), withTasks = true))
+              _         <- ZIO.sleep(300.millis)
+              _         <- send("""{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}""")
+              stopped   <- graceInterrupted.await.timeout(5.seconds)
+            yield assertTrue(stopped.isDefined)
+        ,
+      ),
+
       suite("tasks/get")(
         test("polls to completed, with the tool result inlined and resultType complete"):
           for
@@ -460,6 +558,49 @@ object TasksSpec extends ZIOSpecDefault:
                       withTasks = false).flatMap(json)
           yield assertTrue(errorCode(b).contains(ErrorCode.MissingRequiredClientCapability.code))
         ,
+        test("the caller's live tasks are agreed, and each status change is a notifications/tasks until terminal"):
+          ZIO.scoped:
+            for
+              port   <- Server.install(server.routes)
+              tid    <- createTask(port, "book_flight")
+              _      <- pollUntil(port, tid)(t => str(t, "status").contains("input_required"))
+              stream <- listen(port, Chunk(tid, "no-such-task"))
+              seen   <- Queue.unbounded[Json.Obj]
+              _      <- sseMessages(stream).foreach(seen.offer).forkScoped
+              ack    <- seen.take
+              first  <- seen.take
+              _      <- taskRequest(port, "tasks/update", tid, extra = Json.Obj("inputResponses" -> Json.Obj(
+                          "confirm" -> Json.Obj("action" -> Json.Str("accept"), "content" -> Json.Obj("confirm" -> Json.Bool(true))),
+                        )))
+              rest   <- seen.take.repeatUntil(m => taskOf(m).exists(isTerminal)).zip(seen.takeAll)
+                          .timeoutFail(RuntimeException("no terminal notification"))(10.seconds)
+            yield
+              val last = rest._1
+              assertTrue(
+                str(ack, "method").contains("notifications/subscriptions/acknowledged"),
+                notificationsOf(ack).contains(Json.Obj("taskIds" -> Json.Arr(Json.Str(tid)))),
+                str(first, "method").contains(McpTasks.StatusNotification),
+                taskOf(first).flatMap(str(_, "status")).contains("input_required"),
+                taskOf(first).flatMap(_.get("inputRequests")).flatMap(_.asObject).exists(_.get("confirm").isDefined),
+                subscriptionOf(first).contains(Json.Num(1)),
+                taskOf(last).flatMap(str(_, "status")).contains("completed"),
+                taskOf(last).flatMap(resultText).contains("Booked"),
+                subscriptionOf(last).contains(Json.Num(1)),
+              )
+        ,
+        test("a task that is already terminal is reported once"):
+          ZIO.scoped:
+            for
+              port   <- Server.install(server.routes)
+              tid    <- createTask(port, "quick")
+              _      <- pollUntil(port, tid)(isTerminal)
+              stream <- listen(port, Chunk(tid))
+              seen   <- sseMessages(stream).take(2).runCollect.timeoutFail(RuntimeException("no notification"))(10.seconds)
+            yield assertTrue(
+              notificationsOf(seen(0)).contains(Json.Obj("taskIds" -> Json.Arr(Json.Str(tid)))),
+              taskOf(seen(1)).flatMap(str(_, "status")).contains("completed"),
+            )
+        ,
       ),
 
       suite("auth")(
@@ -487,6 +628,15 @@ object TasksSpec extends ZIOSpecDefault:
             denied.status == Status.Forbidden,
             str(result(ok), "resultType").contains("task"),
           )
+        ,
+        test("subscriptions/listen does not agree to another caller's task"):
+          ZIO.scoped:
+            for
+              port   <- Server.install(authedServer.routes)
+              tid    <- createTask(port, "slow", token = Some("alice"))
+              stream <- listen(port, Chunk(tid), token = Some("bob"))
+              ack    <- sseMessages(stream).runHead.someOrFail(RuntimeException("no acknowledgement"))
+            yield assertTrue(notificationsOf(ack).contains(Json.Obj()))
         ,
       ),
 

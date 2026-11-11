@@ -150,7 +150,9 @@ final class McpTool private (
    * [[TaskExecution.WhenSupported]] a client that did not declare the extension
    * (and every legacy `2025-11-25` client) gets an ordinary synchronous answer;
    * with [[TaskExecution.Required]] a modern client that did not declare it
-   * gets a `-32021` error instead.
+   * gets a `-32021` error instead. With [[TaskExecution.WhenSlow]] a client that
+   * declared it gets a task only for a call still running after the grace
+   * period, and a plain result for a quick one.
    *
    * @param ttl          how long the server keeps the task after creating it;
    *                     `None` keeps it until the server restarts

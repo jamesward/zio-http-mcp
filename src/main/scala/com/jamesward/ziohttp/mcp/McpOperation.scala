@@ -3,6 +3,7 @@ package com.jamesward.ziohttp.mcp
 import zio.*
 import zio.json.ast.Json
 import zio.schema.Schema
+import zio.stream.ZStream
 
 enum ProtocolSupport:
   case All, Legacy, Modern
@@ -60,10 +61,21 @@ enum McpMethodError:
   case UnsupportedProtocol(version: ProtocolVersion)
   case MissingRequiredClientExtension(id: McpExtensionId)
   case RoutingNameMismatch(expected: McpRoutingName, actual: String)
+  case MissingRoutingName(expected: McpRoutingName)
   case Domain(code: Int, message: String, data: Option[Json] = None)
 
 object McpMethodError:
   given CanEqual[McpMethodError, McpMethodError] = CanEqual.derived
+
+/**
+ * Whether a Streamable HTTP request for an operation with a routing name must
+ * carry the `Mcp-Name` header. Either way a header that is present must match.
+ */
+enum McpRoutingHeader:
+  case Optional, Required
+
+object McpRoutingHeader:
+  given CanEqual[McpRoutingHeader, McpRoutingHeader] = CanEqual.derived
 
 final case class McpOperation[Params, Result] private (
   extensionId: McpExtensionId,
@@ -74,6 +86,7 @@ final case class McpOperation[Params, Result] private (
   routingName: Params => Option[McpRoutingName],
   private[mcp] val paramsCodec: McpWireCodec[Params],
   private[mcp] val resultCodec: McpWireCodec[Result],
+  routingHeader: McpRoutingHeader,
 ):
   def decodeParams(json: Json): Either[String, Params] = paramsCodec.decode(json)
   def encodeParams(params: Params): Either[String, Json] = paramsCodec.encode(params)
@@ -88,6 +101,7 @@ object McpOperation:
     clientSupport: ClientSupportPolicy = ClientSupportPolicy.Optional,
     cachePolicy: McpCachePolicy = McpCachePolicy.NotCacheable,
     routingName: Params => Option[McpRoutingName] = (_: Params) => None,
+    routingHeader: McpRoutingHeader = McpRoutingHeader.Optional,
   ): McpOperation[Params, Result] =
     val paramsSchema = summon[Schema[Params]]
     val resultSchema = summon[Schema[Result]]
@@ -100,6 +114,7 @@ object McpOperation:
       routingName,
       McpWireCodec.schema(paramsSchema),
       McpWireCodec.schema(resultSchema),
+      routingHeader,
     )
 
   def wire[Params, Result](
@@ -111,6 +126,7 @@ object McpOperation:
     clientSupport: ClientSupportPolicy = ClientSupportPolicy.Optional,
     cachePolicy: McpCachePolicy = McpCachePolicy.NotCacheable,
     routingName: Params => Option[McpRoutingName] = (_: Params) => None,
+    routingHeader: McpRoutingHeader = McpRoutingHeader.Optional,
   ): McpOperation[Params, Result] =
     McpOperation(
       extensionId,
@@ -121,22 +137,58 @@ object McpOperation:
       routingName,
       paramsCodec,
       resultCodec,
+      routingHeader,
     )
+
+/** A notification a streaming operation sends before its result. */
+final case class McpStreamNotification(method: McpMethodName, params: Json.Obj)
+
+object McpStreamNotification:
+  given CanEqual[McpStreamNotification, McpStreamNotification] = CanEqual.derived
+
+/**
+ * What a streaming operation answers with: `notifications`, sent as they come
+ * (SSE events on Streamable HTTP, lines on stdio), and then `result`, once they
+ * end. A client that goes away (or, on stdio, cancels) interrupts the stream.
+ */
+final case class McpOperationStream[-R, +Result](
+  notifications: ZStream[R, Nothing, McpStreamNotification],
+  result: Result,
+)
+
+/** An operation's answer, as the server sends it. */
+private[mcp] enum McpOperationOutput[-R]:
+  case Complete(result: Json.Obj)
+  case Streaming(notifications: ZStream[R, Nothing, McpStreamNotification], result: Json.Obj)
 
 trait McpBoundOperation[-R]:
   def operation: McpOperation[?, ?]
-  private[mcp] def invoke(params: Json.Obj, ctx: McpRequestContext): ZIO[R, McpMethodError, Json.Obj]
+  private[mcp] def invoke(params: Json.Obj, ctx: McpRequestContext): ZIO[R, McpMethodError, McpOperationOutput[R]]
   private[mcp] def routingName(params: Json.Obj): Either[McpMethodError, Option[McpRoutingName]]
 
 object McpBoundOperation:
   def apply[R, Params, Result](operationValue: McpOperation[Params, Result])(
     handler: (Params, McpRequestContext) => ZIO[R, McpMethodError, Result]
   ): McpBoundOperation[R] =
-    Bound(operationValue, handler)
+    Bound(operationValue, (params, ctx) => handler(params, ctx).map(Answer.Complete(_)))
+
+  /**
+   * An operation answered with a stream of notifications and then its result,
+   * like `subscriptions/listen`. A failure of `handler` is a JSON-RPC error
+   * response, sent before any stream opens.
+   */
+  def streaming[R, Params, Result](operationValue: McpOperation[Params, Result])(
+    handler: (Params, McpRequestContext) => ZIO[R, McpMethodError, McpOperationStream[R, Result]]
+  ): McpBoundOperation[R] =
+    Bound(operationValue, (params, ctx) => handler(params, ctx).map(Answer.Streaming(_)))
+
+  private enum Answer[-R, +Result]:
+    case Complete(result: Result)
+    case Streaming(stream: McpOperationStream[R, Result])
 
   private final case class Bound[R, Params, Result](
     typedOperation: McpOperation[Params, Result],
-    handler: (Params, McpRequestContext) => ZIO[R, McpMethodError, Result],
+    handler: (Params, McpRequestContext) => ZIO[R, McpMethodError, Answer[R, Result]],
   ) extends McpBoundOperation[R]:
     val operation: McpOperation[?, ?] = typedOperation
 
@@ -146,12 +198,15 @@ object McpBoundOperation:
     def routingName(params: Json.Obj): Either[McpMethodError, Option[McpRoutingName]] =
       decode(params).map(typedOperation.routingName)
 
-    def invoke(params: Json.Obj, ctx: McpRequestContext): ZIO[R, McpMethodError, Json.Obj] =
-      for
-        decoded <- ZIO.fromEither(decode(params))
-        result  <- handler(decoded, ctx)
-        json    <- ZIO.fromEither(typedOperation.resultCodec.encode(result))
-                     .mapError(McpMethodError.InvalidResult.apply)
-        obj     <- ZIO.fromOption(json.asObject)
-                     .orElseFail(McpMethodError.InvalidResult("Extension results must encode to a JSON object"))
-      yield obj
+    def invoke(params: Json.Obj, ctx: McpRequestContext): ZIO[R, McpMethodError, McpOperationOutput[R]] =
+      ZIO.fromEither(decode(params)).flatMap(handler(_, ctx)).flatMap:
+        case Answer.Complete(result) => encode(result).map(McpOperationOutput.Complete(_))
+        case Answer.Streaming(stream) =>
+          encode(stream.result).map(McpOperationOutput.Streaming(stream.notifications, _))
+
+    private def encode(result: Result): IO[McpMethodError, Json.Obj] =
+      ZIO.fromEither(typedOperation.resultCodec.encode(result))
+        .mapError(McpMethodError.InvalidResult.apply)
+        .flatMap: json =>
+          ZIO.fromOption(json.asObject)
+            .orElseFail(McpMethodError.InvalidResult("Extension results must encode to a JSON object"))

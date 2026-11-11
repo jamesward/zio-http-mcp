@@ -69,6 +69,37 @@ object McpAppsSpec extends ZIOSpecDefault:
             .exists(_.flatMap(_.asString) == Chunk("app")),
         )
       ,
+      test("a global entry point is marked under openai/ui, beside ui.resourceUri; an app-only tool has only visibility"):
+        for
+          uri <- ZIO.fromEither(McpUiUri.parse("ui://example/home"))
+          base = ToolDefinition(ToolName("open_studio"), inputSchema = Json.Obj("type" -> Json.Str("object")))
+          entry = McpApps.withToolMetadata(base, McpAppsToolMeta.View(uri, globalEntryPoint = true))
+          plain = McpApps.withToolMetadata(base, McpAppsToolMeta(uri))
+          appOnly = McpApps.withToolMetadata(base.copy(name = ToolName("sign_in_token")), McpAppsToolMeta.AppOnly)
+        yield assertTrue(
+          entry.meta.flatMap(_.get("openai/ui")).contains(
+            Json.Obj("entrypoints" -> Json.Arr(Json.Obj("type" -> Json.Str("global"))))
+          ),
+          uiObject(entry.meta).flatMap(_.get("resourceUri")).flatMap(_.asString).contains(uri.value),
+          plain.meta.flatMap(_.get("openai/ui")).isEmpty,
+          uiObject(appOnly.meta).contains(Json.Obj("visibility" -> Json.Arr(Json.Str("app")))),
+        )
+      ,
+      test("preferredDisplayMode, Claude's ui.domain, and the client's declared HTML support"):
+        for
+          uri <- ZIO.fromEither(McpUiUri.parse("ui://example/home"))
+          contents = McpApps.contents(uri, "<!doctype html>", McpAppsResourceMeta(preferredDisplayMode = Some(McpAppsDisplayMode.Fullscreen)))
+        yield
+          val html = McpRequestContext(ProtocolVersion.V2026_07_28, capabilities = Map(McpApps.Id -> McpApps.clientExtension(McpAppsClientSettings.Html).settings))
+          val none = McpRequestContext(ProtocolVersion.V2026_07_28)
+          assertTrue(
+            uiObject(contents.meta).flatMap(_.get("preferredDisplayMode")).contains(Json.Str("fullscreen")),
+            // The example in Claude's documentation.
+            McpApps.claudeDomain("https://example.com/mcp") == "c3d80a4ed901ee05b21755a88273b4a4.claudemcpcontent.com",
+            McpApps.clientSupportsHtml(html),
+            !McpApps.clientSupportsHtml(none),
+          )
+      ,
       test("typed Apps resource definition and contents preserve unknown metadata at both locations"):
         for
           uri <- ZIO.fromEither(McpUiUri.parse("ui://weather/dashboard"))
@@ -146,6 +177,46 @@ object McpAppsSpec extends ZIOSpecDefault:
           text(decoded).contains("Weather is 72°F and sunny"),
           decoded.meta.flatMap(_.get("unknown")).contains(Json.Arr(Json.Num(1), Json.Str("two"))),
         )
+      ,
+      test("README entry point, app-only tool and embedded-site resource are served as Claude reads them"):
+        // The README example.
+        val studio = for
+          uri      <- McpUiUri.parse("ui://example/home")
+          fallback <- McpAppsFallbackText.parse("Example Studio is open")
+        yield
+          val open = McpApps.tool(
+            McpTool("open_studio").description("Open Example Studio.").handle(ZIO.succeed(McpApps.result(fallback))),
+            McpAppsToolMeta.View(uri, globalEntryPoint = true),
+          )
+          val signIn = McpApps.tool(McpTool("sign_in_token").handle(ZIO.succeed("token")), McpAppsToolMeta.AppOnly)
+          val home = McpApps.resourceHandler(uri, "studio", McpAppsResourceMeta(
+            csp = Some(McpAppsCsp(frameDomains = Chunk("https://editor.example.com"))),
+            domain = Some(McpApps.claudeDomain("https://example.com/mcp")),
+            preferredDisplayMode = Some(McpAppsDisplayMode.Fullscreen),
+          ))(ZIO.succeed("<!doctype html><iframe src=\"https://editor.example.com\"></iframe>"))
+          (open, signIn, home)
+        ZIO.scoped:
+          for
+            (open, signIn, home) <- ZIO.fromEither(studio)
+            registry <- ZIO.fromEither(McpExtensions(McpApps.serverExtension))
+            server    = McpServer("studio", "1.0.0").withExtensions(registry).tool(open).tool(signIn).resource(home)
+            port     <- Server.install(server.routes)
+            client   <- McpClient.connect(McpClientConfig(s"http://localhost:$port/mcp"), McpClientExtensions.empty)
+            tools    <- client.listTools
+            contents <- client.readResource("ui://example/home")
+          yield
+            val byName = tools.map(t => t.name.value -> t).toMap
+            val ui = contents.headOption.flatMap(c => uiObject(c.meta))
+            assertTrue(
+              byName.get("open_studio").flatMap(_.meta).flatMap(_.get("openai/ui")).contains(
+                Json.Obj("entrypoints" -> Json.Arr(Json.Obj("type" -> Json.Str("global"))))
+              ),
+              byName.get("open_studio").flatMap(t => uiObject(t.meta)).flatMap(_.get("resourceUri")).contains(Json.Str("ui://example/home")),
+              byName.get("sign_in_token").flatMap(t => uiObject(t.meta)).contains(Json.Obj("visibility" -> Json.Arr(Json.Str("app")))),
+              ui.flatMap(_.get("csp")).contains(Json.Obj("frameDomains" -> Json.Arr(Json.Str("https://editor.example.com")))),
+              ui.flatMap(_.get("domain")).contains(Json.Str("c3d80a4ed901ee05b21755a88273b4a4.claudemcpcontent.com")),
+              ui.flatMap(_.get("preferredDisplayMode")).contains(Json.Str("fullscreen")),
+            )
       ,
       test("core-only client receives fallback and ui iframe-host methods are not routed over HTTP"):
         ZIO.scoped:

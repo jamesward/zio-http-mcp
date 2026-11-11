@@ -61,7 +61,34 @@ object McpApps:
     )
 
   def withToolMetadata(definition: ToolDefinition, metadata: McpAppsToolMeta): ToolDefinition =
-    definition.copy(meta = Some(McpMetadata.mergeNested(definition.meta, "ui", toolMetaJson(metadata))))
+    val ui = McpMetadata.mergeNested(definition.meta, "ui", toolMetaJson(metadata))
+    val withEntryPoint = metadata match
+      case McpAppsToolMeta.View(_, _, true) =>
+        McpMetadata.mergeNested(Some(ui), OpenAiUiKey, Json.Obj("entrypoints" -> Json.Arr(Json.Obj("type" -> Json.Str("global")))))
+      case McpAppsToolMeta.View(_, _, false) | McpAppsToolMeta.AppOnly => ui
+    definition.copy(meta = Some(withEntryPoint))
+
+  /**
+   * Whether the client declared that it renders MCP Apps views (`text/html;profile=mcp-app`
+   * in its `io.modelcontextprotocol/ui` settings). A server can register UI tools, or
+   * describe its results, only for such clients; every UI tool still needs a text fallback.
+   */
+  def clientSupportsHtml(ctx: McpRequestContext): Boolean =
+    ctx.extensionCapabilities.get(Id).flatMap(_.asObject).flatMap(_.get("mimeTypes")).flatMap(_.asArray)
+      .exists(_.exists(_.asString.contains(HtmlMimeType)))
+
+  /**
+   * The `domain` (sandbox origin) Claude gives the views of the server at `serverUrl`: the
+   * first 32 hex characters of the SHA-256 of the URL, then `.claudemcpcontent.com`.
+   * `serverUrl` is the URL the connector was added with, exactly. Other hosts define their
+   * own formats.
+   */
+  def claudeDomain(serverUrl: String): String =
+    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(serverUrl.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    digest.map(b => f"${b & 0xff}%02x").mkString.take(32) + ".claudemcpcontent.com"
+
+  /** The OpenAI Apps SDK's `_meta` key, which Claude also reads for entry points. */
+  private val OpenAiUiKey = "openai/ui"
 
   def withResourceMetadata(definition: ResourceDefinition, metadata: McpAppsResourceMeta): ResourceDefinition =
     definition.copy(meta = Some(McpMetadata.mergeNested(definition.meta, "ui", resourceMetaJson(metadata))))
@@ -96,11 +123,14 @@ object McpApps:
   private def settingsJson(settings: McpAppsClientSettings): Json.Obj =
     Json.Obj("mimeTypes" -> Json.Arr(settings.mimeTypes.map(mimeType => Json.Str(mimeType.value))))
 
-  private def toolMetaJson(metadata: McpAppsToolMeta): Json.Obj =
-    Json.Obj(
-      "resourceUri" -> Json.Str(metadata.resourceUri.value),
-      "visibility" -> Json.Arr(metadata.visibility.map(visibility => Json.Str(visibility.wire))),
-    )
+  private def toolMetaJson(metadata: McpAppsToolMeta): Json.Obj = metadata match
+    case McpAppsToolMeta.View(resourceUri, visibility, _) =>
+      Json.Obj(
+        "resourceUri" -> Json.Str(resourceUri.value),
+        "visibility" -> Json.Arr(visibility.map(value => Json.Str(value.wire))),
+      )
+    case McpAppsToolMeta.AppOnly =>
+      Json.Obj("visibility" -> Json.Arr(Json.Str(McpAppsVisibility.App.wire)))
 
   private def resourceMetaJson(metadata: McpAppsResourceMeta): Json.Obj =
     val csp = metadata.csp.map: value =>
@@ -120,6 +150,7 @@ object McpApps:
       permissions,
       metadata.domain.map(value => "domain" -> (Json.Str(value): Json)),
       metadata.prefersBorder.map(value => "prefersBorder" -> (Json.Bool(value): Json)),
+      metadata.preferredDisplayMode.map(value => "preferredDisplayMode" -> (Json.Str(value.wire): Json)),
     ).flatten)
 
   private def stringArray(values: Chunk[String]): Json = Json.Arr(values.map(Json.Str.apply))

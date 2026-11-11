@@ -58,6 +58,9 @@ enum McpAppsVisibility(val wire: String):
   case App extends McpAppsVisibility("app")
 
 object McpAppsVisibility:
+  /** `["model", "app"]`, what an omitted `visibility` means. */
+  val Default: NonEmptyChunk[McpAppsVisibility] = NonEmptyChunk(Model, App)
+
   given CanEqual[McpAppsVisibility, McpAppsVisibility] = CanEqual.derived
   given JsonEncoder[McpAppsVisibility] = JsonEncoder.string.contramap(_.wire)
   given JsonDecoder[McpAppsVisibility] = JsonDecoder.string.mapOrFail:
@@ -93,20 +96,68 @@ object McpAppsCsp:
   given CanEqual[McpAppsCsp, McpAppsCsp] = CanEqual.derived
   given JsonCodec[McpAppsCsp] = DeriveJsonCodec.gen[McpAppsCsp]
 
-final case class McpAppsToolMeta(
-  resourceUri: McpUiUri,
-  visibility: NonEmptyChunk[McpAppsVisibility] = NonEmptyChunk(McpAppsVisibility.Model, McpAppsVisibility.App),
-)
+/**
+ * What a tool's `_meta.ui` says (SEP-1865): the view that renders its results and who
+ * may call it, or that only views call it.
+ */
+enum McpAppsToolMeta:
+  /**
+   * A tool whose results the view at `resourceUri` renders. `globalEntryPoint` marks it
+   * as an entry point: a host can list the app so people open it without asking the model
+   * (Claude's Artifacts page reads `_meta["openai/ui"].entrypoints`). An entry point needs
+   * `Model` in `visibility`, and should accept `{}` as arguments.
+   */
+  case View(
+    resourceUri: McpUiUri,
+    visibility: NonEmptyChunk[McpAppsVisibility] = McpAppsVisibility.Default,
+    globalEntryPoint: Boolean = false,
+  )
+
+  /**
+   * A tool only views call (`visibility: ["app"]`, no view of its own), hidden from the
+   * model: for example one that returns a short-lived sign-in token for an embedded site.
+   */
+  case AppOnly
 
 object McpAppsToolMeta:
-  given CanEqual[McpAppsToolMeta, McpAppsToolMeta] = CanEqual.derived
-  given JsonCodec[McpAppsToolMeta] = DeriveJsonCodec.gen[McpAppsToolMeta]
+  /** A tool whose results the view at `resourceUri` renders. */
+  def apply(
+    resourceUri: McpUiUri,
+    visibility: NonEmptyChunk[McpAppsVisibility] = McpAppsVisibility.Default,
+  ): McpAppsToolMeta = View(resourceUri, visibility)
 
+  given CanEqual[McpAppsToolMeta, McpAppsToolMeta] = CanEqual.derived
+
+/**
+ * A display mode a view can be in or ask for (`ui/request-display-mode`). Claude shows
+ * `Fullscreen` in its side panel or full screen.
+ */
+enum McpAppsDisplayMode(val wire: String):
+  case Inline extends McpAppsDisplayMode("inline")
+  case Fullscreen extends McpAppsDisplayMode("fullscreen")
+  case Pip extends McpAppsDisplayMode("pip")
+
+object McpAppsDisplayMode:
+  given CanEqual[McpAppsDisplayMode, McpAppsDisplayMode] = CanEqual.derived
+  given JsonEncoder[McpAppsDisplayMode] = JsonEncoder.string.contramap(_.wire)
+  given JsonDecoder[McpAppsDisplayMode] = JsonDecoder.string.mapOrFail:
+    case "inline"     => Right(McpAppsDisplayMode.Inline)
+    case "fullscreen" => Right(McpAppsDisplayMode.Fullscreen)
+    case "pip"        => Right(McpAppsDisplayMode.Pip)
+    case other        => Left(s"Unknown MCP Apps display mode: $other")
+
+/**
+ * A view resource's `_meta.ui`. `preferredDisplayMode` is a Claude extension, not part of
+ * SEP-1865: with `Fullscreen` Claude opens the view in its side panel without a click.
+ * Claude reads it, with `csp`, `domain` and `permissions`, from the `resources/read`
+ * content item.
+ */
 final case class McpAppsResourceMeta(
   csp: Option[McpAppsCsp] = None,
   permissions: Set[McpAppsPermission] = Set.empty,
   domain: Option[String] = None,
   prefersBorder: Option[Boolean] = None,
+  preferredDisplayMode: Option[McpAppsDisplayMode] = None,
 )
 
 object McpAppsResourceMeta:

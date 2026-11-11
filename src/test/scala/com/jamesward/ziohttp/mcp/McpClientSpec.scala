@@ -78,6 +78,16 @@ object McpClientSpec extends ZIOSpecDefault:
     .tool(addTool)
     .mountedAtParam("slug")
 
+  // Provider varies by the extensions the client declared (the README's Skills example).
+  val skillsAwareServer = McpServer("skills-aware", "1.0.0")
+    .instructions(InstructionsSource: ctx =>
+      ZIO.succeed(Some(
+        if ctx.extensionCapabilities.contains(McpSkills.Id) then "This server's skills are served over MCP."
+        else "This server's skills are in the skills/ directory of its repository."
+      ))
+    )
+    .tool(addTool)
+
   private def addArgs(a: Int, b: Int): Json.Obj =
     Json.Obj(Chunk("a" -> Json.Num(a), "b" -> Json.Num(b)))
 
@@ -315,6 +325,26 @@ object McpClientSpec extends ZIOSpecDefault:
             acme.instructions.contains("instructions for acme"),
             globex.instructions.contains("instructions for globex"),
           )
+      ,
+      test("InstructionsSource varies by the client's declared extensions, legacy and modern"):
+        ZIO.scoped:
+          for
+            port         <- Server.install(skillsAwareServer.statelessRoutes)
+            url           = s"http://localhost:$port/mcp"
+            plainLegacy  <- connectLegacy(url)
+            skillsLegacy <- McpClient.connect(McpClientConfig(url, preferredVersion = ProtocolVersion.V2025_11_25), McpSkillsClient.declaration)
+            plainModern  <- McpClient.connect(McpClientConfig(url))
+            skillsModern <- McpClient.connect(McpClientConfig(url), McpSkillsClient.declaration)
+          yield
+            val viaMcp  = "This server's skills are served over MCP."
+            val viaRepo = "This server's skills are in the skills/ directory of its repository."
+            assertTrue(
+              plainLegacy.instructions.contains(viaRepo),
+              skillsLegacy.instructions.contains(viaMcp),
+              plainModern.instructions.contains(viaRepo),
+              skillsModern.instructions.contains(viaMcp),
+              skillsModern.protocolVersion == ProtocolVersion.V2026_07_28.wire,
+            )
       ,
     ).provide(
       Server.defaultWith(_.onAnyOpenPort),

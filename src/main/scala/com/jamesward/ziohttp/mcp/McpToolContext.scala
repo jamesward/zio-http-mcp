@@ -140,7 +140,10 @@ final class InputResults private[mcp] (answers: Map[String, Json]):
 
 trait McpToolContext extends McpRequestContext:
   def log(level: LogLevel, message: String): UIO[Unit]
-  def progress(current: Double, total: Double, message: Option[String] = None): UIO[Unit]
+  /** Report progress: `current` of `total` (`None` when the total is unknown; `current` must still increase). */
+  def progress(current: Double, total: Option[Double], message: Option[String]): UIO[Unit]
+  final def progress(current: Double, total: Double, message: Option[String] = None): UIO[Unit] =
+    progress(current, Some(total), message)
   def sample(prompt: String, maxTokens: Int = 100): ZIO[Any, ToolError, SamplingResult]
   def elicit(message: String, schema: Json.Obj): ZIO[Any, ToolError, ElicitationResult]
   /** The client's roots (`roots/list`). */
@@ -253,15 +256,14 @@ object McpToolContext:
         ))
         outQueue.offer(JsonRpcMessage.Notification("notifications/message", Some(params))).unit
 
-      def progress(current: Double, total: Double, message: Option[String]): UIO[Unit] =
+      def progress(current: Double, total: Option[Double], message: Option[String]): UIO[Unit] =
         progressToken match
           case None => ZIO.unit
           case Some(token) =>
             val fields = Chunk(
               "progressToken" -> token,
               "progress" -> Json.Num(current),
-              "total" -> Json.Num(total),
-            ) ++ message.fold(Chunk.empty[(String, Json)])(m => Chunk("message" -> Json.Str(m)))
+            ) ++ total.fold(Chunk.empty[(String, Json)])(t => Chunk("total" -> Json.Num(t))) ++ message.fold(Chunk.empty[(String, Json)])(m => Chunk("message" -> Json.Str(m)))
             outQueue.offer(JsonRpcMessage.Notification("notifications/progress", Some(Json.Obj(fields)))).unit
 
       // A legacy connection has an open back-channel, so every input is a
@@ -376,14 +378,13 @@ object McpToolContext:
             queue.offer(JsonRpcMessage.Notification("notifications/message", Some(params))).unit
           case _ => ZIO.unit
 
-      def progress(current: Double, total: Double, message: Option[String]): UIO[Unit] =
+      def progress(current: Double, total: Option[Double], message: Option[String]): UIO[Unit] =
         (notifications, progressToken) match
           case (Some(queue), Some(token)) =>
             val fields = Chunk(
               "progressToken" -> token,
               "progress" -> Json.Num(current),
-              "total" -> Json.Num(total),
-            ) ++ message.fold(Chunk.empty[(String, Json)])(m => Chunk("message" -> Json.Str(m)))
+            ) ++ total.fold(Chunk.empty[(String, Json)])(t => Chunk("total" -> Json.Num(t))) ++ message.fold(Chunk.empty[(String, Json)])(m => Chunk("message" -> Json.Str(m)))
             queue.offer(JsonRpcMessage.Notification("notifications/progress", Some(Json.Obj(fields)))).unit
           case _ => ZIO.unit
 
@@ -444,11 +445,19 @@ object McpToolContext:
   private[mcp] def noopWith(
     callerPrincipal: Option[Principal],
     callerPathParams: Map[String, String] = Map.empty,
-  ): McpToolContext = new McpToolContext:
-    override val principal: Option[Principal] = callerPrincipal
-    override val pathParams: Map[String, String] = callerPathParams
+  ): McpToolContext =
+    noopFor(McpRequestContext(ProtocolVersion.default, callerPrincipal = callerPrincipal, callerPathParams = callerPathParams))
+
+  /** A context with no client interaction that carries `request`'s client, its declared extensions, principal and path parameters. */
+  private[mcp] def noopFor(request: McpRequestContext): McpToolContext = new McpToolContext:
+    override val protocolVersion: ProtocolVersion = request.protocolVersion
+    override val clientInfo: Option[Implementation] = request.clientInfo
+    override val extensionCapabilities: Map[McpExtensionId, Json] = request.extensionCapabilities
+    override val extensionCapabilityErrors: Chunk[McpExtensionCapabilityParseError] = request.extensionCapabilityErrors
+    override val principal: Option[Principal] = request.principal
+    override val pathParams: Map[String, String] = request.pathParams
     def log(level: LogLevel, message: String): UIO[Unit] = ZIO.unit
-    def progress(current: Double, total: Double, message: Option[String]): UIO[Unit] = ZIO.unit
+    def progress(current: Double, total: Option[Double], message: Option[String]): UIO[Unit] = ZIO.unit
     def sample(prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =
       ZIO.fail(ToolError("Sampling not available"))
     def sample(id: String, prompt: String, maxTokens: Int): ZIO[Any, ToolError, SamplingResult] =

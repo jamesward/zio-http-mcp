@@ -247,6 +247,30 @@ object McpSkillsJarsSpec extends ZIOSpecDefault:
             ),
           )
       ,
+      test("load(entries) reads jars directly, also one without directory entries, and classpath directories"):
+        ZIO.scoped:
+          for
+            base <- ZIO.acquireRelease(ZIO.attemptBlocking(Files.createTempDirectory("skillsjars-entries")))(dir =>
+                      ZIO.attemptBlocking(
+                        Files.walk(dir).sorted(java.util.Comparator.reverseOrder()).forEach(Files.delete(_))
+                      ).orDie
+                    )
+            jar  <- ZIO.attemptBlocking {
+                      val file = base.resolve("bare.jar")
+                      scala.util.Using.resource(java.util.jar.JarOutputStream(Files.newOutputStream(file))) { out =>
+                        out.putNextEntry(java.util.jar.JarEntry("META-INF/skills/acme/jarred/SKILL.md"))
+                        out.write("---\nname: jarred\ndescription: From a jar.\n---\n# Jarred\n".getBytes(StandardCharsets.UTF_8))
+                        out.closeEntry()
+                      }
+                      file
+                    }
+            _    <- writeSkill(base.resolve("classes"), "META-INF/skills/acme/listed/SKILL.md",
+                      "---\nname: listed\ndescription: From a directory.\n---\n# Listed\n")
+            jars <- McpSkillsJars.load(Chunk(jar, base.resolve("classes"), base.resolve("missing.jar")))
+          yield assertTrue(
+            jars.entries.map(_.uri.value).toSet == Set("skill://acme/jarred/SKILL.md", "skill://acme/listed/SKILL.md")
+          )
+      ,
       test("frontmatter parsing rejects missing and unterminated blocks"):
         assertTrue(
           McpSkillsJars.parseFrontmatter("# no frontmatter").isLeft,

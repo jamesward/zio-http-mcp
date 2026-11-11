@@ -26,6 +26,9 @@ object McpClientExtensions:
 
   val empty: McpClientExtensions = Validated(Chunk.empty)
 
+  /** One declaration, which can't collide with another. */
+  def single(extension: McpClientExtension): McpClientExtensions = Validated(Chunk(extension))
+
   def apply(extensions: McpClientExtension*): Either[McpClientExtensionsError, McpClientExtensions] =
     val values = Chunk.fromIterable(extensions)
     values.foldLeft((Set.empty[McpExtensionId], Option.empty[McpExtensionId])):

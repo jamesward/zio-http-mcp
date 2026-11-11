@@ -4,6 +4,7 @@ import com.jamesward.ziohttp.mcp.RequestId
 import zio.*
 import zio.http.Headers
 import zio.json.ast.Json
+import zio.stream.ZStream
 
 /**
  * How the client's JSON-RPC messages reach a server: Streamable HTTP or a stdio
@@ -13,6 +14,14 @@ import zio.json.ast.Json
 private[client] trait McpWire:
   /** Sends a request and gives its raw `result`, or the server's JSON-RPC error. */
   def request(o: Outgoing): IO[McpClientError, Json]
+
+  /**
+   * Sends a request answered with a stream (`events/stream`): every message the
+   * server sends for it as it arrives, its response last. Ending the stream
+   * early abandons the request: the HTTP response is closed, and on stdio the
+   * request is cancelled.
+   */
+  def stream(o: Outgoing): ZStream[Any, McpClientError, Json.Obj]
 
   /** Sends the notification `body` (a serialized `method` notification). */
   def notify(method: String, body: String): IO[McpClientError, Unit]

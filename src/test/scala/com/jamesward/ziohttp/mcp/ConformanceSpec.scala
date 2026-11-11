@@ -510,9 +510,66 @@ object ConformanceSpec extends ZIOSpecDefault:
           )),
         )
 
-  /** The Tasks extension, which the `tasks-*` scenarios need registered. */
+  // --- Events extension fixtures (SEP-3415; the `events-*` scenarios of conformance PR 521) ---
+
+  case class TickFilter(label: Option[String]) derives Schema
+  case class EventControl(name: String) derives Schema
+
+  /** The faults the `events_conformance_*` controls asked for: a one-shot upstream
+    * error or gap, by event type, and the types whose subscriptions were revoked. */
+  private final case class EventFaults(errors: Set[String], gaps: Set[String], revoked: Set[String])
+
+  private val eventFaults: Ref[EventFaults] =
+    Unsafe.unsafe(implicit unsafe => Runtime.default.unsafe.run(Ref.make(EventFaults(Set.empty, Set.empty, Set.empty))).getOrThrowFiberFailure())
+
+  private enum Fault:
+    case Revoked, UpstreamError, Gap, Healthy
+
+  private object Fault:
+    given CanEqual[Fault, Fault] = CanEqual.derived
+
+  /** An event type that ticks every second, and fails or skips when a control says so. */
+  private def controlledTicks(event: McpEvent): McpEventHandler[Any] =
+    val name = event.eventName.value
+    event.description(s"Ticks every second").pollInterval(1.second)
+      .check[Any, TickFilter, EventFixtures.Tick]: request =>
+        eventFaults.modify: f =>
+          if f.revoked.contains(name) then Fault.Revoked -> f
+          else if f.errors.contains(name) then Fault.UpstreamError -> f.copy(errors = f.errors - name)
+          else if f.gaps.contains(name) then Fault.Gap -> f.copy(gaps = f.gaps - name)
+          else Fault.Healthy -> f
+        .flatMap:
+          case Fault.Revoked       => ZIO.fail(McpEventError.Forbidden("Access revoked"))
+          case Fault.UpstreamError => ZIO.fail(McpEventError.Upstream("UpstreamError", Some(Json.Obj("reason" -> Json.Str("fixture")))))
+          case Fault.Gap           => EventFixtures.tick(request).map(_.copy(truncated = true))
+          case Fault.Healthy       => EventFixtures.tick(request)
+
+  private def eventControl(tool: String, fault: (EventFaults, String) => EventFaults): McpToolHandler =
+    McpTool(tool).description("Conformance control: provokes an Events fault for an event type")
+      .handle[Any, Nothing, EventControl, String](control => eventFaults.update(fault(_, control.name)).as("ok"))
+
+  private val eventControls = Chunk(
+    eventControl("events_conformance_yield_error", (f, name) => f.copy(errors = f.errors + name)),
+    eventControl("events_conformance_yield_gap", (f, name) => f.copy(gaps = f.gaps + name)),
+    eventControl("events_conformance_terminate", (f, name) => f.copy(revoked = f.revoked + name)),
+  )
+
+  /** The Tasks extension, which the `tasks-*` scenarios need registered, and the
+    * Events extension. The kit grades the first event type offering a mode, and
+    * terminates another push type, so `conformance.tick` comes first. */
   private val tasksExtension: McpExtensions[Any] =
-    Unsafe.unsafe(implicit unsafe => Runtime.default.unsafe.run(McpTasks.inMemory).getOrThrowFiberFailure())
+    Unsafe.unsafe(implicit unsafe => Runtime.default.unsafe.run(
+      for
+        tasks  <- McpTasks.inMemory
+        events <- ZIO.fromEither(McpEvents(
+                    controlledTicks(McpEvent("conformance.tick")),
+                    controlledTicks(McpEvent("conformance.spare")),
+                    controlledTicks(McpEvent("conformance.poll-only").pollOnly),
+                    controlledTicks(McpEvent("conformance.push-only").pushOnly),
+                  ))
+        all    <- ZIO.fromEither(tasks ++ events)
+      yield all
+    ).getOrThrowFiberFailure())
 
   val testServer = McpServer("test-server", "0.1.0")
     .withExtensions(tasksExtension)
@@ -552,6 +609,9 @@ object ConformanceSpec extends ZIOSpecDefault:
     .tool(tasksProtocolErrorJob)
     .tool(tasksConfirmDelete)
     .tool(tasksMultiInput)
+    .tool(eventControls(0))
+    .tool(eventControls(1))
+    .tool(eventControls(2))
 
   /**
    * `server-stateless` is baselined: running the modern suite by its frozen
@@ -585,7 +645,8 @@ object ConformanceSpec extends ZIOSpecDefault:
    *     and take input through `tasks/update` instead; the spec makes the
    *     MRTR-first ordering a SHOULD for servers that combine the two.
    *   - `tasks-status-notifications` — the kit skips it itself (pending a rewrite
-   *     onto `subscriptions/listen`), and we do not push `notifications/tasks`.
+   *     onto `subscriptions/listen`). `TasksSpec` covers `notifications/tasks` on
+   *     `subscriptions/listen` instead.
    */
   private val TasksScenarios = Chunk(
     "tasks-lifecycle",

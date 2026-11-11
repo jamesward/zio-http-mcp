@@ -27,4 +27,7 @@ object StdioServerMain extends ZIOAppDefault:
         )
       )
 
-  def run = server.serveStdio
+  def run =
+    ZIO.fromEither(McpEvents(EventFixtures.ticks))
+      .orElseFail(IllegalStateException("duplicate event types"))
+      .flatMap(events => server.withExtensions(events).serveStdio)

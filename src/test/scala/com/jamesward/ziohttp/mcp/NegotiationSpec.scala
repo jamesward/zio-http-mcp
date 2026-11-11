@@ -36,6 +36,8 @@ object NegotiationSpec extends ZIOSpecDefault:
         _ <- ctx.progress(50, 100)
         _ <- ctx.log(com.jamesward.ziohttp.mcp.LogLevel.Warning, "halfway")
         _ <- ctx.progress(100, 100)
+        // A total that isn't known is left out of the notification.
+        _ <- ctx.progress(101, None, Some("tidying up"))
       yield Chunk(ToolContent.text("noisy done"))
 
   val testResource: McpResourceHandler = McpResource("test://data", "Test Data")
@@ -322,9 +324,12 @@ object NegotiationSpec extends ZIOSpecDefault:
         assertTrue(
           resp.status == Status.Ok,
           resp.rawHeader("content-type").exists(_.contains("text/event-stream")),
-          progress.size == 3,
+          progress.size == 4,
           progress.forall(_.get("progressToken").flatMap(_.asString).contains("tok-1")),
-          values == Chunk(0.0, 50.0, 100.0),
+          values == Chunk(0.0, 50.0, 100.0, 101.0),
+          progress.take(3).forall(_.get("total").isDefined),
+          progress.last.get("total").isEmpty,
+          progress.last.get("message").flatMap(_.asString).contains("tidying up"),
           // no logLevel opt-in on the request, so log calls MUST NOT surface
           notificationsOf(events, "notifications/message").isEmpty,
           text.contains("noisy done"),

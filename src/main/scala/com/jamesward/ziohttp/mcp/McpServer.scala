@@ -524,8 +524,8 @@ final class McpServer[-R] private (
             case Left(resp) =>
               ZIO.succeed(resp)
             case Right(ProtocolEra.Modern(version)) =>
-              dispatchModern(request, id, method, version, params, principal, pathParams, 
-                stateStore = requestStateOverride.getOrElse(fallbackRequestStateStore))
+              dispatchModern(request, id, method, version, params, principal, pathParams,
+                stateStore = requestStateOverride.getOrElse(fallbackRequestStateStore), httpBinding = httpBinding)
             case Right(ProtocolEra.Legacy) =>
               method match
                 case "initialize" =>
@@ -536,8 +536,8 @@ final class McpServer[-R] private (
                       dispatchMethod(id, dm, ProtocolVersion.default, params, principal, pathParams,
                         statelessHandleToolsCall(request, ProtocolVersion.default, _, _, principal, pathParams))
                     case None =>
-                      val ctx = McpRequestContext(ProtocolVersion.default, callerPrincipal = principal, callerPathParams = pathParams)
-                      dispatchExtension(request, id, method, ProtocolVersion.default, params, ctx)
+                      val ctx = McpRequestContext(ProtocolVersion.default, callerPrincipal = principal, callerPathParams = pathParams, id = Some(id))
+                      dispatchExtension(request, id, method, ProtocolVersion.default, params, ctx, httpBinding)
         case JsonRpcMessage.Notification(method, params) =>
           ZIO.logAnnotate(
             LogAnnotation("method", method),
@@ -576,6 +576,7 @@ final class McpServer[-R] private (
    * calls are answered with a single augmented JSON result.
    */
   private def modernRequestContext(
+    id: RequestId,
     version: ProtocolVersion,
     params: Option[Json.Obj],
     principal: Option[Principal],
@@ -593,6 +594,7 @@ final class McpServer[-R] private (
       principal,
       pathParams,
       parsedCapabilities.invalid,
+      Some(id),
     )
 
   private def dispatchModern(
@@ -604,8 +606,9 @@ final class McpServer[-R] private (
     principal: Option[Principal],
     pathParams: Map[String, String],
     stateStore: McpRequestStateStore,
+    httpBinding: Boolean = true,
   ): ZIO[R, Response, Response] =
-    val ctx = modernRequestContext(version, params, principal, pathParams)
+    val ctx = modernRequestContext(id, version, params, principal, pathParams)
     (McpDispatchMethod.parse(method), taskRuntime) match
       case (Some(McpDispatchMethod.TasksGet), Some(tasks))    => handleTasksGet(id, params, principal, tasks)
       case (Some(McpDispatchMethod.TasksCancel), Some(tasks)) => handleTasksCancel(id, params, principal, tasks)
@@ -624,9 +627,15 @@ final class McpServer[-R] private (
         dispatchMethod(id, dm, version, params, principal, pathParams,
           modernHandleToolsCall(request, version, _, _, principal, pathParams, stateStore))
       case (None, _) =>
-        dispatchExtension(request, id, method, version, params, ctx)
+        dispatchExtension(request, id, method, version, params, ctx, httpBinding)
 
-
+  /**
+   * Serve an extension operation. Over Streamable HTTP (`httpBinding`) an
+   * operation with a routing name has its `Mcp-Name` header checked against it,
+   * and one whose header is [[McpRoutingHeader.Required]] must carry it. A
+   * streaming operation is answered with an SSE stream of its notifications and
+   * then its result.
+   */
   private def dispatchExtension(
     request: Request,
     id: RequestId,
@@ -634,6 +643,7 @@ final class McpServer[-R] private (
     version: ProtocolVersion,
     params: Option[Json.Obj],
     ctx: McpRequestContext,
+    httpBinding: Boolean,
   ): ZIO[R, Response, Response] =
     McpMethodName.parse(rawMethod).toOption.flatMap(extensions.operation) match
       case None =>
@@ -654,20 +664,35 @@ final class McpServer[-R] private (
                   request.rawHeader(Negotiation.NameHeader) match
                     case Some(actual) if Negotiation.decodeHeaderValue(actual) != expected.value =>
                       ZIO.fail(McpMethodError.RoutingNameMismatch(expected, Negotiation.decodeHeaderValue(actual)))
+                    case None if httpBinding && operation.routingHeader == McpRoutingHeader.Required =>
+                      ZIO.fail(McpMethodError.MissingRoutingName(expected))
                     case _ => ZIO.unit
                 case None => ZIO.unit
             else ZIO.unit
+          def envelope(result: Json.Obj): URIO[R, Json.Obj] =
+            if version.isStateless then
+              resolveServerInfo(ctx).map(ModernEnvelope.completeServerOwned(result, _, operation.cachePolicy))
+            else ZIO.succeed(result)
           (requireSupport *> validateRouting *> bound.invoke(rawParams, ctx))
             .foldZIO(
               error => ZIO.fail(extensionErrorResponse(id, version, error)),
-              result =>
-                if version.isStateless then
-                  resolveServerInfo(ctx.principal, ctx.pathParams).map: info =>
-                    rawResultResponse(
-                      id,
-                      ModernEnvelope.completeServerOwned(result, info, operation.cachePolicy),
+              {
+                case McpOperationOutput.Complete(result) =>
+                  envelope(result).map(rawResultResponse(id, _))
+                case McpOperationOutput.Streaming(notifications, result) =>
+                  ZIO.environment[R].map: env =>
+                    val messages = notifications.map: n =>
+                      sseEvent((JsonRpcMessage.Notification(n.method.value, Some(n.params)): JsonRpcMessage).toJson)
+                    val last = ZStream.fromZIO(envelope(result)).map(r => sseEvent(JsonRpcResponse(id, r).toJson))
+                    Response(
+                      status = Status.Ok,
+                      headers = Headers(
+                        Header.ContentType(MediaType.text.`event-stream`),
+                        Header.CacheControl.NoCache,
+                      ),
+                      body = Body.fromCharSequenceStreamChunked((messages ++ last).provideEnvironment(env)),
                     )
-                else ZIO.succeed(rawResultResponse(id, result)),
+              },
             )
 
   private def extensionErrorResponse(
@@ -694,6 +719,13 @@ final class McpServer[-R] private (
           Some(id),
           ErrorCode.HeaderMismatch,
           s"Mcp-Name header '$actual' does not match extension routing name '${expected.value}'",
+          Status.BadRequest,
+        )
+      case McpMethodError.MissingRoutingName(expected) =>
+        jsonRpcErrorResponseWith(
+          Some(id),
+          ErrorCode.HeaderMismatch,
+          s"Missing required Mcp-Name header (routing name '${expected.value}')",
           Status.BadRequest,
         )
       case McpMethodError.Domain(code, message, data) =>
@@ -846,6 +878,8 @@ final class McpServer[-R] private (
                   Status.Ok, Some(McpTasks.requiredCapabilityData)))
               case (TaskExecution.Required | TaskExecution.WhenSupported, Some(tasks)) if clientHasTasks =>
                 runToolAsTask(id, tool, callParams, params, principal, pathParams, tasks)
+              case (TaskExecution.WhenSlow(after), Some(tasks)) if clientHasTasks =>
+                runToolWhenSlow(id, tool, callParams, params, principal, pathParams, tasks, after)
               case _ =>
                 val progressToken = McpMeta.raw(meta, McpMeta.ProgressToken)
                 val logLevel      = McpMeta.raw(meta, McpMeta.LogLevel)
@@ -925,19 +959,60 @@ final class McpServer[-R] private (
     pathParams: Map[String, String],
     tasks: TaskRuntime,
   ): ZIO[R, Response, Response] =
+    launchTask(tool, callParams, params, principal, pathParams, tasks).map((task, _) => createdTaskResponse(id, task))
+
+  /**
+   * [[TaskExecution.WhenSlow]]: run the tool as a task the client is not yet told
+   * about, and wait up to `after`. A call that completed by then is answered
+   * with its result, and its task forgotten; otherwise (still working, waiting
+   * for input, or failed) the client gets the task. A request cancelled while
+   * waiting cancels the work.
+   */
+  private def runToolWhenSlow(
+    id: RequestId,
+    tool: McpToolHandlerR[R],
+    callParams: ToolCallParams,
+    params: Option[Json.Obj],
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+    tasks: TaskRuntime,
+    after: Duration,
+  ): ZIO[R, Response, Response] =
+    launchTask(tool, callParams, params, principal, pathParams, tasks).flatMap: (task, fiber) =>
+      val taskId = task.taskId
+      fiber.await.timeout(after)
+        .onInterrupt(tasks.cancel(taskId) *> tasks.discard(taskId))
+        .flatMap: finished =>
+          tasks.record(taskId).flatMap: current =>
+            (finished, current) match
+              case (Some(_), Some(r)) if r.task.status == TaskStatus.Completed =>
+                tasks.discard(taskId).as(rawResultResponse(id,
+                  ModernEnvelope.complete(r.task.result.getOrElse(Json.Obj()), serverInfo, cacheable = false)))
+              case (_, latest) =>
+                ZIO.succeed(createdTaskResponse(id, latest.fold(task)(_.task)))
+
+  private def launchTask(
+    tool: McpToolHandlerR[R],
+    callParams: ToolCallParams,
+    params: Option[Json.Obj],
+    principal: Option[Principal],
+    pathParams: Map[String, String],
+    tasks: TaskRuntime,
+  ): URIO[R, (McpTask, Fiber.Runtime[Nothing, Unit])] =
     val capabilities = McpMeta.raw(McpMeta.of(params), McpMeta.ClientCapabilities).flatMap(_.asObject)
     val policy = tool.taskPolicy
     val work = (taskId: TaskId) =>
       tasks.context(taskId, principal, pathParams, capabilities, policy.pollInterval)
         .flatMap(ctx => tool.callWithContext(callParams.arguments, ctx))
-    tasks.start(policy, McpTaskOwner.of(principal), work, callToolResultJson)
-      .tap(task => ZIO.logAnnotate(
+    tasks.launch(policy, McpTaskOwner.of(principal), work, callToolResultJson)
+      .tap((task, _) => ZIO.logAnnotate(
         LogAnnotation("tool", tool.name.value),
         LogAnnotation("taskId", task.taskId.value),
       )(ZIO.logInfo("MCP task created")))
-      .map: task =>
-        val created = Json.Obj(Chunk[(String, Json)]("resultType" -> Json.Str("task")) ++ task.toJson.fields)
-        rawResultResponse(id, ModernEnvelope.withServerInfo(created, serverInfo))
+
+  private def createdTaskResponse(id: RequestId, task: McpTask): Response =
+    val created = Json.Obj(Chunk[(String, Json)]("resultType" -> Json.Str("task")) ++ task.toJson.fields)
+    rawResultResponse(id, ModernEnvelope.withServerInfo(created, serverInfo))
 
   /**
    * The checks every `tasks/...` request passes before it touches a task: the
@@ -1045,7 +1120,7 @@ final class McpServer[-R] private (
       case McpDispatchMethod.CompletionComplete =>
         handleCompletionComplete(id, version, params, principal, pathParams)
       case McpDispatchMethod.SubscriptionsListen =>
-        handleSubscriptionsListen(id, version, params)
+        handleSubscriptionsListen(id, version, params, principal)
       case McpDispatchMethod.TasksGet | McpDispatchMethod.TasksUpdate | McpDispatchMethod.TasksCancel =>
         // Modern-only methods, which `dispatchModern` answers before getting
         // here; `isAvailable` rejects them for every legacy revision.
@@ -1060,8 +1135,8 @@ final class McpServer[-R] private (
     ctx: McpRequestContext,
   ): ZIO[R, Response, Response] =
     for
-      instr <- resolveInstructions(ctx.principal, ctx.pathParams)
-      info  <- resolveServerInfo(ctx.principal, ctx.pathParams)
+      instr <- resolveInstructions(ctx)
+      info  <- resolveServerInfo(ctx)
       caps  <- serverCapabilities(ctx)
     yield
       val result = DiscoverResult(
@@ -1128,7 +1203,7 @@ final class McpServer[-R] private (
       case Left(resp) =>
         ZIO.succeed(resp)
       case Right(ProtocolEra.Modern(version)) =>
-        dispatchModern(request, id, method, version, params, principal, pathParams, 
+        dispatchModern(request, id, method, version, params, principal, pathParams,
           stateStore = requestStateOverride.getOrElse(state.requestStateStore))
       case Right(ProtocolEra.Legacy) =>
         method match
@@ -1143,13 +1218,14 @@ final class McpServer[-R] private (
                 principal,
                 pathParams,
                 client.extensionCapabilityErrors,
+                Some(id),
               )
               McpDispatchMethod.parse(method) match
                 case Some(dm) =>
                   dispatchMethod(id, dm, client.protocolVersion, params, principal, pathParams,
                     handleToolsCall(request, _, _, state.pendingRequests, state.serverRequestIds, principal, pathParams))
                 case None =>
-                  dispatchExtension(request, id, method, client.protocolVersion, params, ctx)
+                  dispatchExtension(request, id, method, client.protocolVersion, params, ctx, httpBinding = true)
 
   private def handleNotification(
     request: Request,
@@ -1221,8 +1297,8 @@ final class McpServer[-R] private (
                      LogAnnotation("negotiatedProtocol", negotiated.wire),
                      LogAnnotation("client", client),
                    )(ZIO.logInfo("MCP initialize (legacy handshake)"))
-      instr     <- resolveInstructions(principal, pathParams)
-      info      <- resolveServerInfo(principal, pathParams)
+      instr     <- resolveInstructions(ctx)
+      info      <- resolveServerInfo(ctx)
       caps      <- serverCapabilities(ctx)
     yield
       ParsedInitialize(InitializeResult(
@@ -1235,24 +1311,19 @@ final class McpServer[-R] private (
   /** Resolve the handshake `serverInfo`: the dynamic [[ServerInfoSource]] provider
     * (with the request's principal/pathParams — so a parameterised mount can brand
     * itself per `<value>`), or the static identity when no provider is set. */
-  private def resolveServerInfo(
-    principal: Option[Principal],
-    pathParams: Map[String, String],
-  ): ZIO[R, Nothing, Implementation] =
+  private def resolveServerInfo(ctx: McpRequestContext): ZIO[R, Nothing, Implementation] =
     serverInfoSrc match
-      case Some(source) => source.serverInfo(McpToolContext.noopWith(principal, pathParams))
+      case Some(source) => source.serverInfo(McpToolContext.noopFor(ctx))
       case None         => ZIO.succeed(serverInfo)
 
-  /** Resolve the `initialize` instructions: either the dynamic [[InstructionsSource]]
-    * provider (with the request's principal/pathParams), or the static value — never
-    * both, since the two `instructions` overloads are mutually exclusive. */
-  private def resolveInstructions(
-    principal: Option[Principal],
-    pathParams: Map[String, String],
-  ): ZIO[R, Nothing, Option[String]] =
+  /** Resolve the `initialize` / `server/discover` instructions: either the dynamic
+    * [[InstructionsSource]] provider (with the request's client, its declared
+    * extensions, principal and pathParams), or the static value — never both, since
+    * the two `instructions` overloads are mutually exclusive. */
+  private def resolveInstructions(ctx: McpRequestContext): ZIO[R, Nothing, Option[String]] =
     instructionsSrc match
       case Some(source) =>
-        source.instructions(McpToolContext.noopWith(principal, pathParams))
+        source.instructions(McpToolContext.noopFor(ctx))
       case None =>
         ZIO.succeed(instructions)
 
@@ -1523,44 +1594,55 @@ final class McpServer[-R] private (
 
   /**
    * `subscriptions/listen` (2026-07-28): a single long-lived SSE stream carrying
-   * the change-notification types the client opts into. This server currently
-   * emits no change notifications, so the stream acknowledges the subscription
-   * and stays open with keep-alives until the client disconnects.
+   * the change-notification types the client opts into. With the Tasks extension
+   * registered, a client that declared it can ask for `notifications/tasks` for
+   * `taskIds`: the server agrees to those that are the caller's and still live,
+   * sends each one's current state, and then each change, until it is terminal.
+   * The stream stays open with keep-alives until the client disconnects.
    */
   private def handleSubscriptionsListen(
     id: RequestId,
     version: ProtocolVersion,
     params: Option[Json.Obj],
+    principal: Option[Principal],
   ): ZIO[Any, Response, Response] =
-    val wantsTaskNotifications = params.flatMap(_.get("notifications")).flatMap(_.asObject)
-      .exists(_.get("taskIds").isDefined)
-    if wantsTaskNotifications && !McpTasks.clientDeclares(params) then
+    val requestedTasks = params.flatMap(_.get("notifications")).flatMap(_.asObject).flatMap(_.get("taskIds"))
+    if requestedTasks.isDefined && !McpTasks.clientDeclares(params) then
       ZIO.fail(jsonRpcErrorResponseWith(
         Some(id), ErrorCode.MissingRequiredClientCapability,
         "Missing required client capability", Status.Ok, Some(McpTasks.requiredCapabilityData)))
-    else listen(id)
+    else
+      val asked = requestedTasks.flatMap(_.asArray).getOrElse(Chunk.empty).flatMap(_.asString).distinct.map(TaskId(_))
+      val owner = McpTaskOwner.of(principal)
+      (taskRuntime match
+        case Some(tasks) => ZIO.filter(asked)(taskId => tasks.lookup(taskId, owner).map(_.isDefined)).map(agreed => (agreed, Some(tasks)))
+        case None        => ZIO.succeed((Chunk.empty[TaskId], None))
+      ).map { case (agreed, tasks) =>
+        listen(id, agreed, tasks.fold(ZStream.empty)(_.watch(agreed, owner, 1.second)))
+      }
 
-  // Task status notifications are not offered (polling is the baseline), so the
-  // acknowledgement agrees to no task ids.
-  private def listen(id: RequestId): ZIO[Any, Response, Response] =
+  private def listen(id: RequestId, agreedTasks: Chunk[TaskId], taskUpdates: ZStream[Any, Nothing, McpTask]): Response =
     // The subscription id is the `subscriptions/listen` request's own JSON-RPC id,
     // which clients use to tell subscriptions apart (on stdio they share one channel).
-    // The server agrees to no notification types (it emits none).
+    val subscription = Json.Obj(Chunk(McpMeta.SubscriptionId -> id.asJson))
+    val agreed = Option.when(agreedTasks.nonEmpty)("taskIds" -> (Json.Arr(agreedTasks.map(t => Json.Str(t.value))): Json))
     val ackParams = Json.Obj(Chunk(
-      "_meta"         -> Json.Obj(Chunk(McpMeta.SubscriptionId -> id.asJson)),
-      "notifications" -> Json.Obj(),
+      "_meta"         -> subscription,
+      "notifications" -> Json.Obj(Chunk.fromIterable(agreed)),
     ))
-    val ack = (JsonRpcMessage.Notification("notifications/subscriptions/acknowledged", Some(ackParams)): JsonRpcMessage).toJson
-    val ackEvent = ZStream.succeed(sseEvent(ack))
+    def notification(method: String, params: Json.Obj) =
+      sseEvent((JsonRpcMessage.Notification(method, Some(params)): JsonRpcMessage).toJson)
+    val ackEvent = ZStream.succeed(notification("notifications/subscriptions/acknowledged", ackParams))
+    val tasks = taskUpdates.map(task => notification(McpTasks.StatusNotification, Json.Obj(task.toJson.fields :+ ("_meta" -> subscription))))
     val keepalive = ZStream.tick(30.seconds).as(":\n\n")
-    ZIO.succeed(Response(
+    Response(
       status = Status.Ok,
       headers = Headers(
         Header.ContentType(MediaType.text.`event-stream`),
         Header.CacheControl.NoCache,
       ),
-      body = Body.fromCharSequenceStreamChunked(ackEvent ++ keepalive),
-    ))
+      body = Body.fromCharSequenceStreamChunked(ackEvent ++ tasks.merge(keepalive)),
+    )
 
   private def withSession[R0](request: Request, state: McpServer.State)(
     effect: McpSessionClient => ZIO[R0, Response, Response]

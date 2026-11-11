@@ -58,6 +58,12 @@ final case class McpSkillsClient private (
     ))
 
 object McpSkillsClient:
+  /**
+   * The client's declaration of the Skills extension (SEP-2133 negotiation), sent by
+   * [[connect]]: it tells the server this client loads skills over MCP.
+   */
+  val declaration: McpClientExtensions = McpClientExtensions.single(McpClientExtension(McpSkills.Id, Json.Obj()))
+
   def from(client: McpExtensionClient): Either[McpSkillsClientAdapterError, McpSkillsClient] =
     for
       extensions <- client.serverCapabilities.extensions
@@ -69,7 +75,7 @@ object McpSkillsClient:
 
   def connect(config: McpClientConfig): ZIO[Client & Scope, McpClientError, McpSkillsClient] =
     for
-      client <- McpClient.connect(config, McpClientExtensions.empty)
+      client <- McpClient.connect(config, declaration)
       skills <- ZIO.fromEither(from(client)).mapError:
                   case McpSkillsClientAdapterError.ExtensionNotAdvertised =>
                     McpClientError.Protocol("Server does not advertise io.modelcontextprotocol/skills")

@@ -123,12 +123,23 @@ object McpSkillsJars:
    */
   def load(classLoader: ClassLoader): Task[McpSkillsJars] =
     for
-      paths   <- ZIO.attemptBlocking(scan(classLoader))
-      (skills, skipped) = build(paths)
-      _       <- ZIO.foreachDiscard(skipped)(skip =>
-                   ZIO.logWarning(s"Skipping SkillsJar skill ${skip.path}: ${skip.reason}")
-                 )
-    yield new McpSkillsJars(skills, skipped)
+      paths  <- ZIO.attemptBlocking(scan(classLoader))
+      loaded <- fromPaths(paths)
+    yield loaded
+
+  /**
+   * Load every skill under `META-INF/skills/` in `entries`: jar files, or directories laid
+   * out like a classpath entry (holding `META-INF/skills/`). Unlike loading from a class loader,
+   * it reads each jar's entries itself, so a jar without a `META-INF/skills/` directory
+   * entry is found too. When the same path is in more than one entry, the first one wins.
+   */
+  def load(entries: Chunk[Path]): Task[McpSkillsJars] =
+    ZIO.attemptBlocking(scan(entries)).flatMap(fromPaths)
+
+  private def fromPaths(paths: Map[String, Array[Byte]]): UIO[McpSkillsJars] =
+    val (skills, skipped) = build(paths)
+    ZIO.foreachDiscard(skipped)(skip => ZIO.logWarning(s"Skipping SkillsJar skill ${skip.path}: ${skip.reason}"))
+      .as(new McpSkillsJars(skills, skipped))
 
   private[mcp] final case class SkillFile(uri: String, path: String, mimeType: String, bytes: Array[Byte]):
     def contents: ResourceContents =
@@ -167,6 +178,31 @@ object McpSkillsJars:
               add(relativePath(root, file), Files.readAllBytes(file))
           finally stream.close()
         case _ => ()
+
+    found.toMap
+
+  /** Paths relative to `META-INF/skills/` in jar files and classpath directories, mapped to their bytes. */
+  private def scan(entries: Chunk[Path]): Map[String, Array[Byte]] =
+    val found = scala.collection.mutable.LinkedHashMap.empty[String, Array[Byte]]
+    def add(path: String, read: => Array[Byte]): Unit =
+      if path.nonEmpty && !found.contains(path) then found.update(path, read)
+
+    entries.foreach: entry =>
+      if Files.isDirectory(entry) then
+        val root = entry.resolve(ResourcePrefix)
+        if Files.isDirectory(root) then
+          val stream = Files.walk(root)
+          try
+            stream.iterator().asScala.filter(Files.isRegularFile(_)).foreach: file =>
+              add(relativePath(root, file), Files.readAllBytes(file))
+          finally stream.close()
+      else if Files.isRegularFile(entry) then
+        val jar = java.util.jar.JarFile(entry.toFile)
+        try
+          jar.entries().asScala
+            .filter(e => !e.isDirectory && e.getName.startsWith(ResourcePrefix))
+            .foreach(e => add(e.getName.stripPrefix(ResourcePrefix), jar.getInputStream(e).readAllBytes()))
+        finally jar.close()
 
     found.toMap
 

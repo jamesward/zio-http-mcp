@@ -5,7 +5,7 @@ import zio.*
 import zio.json.*
 import zio.json.ast.Json
 import zio.process.{Command, Process, ProcessInput}
-import zio.stream.ZStream
+import zio.stream.{Take, ZStream}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.Path
@@ -51,12 +51,17 @@ final case class McpStdioConfig(
  * requests: `ping` is answered and anything else gets method-not-found, since
  * the client declares no client-side capabilities.
  *
+ * A request answered with a stream (`events/stream`) has the notifications that
+ * name it as their subscription (`_meta["io.modelcontextprotocol/subscriptionId"]`)
+ * routed to it, since every stream shares the one stdout.
+ *
  * `pending` is `None` once the server's stdout has ended, so a request made
  * after that fails at once instead of waiting forever.
  */
 private[client] final class StdioWire private (
   stdin: Queue[Option[Chunk[Byte]]],
   pending: Ref[Option[Map[RequestId, Promise[McpClientError, Json]]]],
+  streams: Ref[Map[RequestId, Queue[Take[McpClientError, Json.Obj]]]],
 ) extends McpWire:
   import StdioWire.*
 
@@ -70,6 +75,21 @@ private[client] final class StdioWire private (
       result  <- (write(o.body) *> promise.await)
                    .onInterrupt(forget(o.id) *> cancel(o.id))
     yield result
+
+  def stream(o: Outgoing): ZStream[Any, McpClientError, Json.Obj] =
+    ZStream.unwrapScoped:
+      for
+        messages <- Queue.unbounded[Take[McpClientError, Json.Obj]]
+        _        <- ZIO.acquireRelease(
+                      pending.get.flatMap:
+                        case Some(_) => streams.update(_.updated(o.id, messages))
+                        case None    => ZIO.fail(serverGone)
+                    )(_ =>
+                      // Still registered: the stream was abandoned before its response.
+                      streams.modify(m => m.contains(o.id) -> (m - o.id)).flatMap(ZIO.when(_)(cancel(o.id)))
+                    )
+        _        <- write(o.body)
+      yield ZStream.fromQueue(messages).flattenTake
 
   def notify(method: String, body: String): IO[McpClientError, Unit] = write(body)
 
@@ -94,12 +114,22 @@ private[client] final class StdioWire private (
         val id = obj.get("id").flatMap(_.as[RequestId].toOption)
         (method, id) match
           case (Some(m), Some(requestId)) => answer(requestId, m)
-          case (Some(m), None)            => ZIO.logDebug(s"MCP server notification: $m")
-          case (None, Some(requestId))    =>
-            pending.modify(waiting => waiting.flatMap(_.get(requestId)) -> waiting.map(_ - requestId)).flatMap:
-              case Some(promise) => promise.complete(ZIO.fromEither(McpClient.extractResult(obj))).unit
-              case None          => ZIO.logDebug(s"MCP server answered a request that is no longer waiting: $requestId")
+          case (Some(m), None) =>
+            val subscription = obj.get("params").flatMap(_.asObject).flatMap(_.get("_meta")).flatMap(_.asObject)
+              .flatMap(_.get(McpMeta.SubscriptionId)).flatMap(_.as[RequestId].toOption)
+            streams.get.map(open => subscription.flatMap(open.get)).flatMap:
+              case Some(messages) => messages.offer(Take.single(obj)).unit
+              case None           => ZIO.logDebug(s"MCP server notification: $m")
+          case (None, Some(requestId)) =>
+            streams.modify(m => m.get(requestId) -> (m - requestId)).flatMap:
+              case Some(messages) => messages.offerAll(Chunk(Take.single(obj), Take.end)).unit
+              case None           => complete(requestId, obj)
           case (None, None) => ZIO.logWarning(s"MCP server sent a message with neither a method nor an id: ${line.take(200)}")
+
+  private def complete(requestId: RequestId, obj: Json.Obj): UIO[Unit] =
+    pending.modify(waiting => waiting.flatMap(_.get(requestId)) -> waiting.map(_ - requestId)).flatMap:
+      case Some(promise) => promise.complete(ZIO.fromEither(McpClient.extractResult(obj))).unit
+      case None          => ZIO.logDebug(s"MCP server answered a request that is no longer waiting: $requestId")
 
   /** Answers a request from a legacy server. */
   private def answer(id: RequestId, method: String): UIO[Unit] =
@@ -110,7 +140,8 @@ private[client] final class StdioWire private (
 
   /** The server's stdout ended: nothing more can be answered. */
   private def serverClosed: UIO[Unit] =
-    pending.getAndSet(None).flatMap(waiting => ZIO.foreachDiscard(waiting.toList.flatMap(_.values))(_.fail(serverGone)))
+    pending.getAndSet(None).flatMap(waiting => ZIO.foreachDiscard(waiting.toList.flatMap(_.values))(_.fail(serverGone))) *>
+      streams.getAndSet(Map.empty).flatMap(open => ZIO.foreachDiscard(open.values)(_.offer(Take.fail(serverGone))))
 
 private[client] object StdioWire:
 
@@ -124,7 +155,8 @@ private[client] object StdioWire:
     for
       stdin   <- Queue.unbounded[Option[Chunk[Byte]]]
       pending <- Ref.make(Option(Map.empty[RequestId, Promise[McpClientError, Json]]))
-      wire     = StdioWire(stdin, pending)
+      streams <- Ref.make(Map.empty[RequestId, Queue[Take[McpClientError, Json.Obj]]])
+      wire     = StdioWire(stdin, pending, streams)
       _       <- ZIO.acquireRelease(start(config, stdin, wire))(stop(_, config.shutdownTimeout))
     yield wire
 

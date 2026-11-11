@@ -425,6 +425,20 @@ val server = McpServer("multi", "1.0.0")
 
 Because `instructions` is a single value rather than a combinable collection like tools/resources, the `String` and `InstructionsSource` forms are **mutually exclusive** — calling either clears the other, last one wins. (This differs from `.tool` / `.toolSource`, which are additive.) `InstructionsSource.const("…")` wraps a fixed string as a source.
 
+The context also carries the client: `ctx.clientInfo` and the extensions it declared in its capabilities (`ctx.extensionCapabilities`, from `initialize` or from a modern request's `_meta`). So the instructions can say different things to clients that support an extension, for example only telling a client that doesn't load [skills over MCP](#skills-over-mcp) where to find them instead:
+
+```scala
+val server = McpServer("skills-aware", "1.0.0")
+  .instructions(InstructionsSource: ctx =>
+    ZIO.succeed(Some(
+      if ctx.extensionCapabilities.contains(McpSkills.Id) then "This server's skills are served over MCP."
+      else "This server's skills are in the skills/ directory of its repository."
+    ))
+  )
+```
+
+`McpSkillsClient.connect` declares the Skills extension (`McpSkillsClient.declaration`).
+
 
 ### HTTP Endpoints
 
@@ -551,7 +565,7 @@ Without the extension registered, `taskExecution` is ignored: every tool answers
 
 Inside a task the handler runs on a background fiber with the same `McpToolContext`, adapted to the task:
 
-- `ctx.progress(...)` becomes the task's `statusMessage`; `ctx.log` is dropped, since tasks carry no notifications.
+- `ctx.progress(...)` becomes the task's `statusMessage`; `ctx.log` is dropped, since a task has no response stream, and `notifications/message` is not sent for tasks.
 - `ctx.elicit` / `ctx.sample` / `ctx.listRoots` / `ctx.inputs` move the task to `input_required` with the requests in `inputRequests`, and the fiber resumes when the client answers through `tasks/update`. The handler is not replayed, unlike MRTR, so it needs no `requestState`.
 - A result — including one with `isError: true` — completes the task with that result inlined in `tasks/get`. A defect fails it with a `-32603` JSON-RPC `error`.
 
@@ -565,7 +579,9 @@ val bookFlight = McpTool("book_flight")
       else s"Not booked (${answer.action})"
 ```
 
-The server answers `tasks/get`, `tasks/update`, and `tasks/cancel` (cooperative: the fiber is interrupted and the task ends `cancelled`). Each of them requires the client to declare the extension (`-32021` otherwise), checks `Mcp-Name` against `params.taskId`, and only finds tasks the same caller created — with `.auth(...)`, a task is bound to the principal that started it, and another caller gets the same `-32602` as for an unknown id. Per-tool scopes are checked before a task is created. `notifications/tasks` are not sent — clients poll.
+The server answers `tasks/get`, `tasks/update`, and `tasks/cancel` (cooperative: the fiber is interrupted and the task ends `cancelled`). Each of them requires the client to declare the extension (`-32021` otherwise), checks `Mcp-Name` against `params.taskId`, and only finds tasks the same caller created — with `.auth(...)`, a task is bound to the principal that started it, and another caller gets the same `-32602` as for an unknown id. Per-tool scopes are checked before a task is created.
+
+Clients can also be told instead of polling. A client that declared the extension sends `subscriptions/listen` with `notifications.taskIds`; the server agrees, in the acknowledgement, to the ones that are that caller's and still live (`taskIds` in its `notifications`), and then sends a `notifications/tasks` carrying each task's full state, as `tasks/get` would return it, now and on each change until the task is terminal. Each notification carries the subscription id (the `subscriptions/listen` request's id) in `_meta`. The stream is SSE over Streamable HTTP and plain notifications on stdio, with keep-alives, until the client closes it. Changes made in this process are sent at once; the store is also re-read every second, for changes another replica made.
 
 ### Task storage
 
@@ -668,7 +684,7 @@ val skillsJarsServer =
 
 Your own project's skills load the same way: put them in the same layout under `src/main/resources/META-INF/skills/` (for example `META-INF/skills/my-skill/SKILL.md`, served as `skill://my-skill/SKILL.md`), and they are served alongside any SkillsJars dependencies.
 
-Skills with invalid `SKILL.md` frontmatter, or that go over the static-entry limits, are left out with a logged warning and listed in `jars.skipped`. `McpSkillsJars.load(classLoader)` scans a specific class loader instead of the thread's context class loader.
+Skills with invalid `SKILL.md` frontmatter, or that go over the static-entry limits, are left out with a logged warning and listed in `jars.skipped`. `McpSkillsJars.load(classLoader)` scans a specific class loader instead of the thread's context class loader, and `McpSkillsJars.load(entries)` reads a `Chunk[Path]` of jar files and classpath directories directly (it finds skills in a jar that has no `META-INF/skills/` directory entry, which a class loader misses).
 
 ### MCP Apps
 
@@ -694,7 +710,98 @@ yield
     .resource(resource)
 ```
 
-Apps-aware clients advertise `McpApps.clientExtension(McpAppsClientSettings.Html)`. The HTTP server intentionally does not route iframe-host `ui/*` methods; those belong to the host/view `postMessage` transport.
+Apps-aware clients advertise `McpApps.clientExtension(McpAppsClientSettings.Html)`, and `McpApps.clientSupportsHtml(ctx)` tells a server whether the client on a request did. The HTTP server intentionally does not route iframe-host `ui/*` methods; those belong to the host/view `postMessage` transport. Display modes, app-registered tools, messages and downloads are all between the view and the host, so they need nothing from the server beyond the metadata below.
+
+`McpAppsToolMeta` is one of:
+
+- `McpAppsToolMeta(uri)` (`View`): a tool whose results the view at `uri` renders. `visibility` defaults to `["model", "app"]`. With `globalEntryPoint = true` the tool is also an entry point: Claude can list the app on its Artifacts page, so people open it without asking (written as `_meta["openai/ui"].entrypoints: [{"type": "global"}]`, the key Claude reads, beside `_meta.ui.resourceUri`). An entry point needs `Model` in its visibility, and should work with `{}` as its arguments.
+- `McpAppsToolMeta.AppOnly`: a tool only views call (`visibility: ["app"]`), with no view of its own, such as one that hands a view a short-lived sign-in token for a site it embeds. Hosts keep it out of the model's tools.
+
+`McpAppsResourceMeta` carries the resource's `csp` (`connectDomains`, `resourceDomains`, `frameDomains` for embedded sites, `baseUriDomains`), `permissions`, `domain`, `prefersBorder`, and Claude's `preferredDisplayMode` extension (`Fullscreen` opens the view in Claude's side panel without a click). The helpers write it on both the `resources/list` entry and the `resources/read` content item; Claude reads the content item. `McpApps.claudeDomain(serverUrl)` gives the `domain` Claude expects for a server (an embedded site's `frame-ancestors` lists it, and a view that keeps a session needs it):
+
+```scala
+val studio = for
+  uri      <- McpUiUri.parse("ui://example/home")
+  fallback <- McpAppsFallbackText.parse("Example Studio is open")
+yield
+  val open = McpApps.tool(
+    McpTool("open_studio").description("Open Example Studio.").handle(ZIO.succeed(McpApps.result(fallback))),
+    McpAppsToolMeta.View(uri, globalEntryPoint = true),
+  )
+  val signIn = McpApps.tool(McpTool("sign_in_token").handle(ZIO.succeed("token")), McpAppsToolMeta.AppOnly)
+  val home = McpApps.resourceHandler(uri, "studio", McpAppsResourceMeta(
+    csp = Some(McpAppsCsp(frameDomains = Chunk("https://editor.example.com"))),
+    domain = Some(McpApps.claudeDomain("https://example.com/mcp")),
+    preferredDisplayMode = Some(McpAppsDisplayMode.Fullscreen),
+  ))(ZIO.succeed("<!doctype html><iframe src=\"https://editor.example.com\"></iframe>"))
+  (open, signIn, home)
+```
+
+### Events
+
+[Events](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415) (`io.modelcontextprotocol/events`, SEP-3415) let a client subscribe to things that happen upstream, such as a new incident or a push to a repository. The SEP is a draft, so this support is experimental and will change with it. `McpEvents(...)` serves `events/list`, and poll (`events/poll`) and push (`events/stream`) delivery for each event type, on 2026-07-28 requests. Webhook delivery is not implemented yet.
+
+An event type's events come from one of two places. For an upstream with no history to read, such as webhooks or a message bus, emit them into an `McpEventBuffer`, which keeps a window of them (by age and count) for poll clients and push subscribers. `buffered` can filter or reshape each event per subscription from its arguments, or with `None` leave a subscriber out:
+
+```scala
+case class Incident(id: String, severity: String, title: String) derives Schema
+case class IncidentFilter(severity: Option[String]) derives Schema
+
+val incidentsServer =
+  for incidents <- McpEventBuffer.make[Incident](maxAge = 10.minutes, maxEvents = 10000)
+  yield
+    val created = McpEvent("incident.created")
+      .description("A new incident")
+      .buffered[IncidentFilter, Incident](incidents, (filter, incident, _) =>
+        Option.when(filter.severity.forall(_ == incident.severity))(incident))
+    (incidents, McpEvents(created, ticks).map(McpServer("incidents", "1.0.0").withExtensions(_)))
+
+// From the upstream's webhook handler, with the upstream's own id to deduplicate by:
+incidents.emit(Incident("INC-2", "P1", "API down"), eventId = Some("INC-2"))
+```
+
+For an upstream you can read from a position (a mailbox's history id, a change feed's offset), write a check function instead: given a cursor, it answers the events since then and the position after them. With no cursor it answers the current position. Poll requests call it directly; each push subscription calls it every `checkInterval` (sooner while `hasMore`). The cursor is opaque to clients, so it can simply be the upstream's:
+
+```scala
+case class Tick(second: Long) derives Schema
+
+val ticks: McpEventHandler[Any] =
+  McpEvent("clock.tick")
+    .description("Fires every second")
+    .pollInterval(1.second)
+    .check[Any, Unit, Tick](tick)
+
+def tick(request: McpEventRequest[?]): UIO[McpEventBatch[Tick]] =
+  Clock.instant.map: now =>
+    val current = now.getEpochSecond
+    request.cursor.flatMap(_.value.toLongOption) match
+      case None => McpEventBatch.empty(Some(McpEventCursor(current.toString)))
+      case Some(from) =>
+        val upTo = math.min(current, from + request.maxEvents)
+        McpEventBatch(
+          Chunk.fromIterable((from + 1) to upTo).map(s => McpEventEmit(Tick(s), eventId = Some(s.toString))),
+          Some(McpEventCursor(upTo.toString)),
+          hasMore = upTo < current,
+        )
+```
+
+A check function fails with an `McpEventError`: `InvalidParams`, `NotFound`, `Forbidden`, `ResourceExhausted` and `Unsupported` are JSON-RPC errors on a poll and end a push subscription (`notifications/events/terminated`), while `Upstream` is reported on a push stream (`notifications/events/error`) and the next check goes on. Arguments that don't decode as the event type's input are `InvalidParams` (`-32602`); an unknown event type is `NotFound` (`-32023`). Push streams send a heartbeat with the current cursor every 30 seconds (`McpEvents.withHeartbeat(...)` changes it). `pollOnly` and `pushOnly` take a delivery mode away from an event type. Over Streamable HTTP, `events/poll` and `events/stream` must carry the `Mcp-Name` header (`400` `-32020` otherwise).
+
+`McpEventsClient.subscribe` receives a subscription's events whichever way the event type offers them, push first. It reconnects a dropped push stream from its last cursor, treats a stream with no heartbeat for 60 seconds as dropped, drops repeated event ids, and fails with the server's error when the subscription is terminated. A cursor from an `Event` (on push) or a `Heartbeat` is safe to persist and resume from with `cursor = ...`:
+
+```scala
+val watch = ZIO.scoped:
+  for
+    client <- McpEventsClient.connect(McpClientConfig("https://example.com/mcp"))
+    _      <- client.subscribe(McpEventName("incident.created"), Json.Obj("severity" -> Json.Str("P1")))
+                .collect { case McpEventSignal.Event(incident) => incident }
+                .foreach(incident => Console.printLine(incident.data.toJson).orDie)
+  yield ()
+```
+
+`delivery = Some(McpEventDelivery.Poll)` forces polling, at the interval the server suggests but no faster than `McpEventsSubscribeSettings.pollFloor` (1 second). `list`, `poll` and `stream` are the protocol's own requests, and `McpEventsClient.connectStdio` connects to a stdio server, where each push stream's notifications are routed by its subscription id.
+
+The extension kernel's `McpBoundOperation.streaming` is what serves `events/stream`: an operation answered with a stream of notifications and then its result, as SSE over HTTP and as lines on stdio. `McpExtensionClient.requestStream` calls one.
 
 ## Authorization
 

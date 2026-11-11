@@ -2,6 +2,7 @@ package com.jamesward.ziohttp.mcp
 
 import com.jamesward.ziohttp.mcp.auth.Principal
 import zio.*
+import zio.stream.ZStream
 import zio.json.*
 import zio.json.ast.Json
 
@@ -49,6 +50,13 @@ enum TaskExecution:
   case Never
   /** Run as a task when the client declared the extension, otherwise synchronously. */
   case WhenSupported
+  /**
+   * For a client that declared the extension, answer synchronously if the call
+   * completes within `after`, and otherwise as a task: a quick call stays a plain
+   * result, and only a slow one becomes something to follow. Other clients are
+   * answered synchronously.
+   */
+  case WhenSlow(after: Duration)
   /** Run as a task; a client that did not declare the extension gets `-32021`. */
   case Required
 
@@ -255,8 +263,9 @@ object McpTasks:
     for
       fibers  <- Ref.make(Map.empty[TaskId, Fiber.Runtime[Nothing, Unit]])
       signals <- Ref.make(Map.empty[TaskId, Promise[Nothing, Unit]])
+      changes <- Hub.sliding[TaskId](1024)
     yield McpExtensions.trustedVertical(McpServerExtension(
-      Id, Chunk.empty, Settings(TaskRuntime(store, fibers, signals)),
+      Id, Chunk.empty, Settings(TaskRuntime(store, fibers, signals, changes)),
     ))
 
   /** The extension, keeping tasks in memory ([[McpTaskStore.inMemory]]). */
@@ -273,6 +282,9 @@ object McpTasks:
     extensions.values.map(_.settings).collectFirst { case s: Settings => s.runtime }
 
   private[mcp] val ExtensionId: String = McpMeta.Tasks
+
+  /** The task status notification method, sent on a `subscriptions/listen` stream. */
+  private[mcp] val StatusNotification: String = "notifications/tasks"
 
   /** `error.data` for a `-32021` naming this extension. */
   private[mcp] val requiredCapabilityData: Json =
@@ -297,7 +309,12 @@ private[mcp] final class TaskRuntime(
   store: McpTaskStore,
   fibers: Ref[Map[TaskId, Fiber.Runtime[Nothing, Unit]]],
   signals: Ref[Map[TaskId, Promise[Nothing, Unit]]],
+  changes: Hub[TaskId],
 ):
+
+  /** Update the task in the store, and tell [[watch]]ers in this process that it may have changed. */
+  private def write(taskId: TaskId)(f: McpTaskRecord => McpTaskRecord): UIO[Option[McpTaskRecord]] =
+    store.update(taskId)(f) <* changes.publish(taskId)
 
   /**
    * Create a `working` task and run `work` on a daemon fiber that records its
@@ -314,6 +331,15 @@ private[mcp] final class TaskRuntime(
     work: TaskId => ZIO[R, Nothing, CallToolResult],
     encode: CallToolResult => Json,
   ): URIO[R, McpTask] =
+    launch(policy, owner, work, encode).map(_._1)
+
+  /** [[start]], also giving the fiber that runs the work and records its outcome. */
+  def launch[R](
+    policy: TaskPolicy,
+    owner: Option[McpTaskOwner],
+    work: TaskId => ZIO[R, Nothing, CallToolResult],
+    encode: CallToolResult => Json,
+  ): URIO[R, (McpTask, Fiber.Runtime[Nothing, Unit])] =
     for
       now    <- Clock.instant
       task    = McpTask(
@@ -326,7 +352,7 @@ private[mcp] final class TaskRuntime(
                   pollIntervalMs = Some(policy.pollInterval.toMillis),
                 )
       id      = task.taskId
-      _      <- store.create(McpTaskRecord(task, owner, policy.ttl.map(d => now.plusMillis(d.toMillis))))
+      _      <- store.create(McpTaskRecord(task, owner, policy.ttl.map(d => now.plusMillis(d.toMillis)))) *> changes.publish(task.taskId)
       outcome = work(id).foldCauseZIO(
                   cause =>
                     if cause.isInterruptedOnly then ZIO.unit
@@ -344,7 +370,17 @@ private[mcp] final class TaskRuntime(
       _      <- fibers.update(_.updated(id, fiber))
       // The work may already have finished, and forgotten, before it was registered.
       _      <- fiber.poll.flatMap(done => ZIO.when(done.isDefined)(forget(id)))
-    yield task
+    yield (task, fiber)
+
+  /**
+   * Forget a task the client was never told about (a [[TaskExecution.WhenSlow]]
+   * call answered synchronously after all).
+   */
+  def discard(taskId: TaskId): UIO[Unit] =
+    store.delete(taskId) *> changes.publish(taskId).unit
+
+  /** The task's record, whoever owns it. */
+  def record(taskId: TaskId): UIO[Option[McpTaskRecord]] = store.get(taskId)
 
   private def forget(taskId: TaskId): UIO[Unit] =
     fibers.update(_ - taskId) *> signals.update(_ - taskId)
@@ -355,7 +391,7 @@ private[mcp] final class TaskRuntime(
     payload: McpTask => McpTask,
   ): UIO[Unit] =
     Clock.instant.flatMap: now =>
-      store.update(taskId): r =>
+      write(taskId): r =>
         if r.task.isTerminal then r
         else r.copy(task = payload(r.task.copy(
           status = status, statusMessage = message.orElse(r.task.statusMessage),
@@ -386,7 +422,7 @@ private[mcp] final class TaskRuntime(
    */
   def update(taskId: TaskId, responses: Map[String, Json]): UIO[Unit] =
     Clock.instant.flatMap: now =>
-      store.update(taskId): r =>
+      write(taskId): r =>
         val outstanding = r.task.inputRequests.map(_.id).toSet
         val accepted = responses.filter((key, _) => outstanding.contains(key))
         if r.task.isTerminal || accepted.isEmpty then r
@@ -403,7 +439,7 @@ private[mcp] final class TaskRuntime(
     * it runs in this process. */
   def cancel(taskId: TaskId): UIO[Unit] =
     Clock.instant.flatMap: now =>
-      store.update(taskId): r =>
+      write(taskId): r =>
         if r.task.isTerminal then r
         else r.copy(task = r.task.copy(
           status = TaskStatus.Cancelled, statusMessage = Some("Cancelled by the client"),
@@ -418,6 +454,29 @@ private[mcp] final class TaskRuntime(
 
   private def wake(taskId: TaskId): UIO[Unit] =
     signals.modify(m => (m.get(taskId), m - taskId)).flatMap(ZIO.foreachDiscard(_)(_.succeed(())))
+
+  /**
+   * The state of each of `taskIds` (the `owner`'s), as `tasks/get` would report it:
+   * now, and again each time it changes, until it is terminal (or gone). For
+   * `notifications/tasks` on a `subscriptions/listen` stream. A change in this process
+   * is reported at once; the store is also re-read every `recheckEvery`, for changes
+   * another replica made.
+   */
+  def watch(taskIds: Chunk[TaskId], owner: Option[McpTaskOwner], recheckEvery: Duration): ZStream[Any, Nothing, McpTask] =
+    final case class Watching(sent: Map[TaskId, McpTask], open: Set[TaskId])
+    ZStream.unwrapScoped:
+      // Subscribed before the first read, so a change in between is not missed.
+      changes.subscribe.map: queue =>
+        val wakes = ZStream.succeed(()) ++
+          ZStream.fromQueue(queue).filter(taskIds.contains).as(()).merge(ZStream.tick(recheckEvery))
+        wakes
+          .mapAccumZIO(Watching(Map.empty, taskIds.toSet)): (watching, _) =>
+            ZIO.foreach(Chunk.fromIterable(watching.open))(id => lookup(id, owner).map(id -> _.map(_.task))).map: found =>
+              val changed = found.collect { case (id, Some(task)) if !watching.sent.get(id).contains(task) => task }
+              val ended   = found.collect { case (id, None) => id; case (id, Some(task)) if task.isTerminal => id }.toSet
+              (Watching(watching.sent ++ changed.map(t => t.taskId -> t), watching.open -- ended), (changed, (watching.open -- ended).isEmpty))
+          .takeUntil(_._2)
+          .flatMap((changed, _) => ZStream.fromChunk(changed))
 
   /**
    * The context a tool runs with inside a task. There is no response stream to
@@ -442,10 +501,10 @@ private[mcp] final class TaskRuntime(
 
         def log(level: com.jamesward.ziohttp.mcp.LogLevel, message: String): UIO[Unit] = ZIO.unit
 
-        def progress(current: Double, total: Double, message: Option[String]): UIO[Unit] =
-          val text = message.getOrElse(s"${TaskRuntime.fmt(current)}/${TaskRuntime.fmt(total)}")
+        def progress(current: Double, total: Option[Double], message: Option[String]): UIO[Unit] =
+          val text = message.getOrElse(total.fold(TaskRuntime.fmt(current))(t => s"${TaskRuntime.fmt(current)}/${TaskRuntime.fmt(t)}"))
           Clock.instant.flatMap: now =>
-            store.update(taskId): r =>
+            write(taskId): r =>
               if r.task.isTerminal then r
               else r.copy(task = r.task.copy(statusMessage = Some(text), lastUpdatedAt = now))
             .unit
@@ -470,7 +529,7 @@ private[mcp] final class TaskRuntime(
       signal  <- signals.modify: m =>
                    m.get(taskId).fold((fresh, m.updated(taskId, fresh)))(existing => (existing, m))
       now     <- Clock.instant
-      current <- store.update(taskId): r =>
+      current <- write(taskId): r =>
                    val missing = specs.filterNot(spec => r.inputResponses.contains(spec.id))
                    if r.task.isTerminal || missing.isEmpty then r
                    else
