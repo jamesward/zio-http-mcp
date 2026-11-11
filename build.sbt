@@ -21,8 +21,8 @@ val zioVersion = "2.1.27"
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                   % zioVersion,
   "dev.zio" %% "zio-http"              % "3.11.6",
-  "dev.zio" %% "zio-schema-derivation" % "1.9.1",
-  "dev.zio" %% "zio-schema-json"       % "1.9.1",
+  "dev.zio" %% "zio-schema-derivation" % "1.9.0",
+  "dev.zio" %% "zio-schema-json"       % "1.9.0",
   // Subprocesses for the stdio client transport.
   "dev.zio" %% "zio-process"           % "0.8.1",
 
