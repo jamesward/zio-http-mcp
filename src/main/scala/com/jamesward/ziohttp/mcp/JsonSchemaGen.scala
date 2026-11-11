@@ -47,8 +47,14 @@ object JsonSchemaGen:
       case Schema.Lazy(schema0) =>
         convert(schema0())
 
+      // Anything else (zio-json's `Json`, `DynamicValue`, …) can be any JSON value.
+      // Say so with every type, not `{}`: some MCP clients refuse a schema without a
+      // validation keyword.
       case _ =>
-        Json.Obj(Chunk.empty)
+        AnyValue
+
+  private val AnyValue: Json.Obj =
+    Json.Obj("type" -> Json.Arr(Chunk("object", "array", "string", "number", "boolean", "null").map(Json.Str(_))))
 
   private def primitiveSchema(st: StandardType[?]): Json.Obj =
     // Use `eq` for reference equality to avoid strictEquality issues with wildcard types

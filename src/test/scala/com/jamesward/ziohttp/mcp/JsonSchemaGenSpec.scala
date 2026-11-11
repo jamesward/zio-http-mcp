@@ -14,6 +14,12 @@ object JsonSchemaGenSpec extends ZIOSpecDefault:
     age: Int,
   ) derives Schema
 
+  /** As sbta's `show` result: a value that can be any JSON. */
+  case class Shown(@description("The value, as JSON.") value: Option[Json])
+  object Shown:
+    import zio.schema.codec.json.schemaJson
+    given Schema[Shown] = DeriveSchema.gen[Shown]
+
   extension (j: Json)
     private def field(name: String): Option[Json] = j match
       case Json.Obj(fields) => fields.collectFirst { case (k, v) if k == name => v }
@@ -68,5 +74,15 @@ object JsonSchemaGenSpec extends ZIOSpecDefault:
       assertTrue(
         json.field("type").flatMap(_.str).contains("array"),
         json.field("description").flatMap(_.str).contains("a list of String"),
+      )
+    ,
+
+    test("a field that can hold any JSON value lists every JSON type, rather than the keyword-less `{}`"):
+      val json  = JsonSchemaGen.fromSchema(summon[Schema[Shown]])
+      val value = json.field("properties").flatMap(_.field("value"))
+      assertTrue(
+        value.flatMap(_.field("type")).map(_.toString)
+          .contains("""["object","array","string","number","boolean","null"]"""),
+        value.flatMap(_.field("description")).flatMap(_.str).contains("The value, as JSON."),
       )
   )
