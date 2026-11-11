@@ -90,6 +90,12 @@ object TasksSpec extends ZIOSpecDefault:
     .handleWithContext[Any, Nothing, String]: ctx =>
       ctx.progress(1, None, Some("compiling")) *> ZIO.sleep(1.second).as("slow done")
 
+  // Backs off from polling every 100 ms, doubling, to every 10 s.
+  val backingOff: McpToolHandler = McpTool("backing_off")
+    .taskExecution(TaskExecution.WhenSupported,
+      pollSchedule = Some(Schedule.exponential(100.millis) || Schedule.spaced(10.seconds)))
+    .handle(ZIO.sleep(3.seconds).as("backed off"))
+
   /** Set when the work of a `grace_never` call is interrupted. */
   val graceInterrupted: Promise[Nothing, Unit] = unsafeRun(Promise.make[Nothing, Unit])
 
@@ -124,7 +130,7 @@ object TasksSpec extends ZIOSpecDefault:
     .withExtensions(tasks)
     .tool(deepResearch).tool(quickTool).tool(syncTool).tool(requiredTool).tool(slowTool)
     .tool(erroringTool).tool(progressTool).tool(shortLivedTool).tool(bookFlight)
-    .tool(graceQuick).tool(graceSlow).tool(graceNever)
+    .tool(graceQuick).tool(graceSlow).tool(graceNever).tool(backingOff)
 
   // --- wire helpers ---
 
@@ -421,6 +427,48 @@ object TasksSpec extends ZIOSpecDefault:
               _         <- send("""{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":9}}""")
               stopped   <- graceInterrupted.await.timeout(5.seconds)
             yield assertTrue(stopped.isDefined)
+        ,
+      ),
+
+      suite("poll schedule")(
+        test("the suggested interval is the delay the schedule has reached by the task's age"):
+          val created  = Instant.parse("2026-11-11T00:00:00Z")
+          val backoff  = Schedule.exponential(1.second) || Schedule.spaced(30.seconds)
+          val twice    = Schedule.spaced(1.second) && Schedule.recurs(2)
+          def at(schedule: Schedule[Any, Any, Any], ageMillis: Long) =
+            TaskPolicy.pollIntervalAt(schedule, created, created.plusMillis(ageMillis))
+          for
+            first   <- at(backoff, 0)
+            second  <- at(backoff, 1500)
+            capped  <- at(backoff, 100000)
+            running <- at(twice, 1500)
+            done    <- at(twice, 10000)
+          yield assertTrue(
+            first.contains(1.second),
+            // Polled at 1 s, then due 2 s later.
+            second.contains(2.seconds),
+            // 1, 2, 4, 8, 16, then 30 s each.
+            capped.contains(30.seconds),
+            running.contains(1.second),
+            done.isEmpty,
+          )
+        ,
+        test("a task's pollIntervalMs grows as it runs, on the task handle and on each tasks/get"):
+          for
+            port    <- Server.install(server.routes)
+            created <- call(port, "backing_off").flatMap(json).map(result)
+            taskId   = str(created, "taskId").getOrElse("")
+            _       <- ZIO.sleep(1.second)
+            later   <- getTask(port, taskId).map(result)
+            done    <- pollUntil(port, taskId)(isTerminal)
+          yield
+            def interval(t: Json.Obj) = t.get("pollIntervalMs").flatMap(_.asNumber).map(_.value.longValue)
+            assertTrue(
+              interval(created).contains(100L),
+              // At about 1 s: polled at 0.1, 0.3, 0.7 s, then due 0.8 s later (1.6 s, past 1.5 s).
+              interval(later).exists(Set(800L, 1600L).contains),
+              str(done, "status").contains("completed"),
+            )
         ,
       ),
 

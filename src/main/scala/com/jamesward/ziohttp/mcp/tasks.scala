@@ -70,11 +70,19 @@ object TaskExecution:
  * @param ttl          how long the server keeps the task, from creation; `None`
  *                     keeps it until the server restarts (`ttlMs: null`)
  * @param pollInterval the polling interval suggested to the client
+ * @param pollSchedule how the suggested interval changes as the task runs, e.g.
+ *                     `Schedule.exponential(1.second, 1.2) || Schedule.spaced(30.seconds)`
+ *                     to back off to every 30 s. Each answer about the task suggests
+ *                     the delay the schedule has reached by the task's age: it is run
+ *                     from the task's creation, a step at each delay, as if polled on
+ *                     time, so nothing is kept per poll. Once the schedule is done,
+ *                     `pollInterval` is suggested. `None`: always `pollInterval`.
  */
 final case class TaskPolicy(
   execution: TaskExecution,
   ttl: Option[Duration] = TaskPolicy.DefaultTtl,
   pollInterval: Duration = TaskPolicy.DefaultPollInterval,
+  pollSchedule: Option[Schedule[Any, Any, Any]] = None,
 )
 
 object TaskPolicy:
@@ -84,6 +92,31 @@ object TaskPolicy:
   val DefaultPollInterval: Duration = 500.millis
 
   val never: TaskPolicy = TaskPolicy(TaskExecution.Never)
+
+  private val MaxScheduleSteps = 100_000
+
+  /**
+   * The delay `schedule` has reached by `now`, for a task created at `created`: the
+   * schedule stepped from `created`, each step at the time the one before said, until
+   * a step's delay reaches past `now`. `None` once the schedule is done.
+   */
+  private[mcp] def pollIntervalAt(
+    schedule: Schedule[Any, Any, Any],
+    created: Instant,
+    now: Instant,
+  ): UIO[Option[Duration]] =
+    val s = schedule
+    val end = now.atOffset(java.time.ZoneOffset.UTC)
+    def loop(state: s.State, at: java.time.OffsetDateTime, steps: Int): UIO[Option[Duration]] =
+      s.step(at, (), state).flatMap:
+        case (next, _, Schedule.Decision.Continue(intervals)) =>
+          val delay = Duration.fromJava(java.time.Duration.between(at, intervals.start)).max(Duration.Zero)
+          val nextAt = at.plus(delay)
+          // A schedule without delays never gets there: stop counting.
+          if nextAt.isAfter(end) || steps >= MaxScheduleSteps then ZIO.some(delay)
+          else loop(next, nextAt, steps + 1)
+        case (_, _, _: Schedule.Decision.Done.type) => ZIO.none
+    loop(s.initial, created.atOffset(java.time.ZoneOffset.UTC), 0)
 
 /**
  * A task's state as `tasks/get` reports it (the spec's `DetailedTask`): the
@@ -264,8 +297,9 @@ object McpTasks:
       fibers  <- Ref.make(Map.empty[TaskId, Fiber.Runtime[Nothing, Unit]])
       signals <- Ref.make(Map.empty[TaskId, Promise[Nothing, Unit]])
       changes <- Hub.sliding[TaskId](1024)
+      polling <- Ref.make(Map.empty[TaskId, Schedule[Any, Any, Any]])
     yield McpExtensions.trustedVertical(McpServerExtension(
-      Id, Chunk.empty, Settings(TaskRuntime(store, fibers, signals, changes)),
+      Id, Chunk.empty, Settings(TaskRuntime(store, fibers, signals, changes, polling)),
     ))
 
   /** The extension, keeping tasks in memory ([[McpTaskStore.inMemory]]). */
@@ -310,6 +344,8 @@ private[mcp] final class TaskRuntime(
   fibers: Ref[Map[TaskId, Fiber.Runtime[Nothing, Unit]]],
   signals: Ref[Map[TaskId, Promise[Nothing, Unit]]],
   changes: Hub[TaskId],
+  /** The poll schedules of the live tasks started in this process (see [[TaskPolicy.pollSchedule]]). */
+  polling: Ref[Map[TaskId, Schedule[Any, Any, Any]]],
 ):
 
   /** Update the task in the store, and tell [[watch]]ers in this process that it may have changed. */
@@ -366,6 +402,7 @@ private[mcp] final class TaskRuntime(
                     val json = encode(result).asObject.getOrElse(Json.Obj())
                     finish(id, TaskStatus.Completed, None)(_.copy(result = Some(json))),
                 ).ensuring(forget(id))
+      _      <- ZIO.foreachDiscard(policy.pollSchedule)(schedule => polling.update(_.updated(id, schedule)))
       fiber  <- outcome.forkDaemon
       _      <- fibers.update(_.updated(id, fiber))
       // The work may already have finished, and forgotten, before it was registered.
@@ -383,7 +420,21 @@ private[mcp] final class TaskRuntime(
   def record(taskId: TaskId): UIO[Option[McpTaskRecord]] = store.get(taskId)
 
   private def forget(taskId: TaskId): UIO[Unit] =
-    fibers.update(_ - taskId) *> signals.update(_ - taskId)
+    fibers.update(_ - taskId) *> signals.update(_ - taskId) *> polling.update(_ - taskId)
+
+  /**
+   * The task with the poll interval to suggest now: from its policy's
+   * [[TaskPolicy.pollSchedule]] while it runs here, and otherwise as stored.
+   */
+  def current(task: McpTask): UIO[McpTask] =
+    if task.isTerminal then ZIO.succeed(task)
+    else
+      polling.get.map(_.get(task.taskId)).flatMap:
+        case None => ZIO.succeed(task)
+        case Some(schedule) =>
+          Clock.instant.flatMap(now => TaskPolicy.pollIntervalAt(schedule, task.createdAt, now)).map:
+            case Some(interval) => task.copy(pollIntervalMs = Some(interval.toMillis))
+            case None           => task
 
   /** Move a non-terminal task to a terminal status. A task that is already
     * terminal (e.g. cancelled while the work finished) keeps its state. */
@@ -413,7 +464,9 @@ private[mcp] final class TaskRuntime(
                   case Some(r) if r.isExpired(now) =>
                     store.delete(taskId) *> interrupt(taskId).as(None)
                   case other => ZIO.succeed(other)
-    yield live.filter(_.owner == owner)
+      mine    = live.filter(_.owner == owner)
+      shown  <- ZIO.foreach(mine)(r => current(r.task).map(t => r.copy(task = t)))
+    yield shown
 
   /**
    * Accept answers for a task's outstanding input requests. Answers for keys

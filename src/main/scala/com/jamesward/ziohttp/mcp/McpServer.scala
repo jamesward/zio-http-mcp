@@ -959,7 +959,9 @@ final class McpServer[-R] private (
     pathParams: Map[String, String],
     tasks: TaskRuntime,
   ): ZIO[R, Response, Response] =
-    launchTask(tool, callParams, params, principal, pathParams, tasks).map((task, _) => createdTaskResponse(id, task))
+    launchTask(tool, callParams, params, principal, pathParams, tasks)
+      .flatMap((task, _) => tasks.current(task))
+      .map(createdTaskResponse(id, _))
 
   /**
    * [[TaskExecution.WhenSlow]]: run the tool as a task the client is not yet told
@@ -989,7 +991,7 @@ final class McpServer[-R] private (
                 tasks.discard(taskId).as(rawResultResponse(id,
                   ModernEnvelope.complete(r.task.result.getOrElse(Json.Obj()), serverInfo, cacheable = false)))
               case (_, latest) =>
-                ZIO.succeed(createdTaskResponse(id, latest.fold(task)(_.task)))
+                tasks.current(latest.fold(task)(_.task)).map(createdTaskResponse(id, _))
 
   private def launchTask(
     tool: McpToolHandlerR[R],

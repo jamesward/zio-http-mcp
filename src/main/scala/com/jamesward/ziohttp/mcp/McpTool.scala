@@ -157,13 +157,16 @@ final class McpTool private (
    * @param ttl          how long the server keeps the task after creating it;
    *                     `None` keeps it until the server restarts
    * @param pollInterval the polling interval suggested to the client
+   * @param pollSchedule how the suggested interval grows as the task runs (see [[TaskPolicy.pollSchedule]])
    */
   def taskExecution(
     execution: TaskExecution,
     ttl: Option[Duration] = TaskPolicy.DefaultTtl,
     pollInterval: Duration = TaskPolicy.DefaultPollInterval,
+    pollSchedule: Option[Schedule[Any, Any, Any]] = None,
   ): McpTool =
-    new McpTool(toolName, toolDescription, toolAnnotations, toolRequiredScopes, TaskPolicy(execution, ttl, pollInterval))
+    new McpTool(toolName, toolDescription, toolAnnotations, toolRequiredScopes,
+      TaskPolicy(execution, ttl, pollInterval, pollSchedule))
 
   // --- handle: typed input/output ---
 

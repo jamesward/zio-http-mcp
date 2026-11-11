@@ -559,9 +559,10 @@ val deepResearch = McpTool("deep_research")
 |---|---|---|
 | `Never` (default) | synchronous result | synchronous result |
 | `WhenSupported` | task | synchronous result |
+| `WhenSlow(after)` | synchronous result if the call finishes within `after`, otherwise a task (cancelling the request before then stops the work) | synchronous result |
 | `Required` | task | `-32021` naming the extension (legacy sessions still run it synchronously) |
 
-Without the extension registered, `taskExecution` is ignored: every tool answers synchronously and the `tasks/...` methods do not exist (`404`/`-32601`). `taskExecution` also takes the task's `ttl` (default one hour, `None` keeps it until restart) and the `pollInterval` suggested to the client (default 500 ms). The extension is advertised in `server/discover`, and not to legacy `2025-11-25` sessions, which cannot use it.
+Without the extension registered, `taskExecution` is ignored: every tool answers synchronously and the `tasks/...` methods do not exist (`404`/`-32601`). `taskExecution` also takes the task's `ttl` (default one hour, `None` keeps it until restart) and the `pollInterval` suggested to the client (default 500 ms). A `pollSchedule` makes the suggested interval change as the task runs, so clients back off: each answer about the task (the task handle, `tasks/get`, `notifications/tasks`) suggests the delay the ZIO `Schedule` has reached by the task's age, stepping it from the task's creation as if it had been polled on time, so nothing is kept per poll. For example, `pollSchedule = Some(Schedule.exponential(1.second, 1.2) || Schedule.spaced(30.seconds))` grows from 1 s by 20% a poll up to 30 s. Once the schedule is done, `pollInterval` is suggested again. The extension is advertised in `server/discover`, and not to legacy `2025-11-25` sessions, which cannot use it.
 
 Inside a task the handler runs on a background fiber with the same `McpToolContext`, adapted to the task:
 
