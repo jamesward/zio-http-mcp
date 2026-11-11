@@ -21,8 +21,8 @@ val zioVersion = "2.1.27"
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                   % zioVersion,
   "dev.zio" %% "zio-http"              % "3.11.6",
-  "dev.zio" %% "zio-schema-derivation" % "1.9.0",
-  "dev.zio" %% "zio-schema-json"       % "1.9.0",
+  "dev.zio" %% "zio-schema-derivation" % "1.9.1",
+  "dev.zio" %% "zio-schema-json"       % "1.9.1",
   // Subprocesses for the stdio client transport.
   "dev.zio" %% "zio-process"           % "0.8.1",
 
@@ -120,4 +120,4 @@ ThisBuild / versionScheme := Some("semver-spec")
 // SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.22" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.24" % Skills
