@@ -49,6 +49,7 @@ object McpToolSpec extends ZIOSpecDefault:
   case class AddInput(a: Int, b: Int) derives Schema
   case class AddOutput(result: Int) derives Schema
   case class QueryInput(sql: String) derives Schema
+  case class SearchInput(query: String, inPackage: Option[String]) derives Schema
   case class LookupInput(id: String) derives Schema
   case class DeleteInput(userId: String) derives Schema
   case class Result(value: Int) derives Schema
@@ -302,6 +303,19 @@ object McpToolSpec extends ZIOSpecDefault:
 
     // README: Error Handling
     suite("errors")(
+      test("arguments that don't decode are an error result naming what is missing, what is unknown, and what the tool takes"):
+        val search = McpTool("search").handle[Any, Nothing, SearchInput, String](s => ZIO.succeed(s.query))
+        for
+          wrongName <- search.call(Some(Json.Obj("pattern" -> Json.Str("*Version*"))))
+          nothing   <- search.call(None)
+        yield assertTrue(
+          wrongName.isError.contains(true),
+          resultText(wrongName) == "Invalid arguments: .query(missing). Missing required `query`. " +
+            "Unknown `pattern` (did you mean `query`?). Arguments: `query` (required), `inPackage`.",
+          resultText(nothing) == "Invalid arguments: .query(missing). Missing required `query`. " +
+            "Arguments: `query` (required), `inPackage`.",
+        )
+      ,
       test("custom error type — McpError[AppError]"):
         val tool = McpTool("lookup")
           .handle[Any, AppError, LookupInput, String]: input =>

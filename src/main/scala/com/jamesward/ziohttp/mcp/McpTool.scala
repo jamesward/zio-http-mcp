@@ -216,7 +216,7 @@ final class McpTool private (
         mcpInput.decode(args) match
           case Left(decodeError) =>
             ZIO.succeed(CallToolResult(
-              content = Chunk(ToolContent.text(s"Invalid arguments: $decodeError")),
+              content = Chunk(ToolContent.text(McpTool.invalidArguments(decodeError, toolDef.inputSchema, args))),
               isError = Some(true),
             ))
           case Right(input) =>
@@ -250,6 +250,31 @@ final class McpTool private (
 object McpTool:
   def apply(name: String): McpTool =
     new McpTool(ToolName(name), None, None, Set.empty, TaskPolicy.never)
+
+  /**
+   * What a call whose arguments don't decode is told: the decoder's error, then, from
+   * the tool's input schema, the required arguments it lacks, the ones the tool doesn't
+   * take (with a guess when one stands in for the only missing one), and what the tool
+   * takes. A bare `.query(missing)` leaves a caller that sent `pattern` guessing.
+   */
+  private[mcp] def invalidArguments(error: String, inputSchema: Json.Obj, args: Option[Json.Obj]): String =
+    val properties = inputSchema.get("properties").flatMap(_.asObject).map(_.fields.map(_._1)).getOrElse(Chunk.empty)
+    val required   = inputSchema.get("required").flatMap(_.asArray).map(_.flatMap(_.asString)).getOrElse(Chunk.empty)
+    val sent       = args.map(_.fields.map(_._1)).getOrElse(Chunk.empty)
+    val missing    = required.filterNot(sent.contains)
+    val unknown    = if properties.isEmpty then Chunk.empty else sent.filterNot(properties.contains)
+    def names(ns: Chunk[String]) = ns.map(n => s"`$n`").mkString(", ")
+    val guess = (missing.toList, unknown.toList) match
+      case (List(wanted), List(_)) => s" (did you mean `$wanted`?)"
+      case _                       => ""
+    Chunk(
+      Some(s"Invalid arguments: $error."),
+      Option.when(missing.nonEmpty)(s"Missing required ${names(missing)}."),
+      Option.when(unknown.nonEmpty)(s"Unknown ${names(unknown)}$guess."),
+      Option.when(properties.nonEmpty)(
+        "Arguments: " + properties.map(p => if required.contains(p) then s"`$p` (required)" else s"`$p`").mkString(", ") + "."
+      ),
+    ).flatten.mkString(" ")
 
   /**
    * The result for a tool handler that died. A defect is a bug or an unexpected
