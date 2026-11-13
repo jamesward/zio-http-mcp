@@ -39,7 +39,24 @@ object McpOutputSpec extends ZIOSpecDefault:
     case _: Json.Obj => true
     case _           => false
 
+  case class Status(app: String, secondsAgo: Option[Long], tags: List[String]) derives Schema
+
   def spec = suite("McpOutput — spec-compliant structured output for any Schema[A]")(
+
+    test("a None field is left out of structuredContent (the output schema doesn't require it) rather than written as null"):
+      val out      = summon[McpOutput[Status]]
+      val none     = out.toResult(Status("a", None, Nil)).structuredContent
+      val some     = out.toResult(Status("a", Some(3), Nil)).structuredContent.map((_: Json).toJson).getOrElse("")
+      val required = out.outputSchema.flatMap(_.field("required")).map((_: Json).toJson).getOrElse("")
+      assertTrue(
+        none.flatMap(_.field("secondsAgo")).isEmpty,
+        none.flatMap(_.field("tags")).isDefined,
+        !none.map((_: Json).toJson).getOrElse("").contains("null"),
+        !required.contains("secondsAgo"),
+        some.contains("\"secondsAgo\":3"),
+      )
+    ,
+
 
     test("object-typed value: schema is used verbatim; structuredContent is the object (not double-wrapped)"):
       val out = summon[McpOutput[Point]]
