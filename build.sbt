@@ -21,8 +21,8 @@ val zioVersion = "2.1.27"
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                   % zioVersion,
   "dev.zio" %% "zio-http"              % "3.11.6",
-  "dev.zio" %% "zio-schema-derivation" % "1.9.0",
-  "dev.zio" %% "zio-schema-json"       % "1.9.0",
+  "dev.zio" %% "zio-schema-derivation" % "1.9.2",
+  "dev.zio" %% "zio-schema-json"       % "1.9.2",
   // Subprocesses for the stdio client transport.
   "dev.zio" %% "zio-process"           % "0.8.1",
 
@@ -39,8 +39,8 @@ libraryDependencies ++= Seq(
 
   "org.testcontainers" % "testcontainers" % "2.0.5" % Test,
 
-  "io.modelcontextprotocol.sdk" % "mcp-core"           % "2.1.0" % Test,
-  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "2.1.0" % Test,
+  "io.modelcontextprotocol.sdk" % "mcp-core"           % "2.2.0" % Test,
+  "io.modelcontextprotocol.sdk" % "mcp-json-jackson2"  % "2.2.0" % Test,
 
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
@@ -120,4 +120,4 @@ ThisBuild / versionScheme := Some("semver-spec")
 // SkillsJars: extract agent Skills with `./sbta extractSkillsJars`
 skillsJarsOutputDir := Some(file(".kiro/skills"))
 
-libraryDependencies += "com.jamesward" % "skills" % "0.0.24" % Skills
+libraryDependencies += "com.jamesward" % "skills" % "0.0.27" % Skills
