@@ -65,8 +65,13 @@ object McpWebhookPrincipalId:
     principal.subject.map(s => s"sub:$s").orElse(principal.clientId.map(c => s"client:$c"))
       .map(who => s"${principal.issuer.getOrElse("")}|$who")
 
+  /** The owner of subscriptions made without authentication, when [[McpWebhookConfig.anonymous]] allows them. */
+  val Anonymous: McpWebhookPrincipalId = "anonymous"
+
   def apply(value: String): McpWebhookPrincipalId = value
-  extension (id: McpWebhookPrincipalId) def value: String = id
+  extension (id: McpWebhookPrincipalId)
+    def value: String        = id
+    def isAnonymous: Boolean = id == Anonymous
   given CanEqual[McpWebhookPrincipalId, McpWebhookPrincipalId] = CanEqual.derived
 
 /** The handle of a webhook subscription, derived from its [[McpWebhookKey]]: `X-MCP-Subscription-Id` on every delivery. */
@@ -114,7 +119,8 @@ object McpWebhookPreviousSecret:
 /**
  * A webhook subscription, as the [[McpWebhookStore]] holds it.
  *
- * @param principal     the caller, for the event type's check function; its `raw` token is not kept
+ * @param principal     the caller, for the event type's check function; its `raw` token is not kept.
+ *                      `None` for an anonymous subscription
  * @param refreshBefore when it expires unless refreshed; `None` for no expiry
  * @param cursor        the delivery watermark: what it was subscribed from, and,
  *                      in a durable store, kept up to date, so delivery resumes
@@ -124,7 +130,7 @@ final case class McpWebhookSubscription(
   key: McpWebhookKey,
   secret: McpWebhookSecret,
   previousSecret: Option[McpWebhookPreviousSecret],
-  principal: Principal,
+  principal: Option[Principal],
   refreshBefore: Option[Instant],
   cursor: Option[McpEventCursor],
 ):

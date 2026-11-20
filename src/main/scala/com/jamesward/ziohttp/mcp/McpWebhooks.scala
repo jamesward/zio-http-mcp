@@ -76,6 +76,14 @@ object McpWebhookTargets:
  * @param secretGrace     how long a secret replaced on refresh still signs deliveries
  * @param expiryCheck     how often expired subscriptions are ended
  * @param preVerified     callback URLs that need no verification handshake: an allowlist
+ * @param anonymous       accept `events/subscribe` and `events/unsubscribe` without
+ *                        an authenticated caller, which SEP-3415 forbids. Such
+ *                        subscriptions all belong to one anonymous owner, so they
+ *                        are told apart by URL, name and arguments alone: anyone
+ *                        who knows those can unsubscribe one. A new secret on a
+ *                        refresh takes effect only after the endpoint verifies it
+ *                        (the challenge is signed with it), and every new anonymous
+ *                        subscription is verified, without the per-URL cache.
  */
 final case class McpWebhookConfig(
   maxTtl: Duration = 1.hour,
@@ -89,6 +97,7 @@ final case class McpWebhookConfig(
   expiryCheck: Duration = 30.seconds,
   targets: McpWebhookTargets = McpWebhookTargets.public,
   preVerified: McpWebhookUrl => Boolean = _ => false,
+  anonymous: Boolean = false,
 ):
   /** The lifetime granted for a suggestion: `None` for no expiry. */
   def grant(ttl: McpWebhookTtl, durable: Boolean): Option[Duration] = ttl match
@@ -201,7 +210,7 @@ private[mcp] final case class McpWebhookRuntime[R](
       refreshBefore       = config.grant(params.ttl, store.durable).map(now.plus(_))
       live               <- workers.get.map(_.get(key.id))
       result             <- live match
-                              case Some(worker) => refresh(worker, params.secret, refreshBefore)
+                              case Some(worker) => refresh(worker, key, params.secret, refreshBefore)
                               case None         => create(handler, key, principal, params, refreshBefore, ctx)
     yield result
 
@@ -233,12 +242,20 @@ private[mcp] final case class McpWebhookRuntime[R](
 
   private def offersWebhook(handler: McpEventHandler[R]): Boolean = McpWebhookRuntime.offersWebhook(handler.descriptor)
 
-  private def caller(ctx: McpRequestContext): IO[McpEventError, (Principal, McpWebhookPrincipalId)] =
-    ZIO.fromOption(ctx.principal.flatMap(p => McpWebhookPrincipalId.of(p).map(p -> _)))
-      .orElseFail(McpEventError.Forbidden("Webhook subscriptions need an authenticated caller"))
+  private def caller(ctx: McpRequestContext): IO[McpEventError, (Option[Principal], McpWebhookPrincipalId)] =
+    ctx.principal match
+      case Some(p) =>
+        ZIO.fromOption(McpWebhookPrincipalId.of(p)).map(Some(p) -> _)
+          .orElseFail(McpEventError.Forbidden("The caller's principal names no subject or client"))
+      case None if config.anonymous => ZIO.succeed(None -> McpWebhookPrincipalId.Anonymous)
+      case None => ZIO.fail(McpEventError.Forbidden("Webhook subscriptions need an authenticated caller"))
 
-  private def refresh(worker: Worker, secret: McpWebhookSecret, refreshBefore: Option[Instant]): IO[McpEventError, McpEventsSubscribeResult] =
+  private def refresh(worker: Worker, key: McpWebhookKey, secret: McpWebhookSecret, refreshBefore: Option[Instant])
+    : IO[McpEventError, McpEventsSubscribeResult] =
     for
+      current <- worker.state.get.map(_.subscription.secret)
+      // Anyone can refresh an anonymous subscription: its endpoint has to accept a new secret first.
+      _       <- handshake(key, secret).when(key.principal.isAnonymous && current != secret)
       now     <- Clock.instant
       updated <- worker.state.updateAndGet: s =>
                    val sub = s.subscription
@@ -254,7 +271,7 @@ private[mcp] final case class McpWebhookRuntime[R](
   private def create(
     handler: McpEventHandler[R],
     key: McpWebhookKey,
-    principal: Principal,
+    principal: Option[Principal],
     params: McpEventsSubscribeParams,
     refreshBefore: Option[Instant],
     ctx: McpRequestContext,
@@ -262,12 +279,12 @@ private[mcp] final case class McpWebhookRuntime[R](
     for
       pushes  <- handler.push(params.arguments, params.cursor, params.maxAgeMs.map(Duration.fromMillis), ctx).provideEnvironment(env)
       _       <- verify(key, params.secret, refreshBefore)
-      sub      = McpWebhookSubscription(key, params.secret, None, principal.copy(raw = ""), refreshBefore, params.cursor)
+      sub      = McpWebhookSubscription(key, params.secret, None, principal.map(_.copy(raw = "")), refreshBefore, params.cursor)
       _       <- store.put(sub).storeFailure("events/subscribe", key.id)
       started <- install(sub, pushes, resumed = false)
       result  <- started match
                    // Another subscribe for the same key got there first: this one refreshes it.
-                   case Left(existing) => refresh(existing, params.secret, refreshBefore)
+                   case Left(existing) => refresh(existing, key, params.secret, refreshBefore)
                    case Right(first)   =>
                      first.await.map((cursor, truncated) => McpEventsSubscribeResult(key.id, refreshBefore, cursor, truncated))
     yield result
@@ -277,7 +294,8 @@ private[mcp] final case class McpWebhookRuntime[R](
     for
       now    <- Clock.instant
       cached <- store.verification(key.principal, key.url).storeFailure("events/subscribe", key.id)
-      known   = config.preVerified(key.url) || cached.exists(_.isValid(now))
+      // The cache is per principal: one anonymous caller's verification can't vouch for another's.
+      known   = config.preVerified(key.url) || (!key.principal.isAnonymous && cached.exists(_.isValid(now)))
       _      <- (handshake(key, secret) *>
                   store.putVerification(McpWebhookVerification(key.principal, key.url,
                     refreshBefore.map(r => if r.isAfter(now.plus(config.verificationTtl)) then r else now.plus(config.verificationTtl))))
@@ -314,7 +332,7 @@ private[mcp] final case class McpWebhookRuntime[R](
           ZIO.logWarning(s"Webhook subscription ${sub.id} is for the unknown event type '${sub.key.name.value}': deleted") *>
             store.delete(sub.id).ignoreLogged
         case Some(handler) =>
-          val ctx = McpRequestContext(ProtocolVersion.V2026_07_28, callerPrincipal = Some(sub.principal))
+          val ctx = McpRequestContext(ProtocolVersion.V2026_07_28, callerPrincipal = sub.principal)
           handler.push(sub.key.arguments, sub.cursor, None, ctx).provideEnvironment(env).foldZIO(
             error => ZIO.logWarning(s"Webhook subscription ${sub.id} can't resume: ${error.detail.message}") *>
               terminate(sub, error.detail),

@@ -346,7 +346,7 @@ object McpWebhooksSpec extends ZIOSpecDefault:
         val owner = McpWebhookPrincipalId("https://auth.test|sub:alice")
         val key = McpWebhookKey(owner, url, McpEventName("incident.created"), Json.Obj())
         val principal = Principal(Some("alice"), None, Set.empty, Set(Resource), Some("https://auth.test"), None, "", Json.Obj())
-        store.put(McpWebhookSubscription(key, McpWebhookSecret.parse(secretA).toOption.get, None, principal,
+        store.put(McpWebhookSubscription(key, McpWebhookSecret.parse(secretA).toOption.get, None, Some(principal),
           Some(Instant.now().plusSeconds(600)), None)).orDieWith(e => RuntimeException(e.message))
       ZIO.scoped:
         for
@@ -368,6 +368,66 @@ object McpWebhooksSpec extends ZIOSpecDefault:
           field(d, "result", "refreshBefore").contains(Json.Null),
         )
     ,
+    suite("anonymous")(
+      test("with anonymous on, an unauthenticated caller subscribes, verified every time, and gets events"):
+        ZIO.scoped:
+          for
+            fx            <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            first         <- call(fx.port, "events/subscribe", subscription(fx.url()), token = None)
+            verifiedFirst <- fx.receiver.next
+            _             <- fx.incidents.emit(Incident("INC-1", "P1"))
+            delivery      <- fx.receiver.next
+            // A second subscription to the same URL is verified again: there's no per-URL cache for anonymous callers.
+            second        <- call(fx.port, "events/subscribe",
+                               subscription(fx.url(), arguments = Json.Obj("severity" -> Json.Str("P2"))), token = None)
+            verifiedAgain <- fx.receiver.next
+            // A refresh with the same secret needs no verification.
+            same          <- call(fx.port, "events/subscribe", subscription(fx.url()), token = None)
+            quiet         <- fx.receiver.quiet(300)
+            stored        <- fx.store.all
+          yield assertTrue(
+            str(first, "result", "id").isDefined,
+            verifiedFirst.kind.contains("verification"),
+            delivery.str("eventId").isDefined,
+            delivery.signedWith(secretA),
+            str(second, "result", "id").isDefined,
+            verifiedAgain.kind.contains("verification"),
+            str(same, "result", "id") == str(first, "result", "id"),
+            quiet.isEmpty,
+            stored.forall(_.principal.isEmpty),
+            stored.forall(_.key.principal == McpWebhookPrincipalId.Anonymous),
+          )
+      ,
+      test("a new secret for an anonymous subscription takes effect only once the endpoint verifies it"):
+        ZIO.scoped:
+          for
+            fx       <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            first    <- call(fx.port, "events/subscribe", subscription(fx.url()), token = None)
+            _        <- fx.receiver.next
+            // The endpoint doesn't know secret B (it echoes nothing): the refresh is refused.
+            _        <- fx.receiver.echo.set(false)
+            refused  <- call(fx.port, "events/subscribe", subscription(fx.url(), secret = secretB), token = None)
+            _        <- fx.receiver.next
+            _        <- fx.incidents.emit(Incident("INC-1", "P1"))
+            kept     <- fx.receiver.next
+            // Now it does: the refresh keeps the id and signs with both during the grace window.
+            _        <- fx.receiver.echo.set(true)
+            rotated  <- call(fx.port, "events/subscribe", subscription(fx.url(), secret = secretB), token = None)
+            check    <- fx.receiver.next
+            _        <- fx.incidents.emit(Incident("INC-2", "P1"))
+            both     <- fx.receiver.next
+          yield assertTrue(
+            code(refused).contains(-32027),
+            kept.signedWith(secretA),
+            !kept.signedWith(secretB),
+            check.kind.contains("verification"),
+            check.signedWith(secretB),
+            str(rotated, "result", "id") == str(first, "result", "id"),
+            both.signedWith(secretA),
+            both.signedWith(secretB),
+          )
+      ,
+    ),
     suite("refusals")(
       test("an unauthenticated caller is Forbidden"):
         ZIO.scoped:
