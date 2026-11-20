@@ -194,11 +194,12 @@ private[mcp] object McpWebhookSender:
           .flatMap: all =>
             val (allowed, refused) = all.partition(config.targets.allowAddress)
             val addresses = (as: Chunk[InetAddress]) => as.map(_.getHostAddress).mkString(",")
+            // The client may resolve a host several times for one POST: the POST's own line says how it went.
             McpWebhookLog.fields("host" -> host, "allowed" -> addresses(allowed), "refused" -> addresses(refused))(
-              if refused.isEmpty then ZIO.logDebug("Webhook host resolved")
-              else ZIO.logWarning("Webhook host resolves to addresses webhooks may not reach"))
+              ZIO.logDebug("Webhook host resolved"))
               .as(allowed)
-          .filterOrFail(_.nonEmpty)(UnknownHostException(s"$host has no address webhooks may be delivered to"))
+              .filterOrFail(_.nonEmpty)(UnknownHostException(
+                s"$host resolves only to addresses webhooks may not reach: ${addresses(refused)}"))
     val layer = (ZLayer.succeed(ZClient.Config.default.idleTimeout(30.seconds)) ++
       ZLayer.succeed(NettyConfig.defaultWithFastShutdown) ++ ZLayer.succeed(dns)) >>> ZClient.live
     layer.build.map(env => McpWebhookSender(env.get[Client], config.deliveryTimeout))
