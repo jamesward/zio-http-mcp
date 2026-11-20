@@ -87,7 +87,8 @@ object McpWebhooksSpec extends ZIOSpecDefault:
 
   // --- the server under test ---
 
-  final case class Fixture(port: Int, incidents: McpEventBuffer[Incident], store: TestWebhookStore, receiver: Receiver):
+  final case class Fixture(port: Int, incidents: McpEventBuffer[Incident], store: TestWebhookStore, receiver: Receiver,
+    tokensSeen: Ref[Chunk[String]]):
     def url(name: String = "a"): String = s"http://localhost:$port/hooks/$name"
 
   private def install(
@@ -111,7 +112,12 @@ object McpWebhooksSpec extends ZIOSpecDefault:
                        if request.cursor.isEmpty then ZIO.succeed(McpEventBatch.empty(Some(McpEventCursor("0"))))
                        else if n >= 3 then ZIO.fail(McpEventError.Forbidden("Access revoked"))
                        else ZIO.succeed(McpEventBatch.empty(Some(McpEventCursor(n.toString))))
-      events    <- McpEvents.withWebhooks(config)(created, revoked, McpEvent("poll-only").pollOnly.buffered(incidents))
+      tokens    <- Ref.make(Chunk.empty[String])
+      // Records the token of the principal its check function sees.
+      whoami     = McpEvent("whoami").checkInterval(50.millis).check[Any, Unit, Count]: request =>
+                     tokens.update(_ :+ request.context.principal.fold("none")(_.raw))
+                       .as(McpEventBatch.empty(Some(McpEventCursor("0"))))
+      events    <- McpEvents.withWebhooks(config)(created, revoked, whoami, McpEvent("poll-only").pollOnly.buffered(incidents))
                      .provideSomeEnvironment[Scope](_.add[McpWebhookStore](store))
       base       = McpServer("hooks", "1.0.0").withExtensions(events)
       server     = if authenticated then base.auth(McpAuth(
@@ -120,7 +126,7 @@ object McpWebhooksSpec extends ZIOSpecDefault:
                      resourceUri = Some(ResourceUri.unsafe(Resource)),
                    )) else base
       _         <- Server.install(server.routes)
-    yield Fixture(port, incidents, store, receiver)
+    yield Fixture(port, incidents, store, receiver, tokens)
 
   // --- wire helpers ---
 
@@ -526,6 +532,72 @@ object McpWebhooksSpec extends ZIOSpecDefault:
           )
       ,
     ),
+    suite("hardening")(
+      test("a check function never sees the subscriber's token"):
+        ZIO.scoped:
+          for
+            fx     <- install()
+            _      <- subscribed(fx, subscription(fx.url(), name = "whoami", arguments = Json.Obj()))
+            _      <- ZIO.sleep(200.millis)
+            tokens <- fx.tokensSeen.get
+          yield assertTrue(tokens.nonEmpty, tokens.forall(_ == ""))
+      ,
+      test("an https endpoint with a certificate the JDK doesn't trust gets nothing"):
+        ZIO.scoped:
+          for
+            fx     <- install()
+            // A certificate for localhost that no trust store has (zio-http's SSLConfig.generate fails on this Netty).
+            ssl     = SSLConfig.fromJavaxNetSslKeyStoreResource("webhook-tls/self-signed.p12", Config.Secret("changeit"))
+            tls    <- Server.defaultWith(_.onAnyOpenPort.ssl(ssl)).build
+            port   <- Server.install(fx.receiver.routes).provideEnvironment(tls)
+            result <- call(fx.port, "events/subscribe", subscription(s"https://localhost:$port/hooks/a"))
+            posted <- fx.receiver.quiet(100)
+          // zio-http reports the failed handshake as a closed channel, so the reason is a connection failure.
+          yield assertTrue(code(result).contains(-32027), posted.isEmpty)
+      ,
+      test("past maxPerUrl, a new subscription to the same URL is ResourceExhausted"):
+        ZIO.scoped:
+          for
+            fx     <- install(config = testConfig.copy(maxPerUrl = 1))
+            _      <- subscribed(fx, subscription(fx.url()))
+            second <- call(fx.port, "events/subscribe", subscription(fx.url(), arguments = Json.Obj("severity" -> Json.Str("P2"))))
+            other  <- call(fx.port, "events/subscribe", subscription(fx.url("b"), arguments = Json.Obj("severity" -> Json.Str("P2"))))
+          yield assertTrue(
+            code(second).contains(-32025),
+            str(second, "error", "data", "limit").contains("subscriptionsPerUrl"),
+            str(other, "result", "id").isDefined,
+          )
+      ,
+      test("verification POSTs to one host are rate limited"):
+        ZIO.scoped:
+          for
+            fx      <- install(config = testConfig.copy(anonymous = true, verificationsPerHost = 1), authenticated = false)
+            first   <- call(fx.port, "events/subscribe", subscription(fx.url()), token = None)
+            second  <- call(fx.port, "events/subscribe", subscription(fx.url("b")), token = None)
+            posted  <- fx.receiver.quiet(200)
+          yield assertTrue(
+            str(first, "result", "id").isDefined,
+            code(second).contains(-32025),
+            str(second, "error", "data", "limit").contains("verificationsPerHost"),
+            posted.count(_.kind.contains("verification")) == 1,
+          )
+      ,
+      test("arguments that don't decode are refused before anything is POSTed"):
+        ZIO.scoped:
+          for
+            fx     <- install()
+            result <- call(fx.port, "events/subscribe", subscription(fx.url(), arguments = Json.Obj("severity" -> Json.Num(1))))
+            posted <- fx.receiver.quiet(200)
+          yield assertTrue(code(result).contains(-32602), posted.isEmpty)
+      ,
+      test("a negative ttlMs is clamped, not refused"):
+        ZIO.scoped:
+          for
+            fx     <- install()
+            (r, _) <- subscribed(fx, subscription(fx.url(), ttl = Some(Json.Num(-5))))
+          yield assertTrue(str(r, "result", "refreshBefore").isDefined)
+      ,
+    ),
     suite("refusals")(
       test("an unauthenticated caller is Forbidden"):
         ZIO.scoped:
@@ -576,13 +648,25 @@ object McpWebhooksSpec extends ZIOSpecDefault:
       ,
       test("public targets refuse the IANA special-purpose ranges"):
         def global(address: String) = McpWebhookTargets.isGlobal(InetAddress.getByName(address))
+        def v6(prefix: Array[Byte], v4: Int*) =
+          McpWebhookTargets.isGlobal(java.net.Inet6Address.getByAddress(null, prefix ++ v4.map(_.toByte), null))
+        def mapped(v4: Int*) = v6(Array.fill[Byte](10)(0) ++ Array(0xff.toByte, 0xff.toByte), v4*)
+        def compatible(v4: Int*) = v6(Array.fill[Byte](12)(0), v4*)
         assertTrue(
           !global("127.0.0.1"), !global("10.0.0.1"), !global("172.16.0.1"), !global("192.168.0.1"),
           !global("169.254.169.254"), !global("100.64.0.1"), !global("0.0.0.0"), !global("198.18.0.1"),
           !global("203.0.113.5"), !global("255.255.255.255"), !global("::1"), !global("fd00::1"),
-          !global("fe80::1"), !global("2001:db8::1"), !global("64:ff9b::a00:1"),
+          !global("fe80::1"), !global("2001:db8::1"), !global("64:ff9b::a00:1"), !global("64:ff9b:1::a00:1"),
+          // IPv4-mapped and IPv4-compatible IPv6, built as Inet6Address the way an AAAA answer is.
+          !mapped(127, 0, 0, 1), !mapped(169, 254, 169, 254), !mapped(10, 0, 0, 1), mapped(93, 184, 215, 14),
+          !compatible(127, 0, 0, 1),
           global("93.184.215.14"), global("2606:4700::1111"),
         )
+      ,
+      test("schema-encoded wire values leave a None field out instead of writing null"):
+        case class Shape(a: Option[Int], b: String) derives Schema
+        val codec = McpWireCodec.schema(Schema[Shape])
+        assertTrue(codec.encode(Shape(None, "x")).map(_.toJson) == Right("""{"b":"x"}"""))
       ,
       test("the server grants a TTL within its bounds"):
         val config = McpWebhookConfig(minTtl = 1.minute, maxTtl = 1.hour, defaultTtl = 30.minutes, noExpiry = true)

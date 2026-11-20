@@ -364,7 +364,9 @@ private[mcp] object McpEventsWire:
     o.get("ttlMs") match
       case None              => Right(McpWebhookTtl.ServerDefault)
       case Some(_: Json.Null.type) => Right(McpWebhookTtl.NoExpiry)
-      case Some(_)           => optionalLong(o, "ttlMs", min = 0).map(ms => McpWebhookTtl.Suggested(Duration.fromMillis(ms.getOrElse(0L))))
+      // A TTL is never refused, only clamped: a negative one asks for the shortest.
+      case Some(_)           => optionalLong(o, "ttlMs", min = Long.MinValue)
+                                  .map(ms => McpWebhookTtl.Suggested(Duration.fromMillis(ms.getOrElse(0L).max(0L))))
 
   private def instant(field: String)(value: String): Either[String, Instant] =
     Try(Instant.parse(value)).toEither.left.map(_ => s"Invalid '$field' '$value'")

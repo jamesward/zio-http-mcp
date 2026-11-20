@@ -90,6 +90,8 @@ trait McpEventHandler[-R]:
     maxEvents: Int,
     ctx: McpRequestContext,
   ): ZIO[R, McpEventError, McpEventRead]
+  /** Whether `arguments` decode as the event type's input, without reading anything. */
+  private[mcp] def validate(arguments: Json.Obj): IO[McpEventError, Unit]
   /** Validate the subscription and read from its cursor; the stream starts with `active`. */
   private[mcp] def push(
     arguments: Json.Obj,
@@ -203,6 +205,8 @@ object McpEvent:
     checkFn: McpEventRequest[In] => ZIO[R, McpEventError, McpEventBatch[Out]],
   ) extends McpEventHandler[R]:
 
+    def validate(arguments: Json.Obj): IO[McpEventError, Unit] = decode(input, arguments).unit
+
     def read(
       arguments: Json.Obj,
       cursor: Option[McpEventCursor],
@@ -266,6 +270,8 @@ object McpEvent:
     buffer: McpEventBuffer[Out],
     deliver: (In, Out, McpRequestContext) => Option[Out],
   ) extends McpEventHandler[Any]:
+
+    def validate(arguments: Json.Obj): IO[McpEventError, Unit] = decode(input, arguments).unit
 
     def read(
       arguments: Json.Obj,
@@ -447,11 +453,13 @@ object McpEvents:
 
   private def routing(name: McpEventName): Option[McpRoutingName] = McpRoutingName.parse(name.value).toOption
 
-  // `events/list`, `events/subscribe` and `events/unsubscribe` are bound for
-  // every revision so that ChatGPT can call them on a 2025 session; for any
-  // other client they answer only 2026-07-28 requests (see `revision`).
-  val listOperation: McpOperation[McpEventsListParams, McpEventsListResult] =
-    McpOperation.wire(Id, ListMethod, McpEventsWire.listParams, McpEventsWire.listResult)
+  val listOperation: McpOperation[McpEventsListParams, McpEventsListResult] = listOp(ProtocolSupport.Modern)
+
+  // Clients use the 2026-07-28 operations. The server binds `events/list`,
+  // `events/subscribe` and `events/unsubscribe` for every revision, so that
+  // ChatGPT can call them on a 2025 session; `revision` refuses everyone else there.
+  private def listOp(support: ProtocolSupport): McpOperation[McpEventsListParams, McpEventsListResult] =
+    McpOperation.wire(Id, ListMethod, McpEventsWire.listParams, McpEventsWire.listResult, protocolSupport = support)
 
   val pollOperation: McpOperation[McpEventsPollParams, McpEventsPollResult] =
     McpOperation.wire(Id, PollMethod, McpEventsWire.pollParams, McpEventsWire.pollResult,
@@ -464,14 +472,17 @@ object McpEvents:
       routingHeader = McpRoutingHeader.Required)
 
   val subscribeOperation: McpOperation[McpEventsSubscribeParams, McpEventsSubscribeResult] =
-    McpOperation.wire(Id, SubscribeMethod, McpEventsWire.subscribeParams, McpEventsWire.subscribeResult,
-      routingName = p => routing(p.name),
-      routingHeader = McpRoutingHeader.Required)
+    subscribeOp(ProtocolSupport.Modern)
 
-  val unsubscribeOperation: McpOperation[McpEventsUnsubscribeParams, Unit] =
+  private def subscribeOp(support: ProtocolSupport): McpOperation[McpEventsSubscribeParams, McpEventsSubscribeResult] =
+    McpOperation.wire(Id, SubscribeMethod, McpEventsWire.subscribeParams, McpEventsWire.subscribeResult,
+      protocolSupport = support, routingName = p => routing(p.name), routingHeader = McpRoutingHeader.Required)
+
+  val unsubscribeOperation: McpOperation[McpEventsUnsubscribeParams, Unit] = unsubscribeOp(ProtocolSupport.Modern)
+
+  private def unsubscribeOp(support: ProtocolSupport): McpOperation[McpEventsUnsubscribeParams, Unit] =
     McpOperation.wire(Id, UnsubscribeMethod, McpEventsWire.unsubscribeParams, McpEventsWire.unsubscribeResult,
-      routingName = p => routing(p.name),
-      routingHeader = McpRoutingHeader.Required)
+      protocolSupport = support, routingName = p => routing(p.name), routingHeader = McpRoutingHeader.Required)
 
   def apply[R](handlers: McpEventHandler[R]*): Either[McpEventsError, McpExtensions[R]] =
     withHeartbeat(DefaultHeartbeat)(handlers*)
@@ -489,9 +500,11 @@ object McpEvents:
    * [[McpWebhookStore]] layer; their deliveries run in this scope, and
    * subscriptions already in the store resume when it opens.
    *
-   * Only authenticated callers can subscribe: the subscription belongs to
-   * their principal. Event types' check functions keep running in the
-   * background for each subscription, with `R` as it is now.
+   * A subscription belongs to the caller's principal, so only authenticated
+   * callers can subscribe, unless `config.anonymous` allows anyone. Event
+   * types' check functions keep running in the background for each
+   * subscription, with `R` as it is now and the caller's principal without
+   * its token.
    *
    * A store shared by several server instances isn't coordinated: each delivers
    * the subscriptions it was asked for, and on start every one in the store.
@@ -535,19 +548,19 @@ object McpEvents:
 
   private def listBound(descriptors: Chunk[McpEventDescriptor], dialect: McpRequestContext => McpEventsDialect)
     : McpBoundOperation[Any] =
-    McpBoundOperation(listOperation): (_, ctx) =>
+    McpBoundOperation(listOp(ProtocolSupport.All)): (_, ctx) =>
       McpWebhookLog.fields(McpWebhookLog.caller(ctx, dialect(ctx))*)(
         revision(ctx, dialect) *>
           McpWebhookLog.fields("events" -> descriptors.map(d => s"${d.name.value}[${d.delivery.map(_.wire).mkString(",")}]").mkString(" "))(
             ZIO.logInfo("events/list")).as(McpEventsListResult(descriptors)))
 
   private def subscribeBound[R](runtime: McpWebhookRuntime[R]): McpBoundOperation[Any] =
-    McpBoundOperation(subscribeOperation): (params, ctx) =>
+    McpBoundOperation(subscribeOp(ProtocolSupport.All)): (params, ctx) =>
       revision(ctx, runtime.config.dialect) *>
         runtime.subscribe(params, ctx).mapError(e => methodError(e, runtime.config.dialect(ctx)))
 
   private def unsubscribeBound[R](runtime: McpWebhookRuntime[R]): McpBoundOperation[Any] =
-    McpBoundOperation(unsubscribeOperation): (params, ctx) =>
+    McpBoundOperation(unsubscribeOp(ProtocolSupport.All)): (params, ctx) =>
       revision(ctx, runtime.config.dialect) *>
         runtime.unsubscribe(params, ctx).mapError(e => methodError(e, runtime.config.dialect(ctx)))
 

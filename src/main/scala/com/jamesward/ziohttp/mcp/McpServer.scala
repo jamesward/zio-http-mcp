@@ -531,7 +531,7 @@ final class McpServer[-R] private (
             case Right(ProtocolEra.Legacy) =>
               method match
                 case "initialize" =>
-                  parseInitializeParams(id, params, principal, pathParams).flatMap(parsed => jsonRpcResponse(id, parsed.result))
+                  parseInitializeParams(id, params, principal, pathParams, request.rawHeader("user-agent")).flatMap(parsed => jsonRpcResponse(id, parsed.result))
                 case _ =>
                   McpDispatchMethod.parse(method) match
                     case Some(dm) =>
@@ -1225,7 +1225,7 @@ final class McpServer[-R] private (
       case Right(ProtocolEra.Legacy) =>
         method match
           case "initialize" =>
-            handleInitialize(state, id, params, principal, pathParams)
+            handleInitialize(state, id, params, principal, pathParams, request.rawHeader("user-agent"))
           case _ =>
             withSession(request, state): client =>
               val ctx = McpRequestContext(
@@ -1280,6 +1280,7 @@ final class McpServer[-R] private (
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
+    userAgent: Option[String],
   ): ZIO[R, Response, ParsedInitialize] =
     val paramsJson = params.getOrElse(Json.Obj()).toJson
     for
@@ -1303,6 +1304,7 @@ final class McpServer[-R] private (
               principal,
               pathParams,
               parsedExtensionCapabilities.invalid,
+              agent = userAgent,
             )
       // `clientInfo` (a required `initialize` param) is the MCP client's
       // self-reported identity — e.g. `kiro`/`0.x`. Prefer it over the HTTP
@@ -1351,8 +1353,9 @@ final class McpServer[-R] private (
     params: Option[Json.Obj],
     principal: Option[Principal],
     pathParams: Map[String, String],
+    userAgent: Option[String],
   ): ZIO[R, Response, Response] =
-    parseInitializeParams(id, params, principal, pathParams).flatMap: parsed =>
+    parseInitializeParams(id, params, principal, pathParams, userAgent).flatMap: parsed =>
       val sessionId = SessionId.generate
       state.sessions.update(_.updated(sessionId, SessionState.Initializing)) *>
         state.retainSessionClient(sessionId, parsed.client) *>

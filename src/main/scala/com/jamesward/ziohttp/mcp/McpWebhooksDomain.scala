@@ -202,7 +202,9 @@ object McpWebhookStoreError:
  * Provide one as a layer to [[McpEvents.withWebhooks]].
  *
  * Returning an expired subscription or verification is fine: the server checks
- * `refreshBefore` and `until`, and deletes expired subscriptions.
+ * `refreshBefore` and `until`, and deletes expired subscriptions (those without
+ * a worker every `McpWebhookConfig.storeSweep`). It never deletes a
+ * verification: a store may drop one once its `until` has passed.
  */
 trait McpWebhookStore:
   /**
