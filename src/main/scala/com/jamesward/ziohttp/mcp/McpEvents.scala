@@ -524,8 +524,10 @@ object McpEvents:
 
   /** Refuse a legacy (2025) request, as an unknown method, unless it is from a client of ChatGPT's dialect. */
   private def revision(ctx: McpRequestContext, dialect: McpRequestContext => McpEventsDialect): IO[McpMethodError, Unit] =
-    ZIO.fail(McpMethodError.UnsupportedProtocol(ctx.protocolVersion))
-      .unless(ctx.protocolVersion.isStateless || dialect(ctx) == McpEventsDialect.ChatGpt).unit
+    McpWebhookLog.fields(McpWebhookLog.caller(ctx, dialect(ctx))*)(
+      ZIO.logInfo("Events method refused on a 2025 session: only ChatGPT's dialect has it there") *>
+        ZIO.fail(McpMethodError.UnsupportedProtocol(ctx.protocolVersion))
+    ).unless(ctx.protocolVersion.isStateless || dialect(ctx) == McpEventsDialect.ChatGpt).unit
 
   /** The occurrences of a read, then its end position. */
   private[mcp] def delivered(read: McpEventRead): Chunk[McpEventPush] =
@@ -534,7 +536,10 @@ object McpEvents:
   private def listBound(descriptors: Chunk[McpEventDescriptor], dialect: McpRequestContext => McpEventsDialect)
     : McpBoundOperation[Any] =
     McpBoundOperation(listOperation): (_, ctx) =>
-      revision(ctx, dialect).as(McpEventsListResult(descriptors))
+      McpWebhookLog.fields(McpWebhookLog.caller(ctx, dialect(ctx))*)(
+        revision(ctx, dialect) *>
+          McpWebhookLog.fields("events" -> descriptors.map(d => s"${d.name.value}[${d.delivery.map(_.wire).mkString(",")}]").mkString(" "))(
+            ZIO.logInfo("events/list")).as(McpEventsListResult(descriptors)))
 
   private def subscribeBound[R](runtime: McpWebhookRuntime[R]): McpBoundOperation[Any] =
     McpBoundOperation(subscribeOperation): (params, ctx) =>

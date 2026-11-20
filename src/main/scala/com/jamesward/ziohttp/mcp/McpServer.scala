@@ -650,13 +650,21 @@ final class McpServer[-R] private (
     ctx: McpRequestContext,
     httpBinding: Boolean,
   ): ZIO[R, Response, Response] =
+    val annotations = Set(
+      LogAnnotation("method", rawMethod),
+      LogAnnotation("protocol", version.wire),
+      LogAnnotation("client", ctx.clientInfo.fold("-")(i => s"${i.name}/${i.version}")),
+      LogAnnotation("user_agent", ctx.userAgent.getOrElse("-")),
+    )
     McpMethodName.parse(rawMethod).toOption.flatMap(extensions.operation) match
       case None =>
-        ZIO.fail(methodNotFoundResponse(id, version, rawMethod))
+        ZIO.logAnnotate(annotations)(ZIO.logWarning("MCP method not found")) *>
+          ZIO.fail(methodNotFoundResponse(id, version, rawMethod))
       case Some(bound) =>
         val operation = bound.operation
         if !operation.protocolSupport.supports(version) then
-          ZIO.fail(methodNotFoundResponse(id, version, rawMethod))
+          ZIO.logAnnotate(annotations)(ZIO.logWarning("MCP method not available in this protocol revision")) *>
+            ZIO.fail(methodNotFoundResponse(id, version, rawMethod))
         else
           val requireSupport = operation.clientSupport match
             case ClientSupportPolicy.Optional => ZIO.unit
@@ -679,6 +687,8 @@ final class McpServer[-R] private (
               resolveServerInfo(ctx).map(ModernEnvelope.completeServerOwned(result, _, operation.cachePolicy))
             else ZIO.succeed(result)
           (requireSupport *> validateRouting *> bound.invoke(rawParams, ctx))
+            .tapError(error => ZIO.logAnnotate(annotations + LogAnnotation("error", error.toString))(
+              ZIO.logWarning("MCP extension request failed")))
             .foldZIO(
               error => ZIO.fail(extensionErrorResponse(id, version, error)),
               {

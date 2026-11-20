@@ -126,6 +126,7 @@ private[mcp] object McpWebhookSignature:
 private[mcp] final case class McpWebhookSender(client: Client, timeout: Duration):
   import McpWebhookSender.Outcome
 
+  /** POST `body`, and log what happened: the endpoint's status, or why there was none. */
   def post(url: McpWebhookUrl, id: McpWebhookSubscriptionId, secrets: NonEmptyChunk[McpWebhookSecret],
     messageId: String, body: Array[Byte]): UIO[Outcome] =
     for
@@ -139,38 +140,64 @@ private[mcp] final case class McpWebhookSender(client: Client, timeout: Duration
                    Header.Custom("webhook-signature", McpWebhookSignature.sign(secrets, messageId, ts, body)),
                    Header.Custom(McpWebhookSender.SubscriptionIdHeader, id.value),
                  ))
-      outcome <- ZIO.scoped(ZClient.streaming(request).mapError(McpWebhookSender.failureOf).flatMap(answer).provideSomeLayer[Scope](ZLayer.succeed(client)))
-                   .timeoutFail(McpWebhookFailure.Timeout)(timeout)
-                   .catchAll(failure => ZIO.succeed(Outcome.Failed(failure)))
+      started <- Clock.nanoTime
+      outcome <- ZIO.scoped(ZClient.streaming(request).mapError(e => McpWebhookSender.failed(e)).flatMap(answer)
+                     .provideSomeLayer[Scope](ZLayer.succeed(client)))
+                   .timeoutFail(Outcome.Failed(McpWebhookFailure.Timeout, None, Some(s"no answer within ${timeout.render}")))(timeout)
+                   .merge
+      ended   <- Clock.nanoTime
+      _       <- McpWebhookLog.fields(
+                   "webhook_id" -> messageId, "subscription_id" -> id.value, "url" -> url.value,
+                   "bytes" -> body.length.toString, "signatures" -> secrets.size.toString,
+                   "duration_ms" -> ((ended - started) / 1000000).toString,
+                 )(outcome match
+                   case Outcome.Accepted(status, answer) =>
+                     McpWebhookLog.fields("status" -> status.toString, "answer_bytes" -> answer.length.toString)(
+                       ZIO.logInfo("Webhook POST accepted"))
+                   case Outcome.Refused(status) =>
+                     McpWebhookLog.fields("status" -> status.toString)(ZIO.logInfo("Webhook POST refused, not to be retried"))
+                   case Outcome.Failed(failure, status, detail) =>
+                     McpWebhookLog.fields("failure" -> failure.wire, "status" -> status.fold("-")(_.toString),
+                       "detail" -> detail.getOrElse("-"))(ZIO.logWarning("Webhook POST failed")))
     yield outcome
 
-  private def answer(response: Response): ZIO[Any, McpWebhookFailure, Outcome] =
+  private def answer(response: Response): ZIO[Any, Outcome, Outcome] =
     val status = response.status.code
     if response.status.isSuccess then
       response.body.asStream.take(McpWebhookSender.MaxAnswer).runCollect
-        .mapBoth(McpWebhookSender.failureOf, bytes => Outcome.Accepted(String(bytes.toArray, UTF_8)))
+        .mapBoth(McpWebhookSender.failed(_, Some(status)), bytes => Outcome.Accepted(status, String(bytes.toArray, UTF_8)))
     else if status == 410 || status == 413 then ZIO.succeed(Outcome.Refused(status))
-    else if status >= 500 then ZIO.succeed(Outcome.Failed(McpWebhookFailure.Http5xx))
-    else ZIO.succeed(Outcome.Failed(McpWebhookFailure.Http4xx))
-  .catchAllDefect(e => ZIO.fail(McpWebhookSender.failureOf(e)))
+    else if status >= 500 then ZIO.succeed(Outcome.Failed(McpWebhookFailure.Http5xx, Some(status), None))
+    else ZIO.succeed(Outcome.Failed(McpWebhookFailure.Http4xx, Some(status), None))
+  .catchAllDefect(e => ZIO.fail(McpWebhookSender.failed(e)))
 
 private[mcp] object McpWebhookSender:
   val SubscriptionIdHeader: String = "X-MCP-Subscription-Id"
   /** How much of an endpoint's answer is read: enough for a verification echo. */
   val MaxAnswer: Int = 4096
 
+  /** How a POST went. `detail` is for the server's logs only: SEP-3415 keeps it from the client. */
   enum Outcome:
-    case Accepted(body: String)
+    case Accepted(status: Int, body: String)
     /** `410` or `413`: the endpoint doesn't want this one again. */
     case Refused(status: Int)
-    case Failed(failure: McpWebhookFailure)
+    case Failed(failure: McpWebhookFailure, status: Option[Int], detail: Option[String])
+
+  def failed(error: Throwable, status: Option[Int] = None): Outcome =
+    Outcome.Failed(failureOf(error), status, Some(s"${error.getClass.getSimpleName}: ${error.getMessage}"))
 
   def make(config: McpWebhookConfig): ZIO[Scope, Throwable, McpWebhookSender] =
     val dns: DnsResolver = new DnsResolver:
       def resolve(host: String)(implicit trace: Trace): ZIO[Any, UnknownHostException, Chunk[InetAddress]] =
         ZIO.attemptBlocking(Chunk.fromArray(InetAddress.getAllByName(host)))
           .refineOrDie { case e: UnknownHostException => e }
-          .map(_.filter(config.targets.allowAddress))
+          .flatMap: all =>
+            val (allowed, refused) = all.partition(config.targets.allowAddress)
+            val addresses = (as: Chunk[InetAddress]) => as.map(_.getHostAddress).mkString(",")
+            McpWebhookLog.fields("host" -> host, "allowed" -> addresses(allowed), "refused" -> addresses(refused))(
+              if refused.isEmpty then ZIO.logDebug("Webhook host resolved")
+              else ZIO.logWarning("Webhook host resolves to addresses webhooks may not reach"))
+              .as(allowed)
           .filterOrFail(_.nonEmpty)(UnknownHostException(s"$host has no address webhooks may be delivered to"))
     val layer = (ZLayer.succeed(ZClient.Config.default.idleTimeout(30.seconds)) ++
       ZLayer.succeed(NettyConfig.defaultWithFastShutdown) ++ ZLayer.succeed(dns)) >>> ZClient.live
@@ -203,6 +230,34 @@ private[mcp] final case class McpWebhookRuntime[R](
   import McpWebhookSender.Outcome
 
   def subscribe(params: McpEventsSubscribeParams, ctx: McpRequestContext): IO[McpEventError, McpEventsSubscribeResult] =
+    val dialect = config.dialect(ctx)
+    McpWebhookLog.fields(McpWebhookLog.caller(ctx, dialect)*)(McpWebhookLog.fields(
+      "event" -> params.name.value, "url" -> params.url.value, "arguments" -> params.arguments.toJson,
+      "cursor_in" -> params.cursor.fold("null")(_.value), "max_age_ms" -> params.maxAgeMs.fold("-")(_.toString),
+      "ttl_requested" -> (params.ttl match
+        case McpWebhookTtl.ServerDefault  => "default"
+        case McpWebhookTtl.NoExpiry       => "none"
+        case McpWebhookTtl.Suggested(ttl) => ttl.toMillis.toString),
+    )(
+      for
+        started <- Clock.nanoTime
+        _       <- ZIO.logInfo("events/subscribe")
+        result  <- subscribing(params, ctx).tapError(e =>
+                     McpWebhookLog.fields("code" -> e.detail(dialect).code.toString, "error" -> e.detail.message,
+                       "error_data" -> e.detail.data.fold("-")(_.toJson))(ZIO.logWarning("events/subscribe refused")))
+        ended   <- Clock.nanoTime
+        _       <- McpWebhookLog.fields(
+                     "subscription_id" -> result.id.value,
+                     "refresh_before" -> result.refreshBefore.fold("never")(_.toString),
+                     "cursor_out" -> result.cursor.fold("null")(_.value),
+                     "truncated" -> result.truncated.toString,
+                     "refreshed" -> result.deliveryStatus.isDefined.toString,
+                     "duration_ms" -> ((ended - started) / 1000000).toString,
+                   )(ZIO.logInfo("events/subscribe granted"))
+      yield result
+    ))
+
+  private def subscribing(params: McpEventsSubscribeParams, ctx: McpRequestContext): IO[McpEventError, McpEventsSubscribeResult] =
     for
       (principal, owner) <- caller(ctx)
       _                  <- ZIO.fail(McpEventError.InvalidParams("Invalid 'delivery.url': expected an https URL"))
@@ -219,19 +274,26 @@ private[mcp] final case class McpWebhookRuntime[R](
     yield result
 
   def unsubscribe(params: McpEventsUnsubscribeParams, ctx: McpRequestContext): IO[McpEventError, Unit] =
-    for
-      (_, owner) <- caller(ctx)
-      id          = McpWebhookKey(owner, params.url, params.name, params.arguments).id
-      removed    <- workers.modify(m => (m.get(id), m - id))
-      stored     <- store.get(id).storeFailure("events/unsubscribe", id)
-      _          <- ZIO.fail(McpEventError.SubscriptionNotFound).when(removed.isEmpty && stored.isEmpty)
-      _          <- ZIO.foreachDiscard(removed)(_.fiber.interrupt)
-      _          <- store.delete(id).storeFailure("events/unsubscribe", id)
-    yield ()
+    McpWebhookLog.fields(McpWebhookLog.caller(ctx, config.dialect(ctx))*)(McpWebhookLog.fields(
+      "event" -> params.name.value, "url" -> params.url.value, "arguments" -> params.arguments.toJson)(
+      for
+        (_, owner) <- caller(ctx)
+        id          = McpWebhookKey(owner, params.url, params.name, params.arguments).id
+        removed    <- workers.modify(m => (m.get(id), m - id))
+        stored     <- store.get(id).storeFailure("events/unsubscribe", id)
+        _          <- McpWebhookLog.fields("subscription_id" -> id.value, "running" -> removed.isDefined.toString,
+                        "stored" -> stored.isDefined.toString)(ZIO.logInfo("events/unsubscribe"))
+        _          <- ZIO.fail(McpEventError.SubscriptionNotFound).when(removed.isEmpty && stored.isEmpty)
+        _          <- ZIO.foreachDiscard(removed)(_.fiber.interrupt)
+        _          <- store.delete(id).storeFailure("events/unsubscribe", id)
+      yield ()
+    ).tapError(e => McpWebhookLog.fields("error" -> e.detail.message)(ZIO.logWarning("events/unsubscribe refused"))))
 
   /** Deliver to every subscription in the store, as after a restart. */
   def resume: UIO[Unit] =
-    store.all.flatMap(ZIO.foreachDiscard(_)(resumeOne))
+    store.all.tap(all => McpWebhookLog.fields("subscriptions" -> all.size.toString, "durable" -> store.durable.toString)(
+      ZIO.logInfo("Resuming webhook subscriptions from the store")))
+      .flatMap(ZIO.foreachDiscard(_)(resumeOne))
       .catchAllCause(c => ZIO.logErrorCause("Webhook subscriptions could not be read from the store", c))
 
   /** End subscriptions whose expiry passed, every `config.expiryCheck`. */
@@ -241,7 +303,7 @@ private[mcp] final case class McpWebhookRuntime[R](
       current <- workers.get
       expired <- ZIO.filter(current.toList)((_, w) => w.state.get.map(_.subscription.isExpired(now)))
       _       <- ZIO.foreachDiscard(expired)((id, w) => end(id, Some(w.token)) *> w.fiber.interrupt *>
-                   ZIO.logInfo(s"Webhook subscription $id expired"))
+                   McpWebhookLog.fields("subscription_id" -> id.value)(ZIO.logInfo("Webhook subscription expired")))
     yield ()).repeat(Schedule.spaced(config.expiryCheck)).unit
 
   private def offersWebhook(handler: McpEventHandler[R]): Boolean = McpWebhookRuntime.offersWebhook(handler.descriptor)
@@ -260,6 +322,8 @@ private[mcp] final case class McpWebhookRuntime[R](
     for
       current <- worker.state.get.map(_.subscription.secret)
       // Anyone can refresh an anonymous subscription: its endpoint has to accept a new secret first.
+      _       <- McpWebhookLog.fields("subscription_id" -> key.id.value, "new_secret" -> (current != secret).toString,
+                   "dialect" -> dialect.toString)(ZIO.logInfo("Refreshing a live webhook subscription"))
       _       <- handshake(key, secret).when(key.principal.isAnonymous && current != secret)
       now     <- Clock.instant
       updated <- worker.state.updateAndGet: s =>
@@ -303,6 +367,9 @@ private[mcp] final case class McpWebhookRuntime[R](
       cached <- store.verification(key.principal, key.url).storeFailure("events/subscribe", key.id)
       // The cache is per principal: one anonymous caller's verification can't vouch for another's.
       known   = config.preVerified(key.url) || (!key.principal.isAnonymous && cached.exists(_.isValid(now)))
+      _      <- McpWebhookLog.fields("subscription_id" -> key.id.value, "pre_verified" -> config.preVerified(key.url).toString,
+                  "cached_until" -> cached.fold("-")(_.until.fold("never")(_.toString)))(
+                  ZIO.logInfo("Webhook endpoint already verified")).when(known)
       _      <- (handshake(key, secret) *>
                   store.putVerification(McpWebhookVerification(key.principal, key.url,
                     refreshBefore.map(r => if r.isAfter(now.plus(config.verificationTtl)) then r else now.plus(config.verificationTtl))))
@@ -314,18 +381,29 @@ private[mcp] final case class McpWebhookRuntime[R](
       challenge <- randomToken(32)
       messageId <- randomToken(18).map(r => s"msg_verification_$r")
       body       = McpEventsWire.webhookVerification(challenge).toJson.getBytes(UTF_8)
-      outcome   <- sender.post(key.url, key.id, NonEmptyChunk(secret), messageId, body)
+      _         <- McpWebhookLog.fields("subscription_id" -> key.id.value, "webhook_id" -> messageId, "url" -> key.url.value)(
+                     ZIO.logInfo("Verifying webhook endpoint"))
+      outcome   <- McpWebhookLog.fields("kind" -> "verification")(sender.post(key.url, key.id, NonEmptyChunk(secret), messageId, body))
       _         <- verified(outcome, challenge)
                    .mapError(McpEventError.CallbackEndpoint(_))
-                   .tapError(e => ZIO.logWarning(s"Webhook endpoint verification failed for ${key.id}: $e"))
+                   .tapBoth(
+                     e => McpWebhookLog.fields("subscription_id" -> key.id.value, "error" -> e.toString,
+                       "answer" -> answerPreview(outcome))(ZIO.logWarning("Webhook endpoint verification failed")),
+                     _ => McpWebhookLog.fields("subscription_id" -> key.id.value)(ZIO.logInfo("Webhook endpoint verified")),
+                   )
     yield ()
+
+  /** The start of what an endpoint answered, for the logs: why a challenge didn't match. */
+  private def answerPreview(outcome: Outcome): String = outcome match
+    case Outcome.Accepted(_, answer) => answer.take(300)
+    case _                           => "-"
 
   private def verified(outcome: Outcome, challenge: String): IO[McpWebhookFailure, Unit] =
     outcome match
-      case Outcome.Accepted(answer) if echoes(answer, challenge) => ZIO.unit
-      case Outcome.Accepted(_)  => ZIO.fail(McpWebhookFailure.ChallengeFailed)
-      case Outcome.Refused(_)   => ZIO.fail(McpWebhookFailure.Http4xx)
-      case Outcome.Failed(f)    => ZIO.fail(f)
+      case Outcome.Accepted(_, answer) if echoes(answer, challenge) => ZIO.unit
+      case Outcome.Accepted(_, _)     => ZIO.fail(McpWebhookFailure.ChallengeFailed)
+      case Outcome.Refused(_)         => ZIO.fail(McpWebhookFailure.Http4xx)
+      case Outcome.Failed(f, _, _)    => ZIO.fail(f)
 
   private def echoes(answer: String, challenge: String): Boolean =
     answer.fromJson[Json.Obj].toOption.flatMap(_.get("challenge")).flatMap(_.asString)
@@ -340,6 +418,9 @@ private[mcp] final case class McpWebhookRuntime[R](
             store.delete(sub.id).ignoreLogged
         case Some(handler) =>
           val ctx = McpRequestContext(ProtocolVersion.V2026_07_28, callerPrincipal = sub.principal)
+          McpWebhookLog.fields("subscription_id" -> sub.id.value, "event" -> sub.key.name.value, "url" -> sub.key.url.value,
+            "cursor" -> sub.cursor.fold("null")(_.value), "dialect" -> sub.dialect.toString,
+            "refresh_before" -> sub.refreshBefore.fold("never")(_.toString))(ZIO.logInfo("Resuming webhook subscription")) *>
           handler.push(sub.key.arguments, sub.cursor, None, ctx).provideEnvironment(env).foldZIO(
             error => ZIO.logWarning(s"Webhook subscription ${sub.id} can't resume: ${error.detail.message}") *>
               terminate(sub, error.detail),
@@ -357,10 +438,16 @@ private[mcp] final case class McpWebhookRuntime[R](
             token <- Random.nextUUID
             state <- Ref.make(WorkerState(sub, sub.cursor, McpWebhookDeliveryStatus.initial))
             first <- Promise.make[Nothing, (Option[McpEventCursor], Boolean)]
-            fiber <- deliver(state, first, pushes, resumed)
-                       .provideEnvironment(env)
-                       .ensuring(first.succeed((sub.cursor, false)) *> forget(sub.id, token))
-                       .forkIn(scope)
+            // The worker outlives the request: it logs with its subscription's fields, not the request's.
+            fiber <- FiberRef.currentLogAnnotations.locally(Map(
+                       "subscription_id" -> sub.id.value, "event" -> sub.key.name.value,
+                       "url" -> sub.key.url.value, "dialect" -> sub.dialect.toString,
+                     ))(
+                       (ZIO.logInfo("Webhook delivery started") *> deliver(state, first, pushes, resumed))
+                         .provideEnvironment(env)
+                         .onExit(exit => ZIO.logInfo(s"Webhook delivery stopped: ${if exit.isInterrupted then "ended" else "finished"}"))
+                         .ensuring(first.succeed((sub.cursor, false)) *> forget(sub.id, token))
+                         .forkIn(scope))
           yield (Right(first), current.updated(sub.id, Worker(token, fiber, state)))
 
   private def deliver(
@@ -374,14 +461,21 @@ private[mcp] final case class McpWebhookRuntime[R](
       case McpEventPush.Signal(McpEventSignal.Active(cursor, truncated)) =>
         first.succeed((cursor, truncated)).flatMap: initial =>
           val gap = !initial || (resumed && truncated)
+          McpWebhookLog.fields("cursor" -> cursor.fold("null")(_.value), "truncated" -> truncated.toString,
+            "gap" -> gap.toString)(ZIO.logInfo("Webhook subscription active")) *>
           (send(state, "gap", McpEventsWire.webhookGap(cursor)).when(gap) *> advance(state, cursor)).as(true)
       case McpEventPush.Signal(McpEventSignal.Event(occurrence)) =>
-        (send(state, "event", McpEventsWire.webhookEvent(occurrence), Some(occurrence.eventId)) *>
-          advance(state, occurrence.cursor)).as(true)
+        McpWebhookLog.fields("event_id" -> occurrence.eventId, "event_time" -> occurrence.timestamp.toString,
+          "cursor" -> occurrence.cursor.fold("null")(_.value))(
+          ZIO.logInfo("Webhook event to deliver") *>
+            send(state, "event", McpEventsWire.webhookEvent(occurrence), Some(occurrence.eventId))) *>
+          advance(state, occurrence.cursor).as(true)
       case McpEventPush.Signal(McpEventSignal.Error(error)) =>
         state.get.flatMap(s => ZIO.logWarning(s"Webhook subscription ${s.subscription.id}: ${error.message}")).as(true)
       case McpEventPush.Signal(McpEventSignal.Terminated(error)) =>
-        state.get.flatMap(s => terminate(s.subscription, error)).as(false)
+        McpWebhookLog.fields("code" -> error.code.toString, "error" -> error.message)(
+          ZIO.logInfo("Webhook subscription terminated by its event type")) *>
+          state.get.flatMap(s => terminate(s.subscription, error)).as(false)
       case McpEventPush.Signal(McpEventSignal.Heartbeat(_)) => ZIO.succeed(true)
 
   /** Tell the endpoint the subscription ended, and forget it. */
@@ -394,6 +488,7 @@ private[mcp] final case class McpWebhookRuntime[R](
 
   private def advance(state: Ref[WorkerState], cursor: Option[McpEventCursor]): UIO[Unit] =
     state.modify(s => (s.watermark != cursor, s.copy(watermark = cursor))).flatMap: moved =>
+      McpWebhookLog.fields("cursor" -> cursor.fold("null")(_.value))(ZIO.logDebug("Webhook watermark advanced")).when(moved) *>
       state.get.flatMap(s => store.update(s.subscription.id)(_.copy(cursor = cursor)).unit
         .catchAll(e => ZIO.logWarning(s"Webhook subscription ${s.subscription.id}: cursor not stored: ${e.message}")))
         .when(moved && store.durable).unit
@@ -401,36 +496,42 @@ private[mcp] final case class McpWebhookRuntime[R](
   /** POST one message, retrying it after each of `config.retryDelays` until the endpoint takes it. */
   private def send(state: Ref[WorkerState], kind: String, body: Json.Obj, eventId: Option[String] = None): UIO[Unit] =
     val bytes = body.toJson.getBytes(UTF_8)
-    def attempt(messageId: String, delays: List[Duration]): UIO[Unit] =
+    def attempt(messageId: String, number: Int, delays: List[Duration]): UIO[Unit] =
       for
         s       <- state.get
         now     <- Clock.instant
         sub      = s.subscription
-        outcome <- sender.post(sub.key.url, sub.id, sub.signingSecrets(now), messageId, bytes)
+        outcome <- McpWebhookLog.fields("kind" -> kind, "attempt" -> number.toString)(
+                     sender.post(sub.key.url, sub.id, sub.signingSecrets(now), messageId, bytes))
         done    <- Clock.instant
         _       <- outcome match
-                     case Outcome.Accepted(_) =>
+                     case Outcome.Accepted(_, _) =>
                        state.update(s => s.copy(status = s.status.copy(lastDeliveryAt = Some(done), lastError = None, failedSince = None)))
-                     case Outcome.Refused(status) =>
-                       ZIO.logInfo(s"Webhook endpoint of ${sub.id} refused $messageId with HTTP $status: not retried")
-                     case Outcome.Failed(failure) =>
+                     case Outcome.Refused(_) => ZIO.unit
+                     case Outcome.Failed(failure, _, _) =>
                        state.update(s => s.copy(status = s.status.copy(lastError = Some(failure),
                          failedSince = s.status.failedSince.orElse(Some(done))))) *>
                          (delays match
-                           case delay :: rest => attempt(messageId, rest).delay(delay)
-                           case Nil => ZIO.logWarning(s"Webhook delivery $messageId to ${sub.id} given up: ${failure.wire}"))
+                           case delay :: rest =>
+                             McpWebhookLog.fields("webhook_id" -> messageId, "kind" -> kind, "retry_in_ms" -> delay.toMillis.toString,
+                               "attempt" -> (number + 1).toString)(ZIO.logInfo("Webhook delivery will be retried")) *>
+                               attempt(messageId, number + 1, rest).delay(delay)
+                           case Nil =>
+                             McpWebhookLog.fields("webhook_id" -> messageId, "kind" -> kind, "attempts" -> number.toString,
+                               "failure" -> failure.wire)(ZIO.logWarning("Webhook delivery given up")))
       yield ()
     state.get.map(_.subscription).flatMap: sub =>
       val chatGpt = sub.dialect == McpEventsDialect.ChatGpt
       if bytes.length > MaxBody then
-        ZIO.logWarning(s"Webhook $kind for ${sub.id} is over $MaxBody bytes: not sent")
+        McpWebhookLog.fields("kind" -> kind, "bytes" -> bytes.length.toString)(
+          ZIO.logWarning(s"Webhook message over $MaxBody bytes: not sent"))
       else if chatGpt && kind != "event" then
-        ZIO.logInfo(s"Webhook $kind for ${sub.id} not sent: ChatGPT doesn't take $kind envelopes")
+        McpWebhookLog.fields("kind" -> kind)(ZIO.logInfo("Webhook envelope not sent: ChatGPT doesn't take it"))
       else
         // ChatGPT wants the event's own id as the webhook-id; SEP-3415 a fresh one.
         val own = eventId.filter(id => chatGpt && HeaderSafe.matches(id))
         randomToken(18).flatMap: r =>
-          attempt(own.getOrElse(if kind == "event" then s"msg_$r" else s"msg_${kind}_$r"), config.retryDelays.toList)
+          attempt(own.getOrElse(if kind == "event" then s"msg_$r" else s"msg_${kind}_$r"), 1, config.retryDelays.toList)
 
   /** Delete the subscription; and forget its worker, if it is still `token`'s. */
   private def end(id: McpWebhookSubscriptionId, token: Option[UUID]): UIO[Unit] =
@@ -479,3 +580,19 @@ private[mcp] object McpWebhookRuntime:
 
   private def randomToken(bytes: Int): UIO[String] =
     Random.nextBytes(bytes).map(b => Base64.getUrlEncoder.withoutPadding.encodeToString(b.toArray))
+
+/** Structured logging for events and webhooks: each field is a top-level log annotation. */
+private[mcp] object McpWebhookLog:
+  def fields[R, E, A](entries: (String, String)*)(zio: ZIO[R, E, A]): ZIO[R, E, A] =
+    ZIO.logAnnotate(entries.map((k, v) => LogAnnotation(k, v)).toSet)(zio)
+
+  /** Who is calling, as the dialect is chosen from it. */
+  def caller(ctx: McpRequestContext, dialect: McpEventsDialect): Seq[(String, String)] =
+    Seq(
+      "protocol"        -> ctx.protocolVersion.wire,
+      "client"          -> ctx.clientInfo.fold("-")(i => s"${i.name}/${i.version}"),
+      "user_agent"      -> ctx.userAgent.getOrElse("-"),
+      "principal"       -> ctx.principal.flatMap(McpWebhookPrincipalId.of).fold("anonymous")(_.value),
+      "declares_events" -> ctx.extensionCapabilities.contains(McpEvents.Id).toString,
+      "dialect"         -> dialect.toString,
+    )
