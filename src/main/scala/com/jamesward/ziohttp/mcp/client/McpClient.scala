@@ -365,7 +365,7 @@ object McpClient:
 
   /** Encode a `Schema`-typed argument value into a JSON object for `tools/call`. */
   private def encodeArgs[A](a: A)(using schema: Schema[A]): IO[McpClientError, Json.Obj] =
-    val encoded = SchemaJsonCodec.jsonEncoder(schema).encodeJson(a, None).toString
+    val encoded = McpJson.encoder(schema).encodeJson(a, None).toString
     ZIO.fromEither(encoded.fromJson[Json.Obj])
       .mapError(e => McpClientError.Decode(s"Tool arguments did not encode to a JSON object: $e"))
 
