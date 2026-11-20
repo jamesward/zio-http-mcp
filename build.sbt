@@ -25,6 +25,8 @@ libraryDependencies ++= Seq(
   "dev.zio" %% "zio-schema-json"       % "1.9.2",
   // Subprocesses for the stdio client transport.
   "dev.zio" %% "zio-process"           % "0.8.1",
+  // Circuit breaker (suspending a failing webhook endpoint) and bulkhead (bounding outbound POSTs).
+  "nl.vroste" %% "rezilience"          % "0.10.6",
 
   "com.guizmaii" %% "scala-nimbus-jose-jwt-zio" % "4.2.1",
 

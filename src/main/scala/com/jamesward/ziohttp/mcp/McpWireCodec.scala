@@ -24,7 +24,7 @@ object McpWireCodec:
 
   def schema[A](schema: Schema[A]): McpWireCodec[A] =
     val decoder = SchemaJsonCodec.jsonDecoder(schema)
-    val encoder = SchemaJsonCodec.jsonEncoder(schema)
+    val encoder = McpJson.encoder(schema)
     McpWireCodec(
       json => decoder.decodeJson(json.toJson),
       value => encoder.encodeJson(value, None).toString.fromJson[Json],
@@ -42,3 +42,14 @@ object McpWireCodec:
   ) extends McpWireCodec[A]:
     def decode(json: Json): Either[String, A] = decodeValue(json)
     def encode(value: A): Either[String, Json] = encodeValue(value)
+
+/** JSON encoding of values that go on the wire as objects a JSON Schema describes. */
+private[mcp] object McpJson:
+  /**
+   * Encode with `schema`, leaving a `None` field out instead of writing `null`.
+   * The JSON Schema generated for an `Option` field (see [[JsonSchemaGen]]) is
+   * its inner type, left out of `required`: a validator accepts a missing field
+   * but rejects `null` (Claude Code reports "must be integer").
+   */
+  def encoder[A](schema: Schema[A]): JsonEncoder[A] =
+    SchemaJsonCodec.jsonEncoder(SchemaJsonCodec.Configuration(explicitNulls = SchemaJsonCodec.ExplicitConfig(encoding = false)))(schema)

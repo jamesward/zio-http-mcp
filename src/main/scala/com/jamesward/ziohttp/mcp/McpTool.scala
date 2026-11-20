@@ -64,11 +64,7 @@ object McpOutput:
         "required"   -> Json.Arr(Json.Str(WrapperKey)),
       )))
 
-    // Omit a `None` field instead of writing `null`: the output schema lists an `Option` field as its inner type and
-    // leaves it out of `required`, so a client that validates `structuredContent` against it (Claude Code does)
-    // accepts a missing field but rejects `null` ("must be integer").
-    private val encoder =
-      SchemaJsonCodec.jsonEncoder(SchemaJsonCodec.Configuration(explicitNulls = SchemaJsonCodec.ExplicitConfig(encoding = false)))(schema)
+    private val encoder = McpJson.encoder(schema)
 
     def toResult(output: A): CallToolResult =
       val encoded = encoder.encodeJson(output, None).toString.fromJson[Json].getOrElse(Json.Null)

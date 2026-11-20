@@ -4,7 +4,6 @@ import zio.*
 import zio.json.*
 import zio.json.ast.Json
 import zio.schema.Schema
-import zio.schema.codec.JsonCodec as SchemaJsonCodec
 import zio.stream.ZStream
 
 import java.time.Instant
@@ -91,6 +90,8 @@ trait McpEventHandler[-R]:
     maxEvents: Int,
     ctx: McpRequestContext,
   ): ZIO[R, McpEventError, McpEventRead]
+  /** Whether `arguments` decode as the event type's input, without reading anything. */
+  private[mcp] def validate(arguments: Json.Obj): IO[McpEventError, Unit]
   /** Validate the subscription and read from its cursor; the stream starts with `active`. */
   private[mcp] def push(
     arguments: Json.Obj,
@@ -180,7 +181,7 @@ object McpEvent:
   private final case class Payload[A](schemaOf: Schema[A]):
     private val valueSchema = JsonSchemaGen.fromSchema(schemaOf)
     private val isObject = valueSchema.get("type").flatMap(_.asString).contains("object")
-    private val encoder = SchemaJsonCodec.jsonEncoder(schemaOf)
+    private val encoder = McpJson.encoder(schemaOf)
 
     val schema: Json.Obj =
       if isObject then valueSchema
@@ -203,6 +204,8 @@ object McpEvent:
     checkInterval: Duration,
     checkFn: McpEventRequest[In] => ZIO[R, McpEventError, McpEventBatch[Out]],
   ) extends McpEventHandler[R]:
+
+    def validate(arguments: Json.Obj): IO[McpEventError, Unit] = decode(input, arguments).unit
 
     def read(
       arguments: Json.Obj,
@@ -267,6 +270,8 @@ object McpEvent:
     buffer: McpEventBuffer[Out],
     deliver: (In, Out, McpRequestContext) => Option[Out],
   ) extends McpEventHandler[Any]:
+
+    def validate(arguments: Json.Obj): IO[McpEventError, Unit] = decode(input, arguments).unit
 
     def read(
       arguments: Json.Obj,
@@ -421,21 +426,25 @@ object McpEventBuffer:
 
 enum McpEventsError:
   case DuplicateEventName(name: McpEventName)
+  /** The HTTP client for webhook deliveries could not be built. */
+  case WebhookSetup(message: String)
 
 object McpEventsError:
   given CanEqual[McpEventsError, McpEventsError] = CanEqual.derived
 
 /**
- * The Events extension (`io.modelcontextprotocol/events`, SEP-3415, a draft:
- * experimental, and subject to change with it). It serves `events/list`,
- * `events/poll` and `events/stream` (push) for the event types given, on
- * 2026-07-28 requests. Webhook delivery is not implemented.
+ * The Events extension (`io.modelcontextprotocol/events`, SEP-3415). It serves
+ * `events/list`, `events/poll` and `events/stream` (push) for the event types
+ * given, on 2026-07-28 requests, and with [[withWebhooks]] also
+ * `events/subscribe` and `events/unsubscribe` (webhook delivery).
  */
 object McpEvents:
   val Id: McpExtensionId = McpExtensionId.fromValid("io.modelcontextprotocol/events")
   val ListMethod: McpMethodName = McpMethodName.fromValid("events/list")
   val PollMethod: McpMethodName = McpMethodName.fromValid("events/poll")
   val StreamMethod: McpMethodName = McpMethodName.fromValid("events/stream")
+  val SubscribeMethod: McpMethodName = McpMethodName.fromValid("events/subscribe")
+  val UnsubscribeMethod: McpMethodName = McpMethodName.fromValid("events/unsubscribe")
 
   /** How often a push stream sends a heartbeat. */
   val DefaultHeartbeat: Duration = 30.seconds
@@ -444,9 +453,13 @@ object McpEvents:
 
   private def routing(name: McpEventName): Option[McpRoutingName] = McpRoutingName.parse(name.value).toOption
 
-  val listOperation: McpOperation[McpEventsListParams, McpEventsListResult] =
-    McpOperation.wire(Id, ListMethod, McpEventsWire.listParams, McpEventsWire.listResult,
-      protocolSupport = ProtocolSupport.Modern)
+  val listOperation: McpOperation[McpEventsListParams, McpEventsListResult] = listOp(ProtocolSupport.Modern)
+
+  // Clients use the 2026-07-28 operations. The server binds `events/list`,
+  // `events/subscribe` and `events/unsubscribe` for every revision, so that
+  // ChatGPT can call them on a 2025 session; `revision` refuses everyone else there.
+  private def listOp(support: ProtocolSupport): McpOperation[McpEventsListParams, McpEventsListResult] =
+    McpOperation.wire(Id, ListMethod, McpEventsWire.listParams, McpEventsWire.listResult, protocolSupport = support)
 
   val pollOperation: McpOperation[McpEventsPollParams, McpEventsPollResult] =
     McpOperation.wire(Id, PollMethod, McpEventsWire.pollParams, McpEventsWire.pollResult,
@@ -458,28 +471,98 @@ object McpEvents:
       protocolSupport = ProtocolSupport.Modern, routingName = p => routing(p.name),
       routingHeader = McpRoutingHeader.Required)
 
+  val subscribeOperation: McpOperation[McpEventsSubscribeParams, McpEventsSubscribeResult] =
+    subscribeOp(ProtocolSupport.Modern)
+
+  private def subscribeOp(support: ProtocolSupport): McpOperation[McpEventsSubscribeParams, McpEventsSubscribeResult] =
+    McpOperation.wire(Id, SubscribeMethod, McpEventsWire.subscribeParams, McpEventsWire.subscribeResult,
+      protocolSupport = support, routingName = p => routing(p.name), routingHeader = McpRoutingHeader.Required)
+
+  val unsubscribeOperation: McpOperation[McpEventsUnsubscribeParams, Unit] = unsubscribeOp(ProtocolSupport.Modern)
+
+  private def unsubscribeOp(support: ProtocolSupport): McpOperation[McpEventsUnsubscribeParams, Unit] =
+    McpOperation.wire(Id, UnsubscribeMethod, McpEventsWire.unsubscribeParams, McpEventsWire.unsubscribeResult,
+      protocolSupport = support, routingName = p => routing(p.name), routingHeader = McpRoutingHeader.Required)
+
   def apply[R](handlers: McpEventHandler[R]*): Either[McpEventsError, McpExtensions[R]] =
     withHeartbeat(DefaultHeartbeat)(handlers*)
 
   def withHeartbeat[R](heartbeat: Duration)(handlers: McpEventHandler[R]*): Either[McpEventsError, McpExtensions[R]] =
+    unique(handlers).map: byName =>
+      eventsExtension(Chunk(listBound(Chunk.fromIterable(handlers).map(_.descriptor), McpEventsDialect.spec),
+        pollBound(byName), streamBound(byName, heartbeat)), McpEventsDialect.spec)
+
+  /**
+   * The Events extension with webhook delivery too, for every event type that
+   * offers push: `events/subscribe` registers a callback URL, and the server
+   * POSTs the subscription's events to it, signed (Standard Webhooks), until it
+   * expires or `events/unsubscribe` ends it. Subscriptions are kept in the
+   * [[McpWebhookStore]] layer; their deliveries run in this scope, and
+   * subscriptions already in the store resume when it opens.
+   *
+   * A subscription belongs to the caller's principal, so only authenticated
+   * callers can subscribe, unless `config.anonymous` allows anyone. Event
+   * types' check functions keep running in the background for each
+   * subscription, with `R` as it is now and the caller's principal without
+   * its token.
+   *
+   * A store shared by several server instances isn't coordinated: each delivers
+   * the subscriptions it was asked for, and on start every one in the store.
+   */
+  def withWebhooks[R](config: McpWebhookConfig, heartbeat: Duration = DefaultHeartbeat)(handlers: McpEventHandler[R]*)
+    : ZIO[R & McpWebhookStore & Scope, McpEventsError, McpExtensions[R]] =
+    for
+      byName  <- ZIO.fromEither(unique(handlers))
+      runtime <- McpWebhookRuntime.make(config, byName).mapError(e => McpEventsError.WebhookSetup(e.getMessage))
+    yield
+      val descriptors = Chunk.fromIterable(handlers).map: h =>
+        if McpWebhookRuntime.offersWebhook(h.descriptor) then
+          h.descriptor.copy(delivery = h.descriptor.delivery :+ McpEventDelivery.Webhook)
+        else h.descriptor
+      eventsExtension(Chunk(listBound(descriptors, config.dialect), pollBound(byName), streamBound(byName, heartbeat),
+        subscribeBound(runtime), unsubscribeBound(runtime)), config.dialect)
+
+  private def unique[R](handlers: Seq[McpEventHandler[R]]): Either[McpEventsError, Map[McpEventName, McpEventHandler[R]]] =
     val all = Chunk.fromIterable(handlers)
     all.groupBy(_.name).collectFirst { case (name, hs) if hs.size > 1 => name } match
       case Some(name) => Left(McpEventsError.DuplicateEventName(name))
-      case None =>
-        val byName = all.map(h => h.name -> h).toMap
-        Right(McpExtensions.trustedVertical(McpServerExtension(
-          Id,
-          Chunk(listBound(all), pollBound(byName), streamBound(byName, heartbeat)),
-          Json.Obj(),
-        )))
+      case None       => Right(all.map(h => h.name -> h).toMap)
+
+  private def eventsExtension[R](operations: Chunk[McpBoundOperation[R]], dialect: McpRequestContext => McpEventsDialect)
+    : McpExtensions[R] =
+    val settings = new McpExtensionSettings[Any]:
+      def resolve(ctx: McpRequestContext): UIO[Json] = ZIO.succeed(Json.Obj())
+      override def topLevel(ctx: McpRequestContext): Boolean = dialect(ctx) == McpEventsDialect.ChatGpt
+    McpExtensions.trustedVertical(McpServerExtension(Id, operations, settings))
+
+  /** Refuse a legacy (2025) request, as an unknown method, unless it is from a client of ChatGPT's dialect. */
+  private def revision(ctx: McpRequestContext, dialect: McpRequestContext => McpEventsDialect): IO[McpMethodError, Unit] =
+    McpWebhookLog.fields(McpWebhookLog.caller(ctx, dialect(ctx))*)(
+      ZIO.logInfo("Events method refused on a 2025 session: only ChatGPT's dialect has it there") *>
+        ZIO.fail(McpMethodError.UnsupportedProtocol(ctx.protocolVersion))
+    ).unless(ctx.protocolVersion.isStateless || dialect(ctx) == McpEventsDialect.ChatGpt).unit
 
   /** The occurrences of a read, then its end position. */
   private[mcp] def delivered(read: McpEventRead): Chunk[McpEventPush] =
     read.events.map(e => McpEventPush.Signal(McpEventSignal.Event(e))) :+ McpEventPush.Position(read.end)
 
-  private def listBound[R](handlers: Chunk[McpEventHandler[R]]): McpBoundOperation[R] =
-    McpBoundOperation(listOperation): (_, _) =>
-      ZIO.succeed(McpEventsListResult(handlers.map(_.descriptor)))
+  private def listBound(descriptors: Chunk[McpEventDescriptor], dialect: McpRequestContext => McpEventsDialect)
+    : McpBoundOperation[Any] =
+    McpBoundOperation(listOp(ProtocolSupport.All)): (_, ctx) =>
+      McpWebhookLog.fields(McpWebhookLog.caller(ctx, dialect(ctx))*)(
+        revision(ctx, dialect) *>
+          McpWebhookLog.fields("events" -> descriptors.map(d => s"${d.name.value}[${d.delivery.map(_.wire).mkString(",")}]").mkString(" "))(
+            ZIO.logInfo("events/list")).as(McpEventsListResult(descriptors)))
+
+  private def subscribeBound[R](runtime: McpWebhookRuntime[R]): McpBoundOperation[Any] =
+    McpBoundOperation(subscribeOp(ProtocolSupport.All)): (params, ctx) =>
+      revision(ctx, runtime.config.dialect) *>
+        runtime.subscribe(params, ctx).mapError(e => methodError(e, runtime.config.dialect(ctx)))
+
+  private def unsubscribeBound[R](runtime: McpWebhookRuntime[R]): McpBoundOperation[Any] =
+    McpBoundOperation(unsubscribeOp(ProtocolSupport.All)): (params, ctx) =>
+      revision(ctx, runtime.config.dialect) *>
+        runtime.unsubscribe(params, ctx).mapError(e => methodError(e, runtime.config.dialect(ctx)))
 
   private def pollBound[R](handlers: Map[McpEventName, McpEventHandler[R]]): McpBoundOperation[R] =
     McpBoundOperation(pollOperation): (params, ctx) =>
@@ -489,7 +572,7 @@ object McpEvents:
             // A poll result carries its cursor on the result, not on each event.
             McpEventsPollResult(read.events.map(_.copy(cursor = None)), read.end, read.truncated, read.hasMore,
               h.pollInterval.toMillis)
-      .mapError(methodError)
+      .mapError(methodError(_))
 
   private def streamBound[R](handlers: Map[McpEventName, McpEventHandler[R]], heartbeat: Duration): McpBoundOperation[R] =
     McpBoundOperation.streaming(streamOperation): (params, ctx) =>
@@ -507,7 +590,7 @@ object McpEvents:
           signals.mergeHaltLeft(heartbeats).map(McpEventsWire.notification(_, ctx.requestId)),
           McpEventsStreamResult(ctx.requestId),
         )
-      ).mapError(methodError)
+      ).mapError(methodError(_))
 
   private def track(position: Ref[Option[McpEventCursor]], signal: McpEventSignal): UIO[Unit] =
     signal match
@@ -523,6 +606,6 @@ object McpEvents:
     ZIO.fromOption(handlers.get(name)).orElseFail(McpEventError.NotFound(name)).filterOrFail(_.descriptor.delivery.contains(mode))(
       McpEventError.Unsupported("deliveryMode", Some(mode.wire)))
 
-  private def methodError(error: McpEventError): McpMethodError =
-    val detail = error.detail
+  private def methodError(error: McpEventError, dialect: McpEventsDialect = McpEventsDialect.Spec): McpMethodError =
+    val detail = error.detail(dialect)
     McpMethodError.Domain(detail.code, detail.message, detail.data)

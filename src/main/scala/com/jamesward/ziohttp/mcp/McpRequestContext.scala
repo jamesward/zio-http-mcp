@@ -14,6 +14,8 @@ trait McpRequestContext:
   /** The JSON-RPC id of the request being served, when there is one. It is the
     * subscription id of a stream the request opens. */
   def requestId: Option[RequestId] = None
+  /** The HTTP `User-Agent` of the request, when it came over HTTP with one. */
+  def userAgent: Option[String] = None
   final def requireClientExtension(id: McpExtensionId): IO[McpMethodError, Json] =
     extensionCapabilities.get(id) match
       case Some(settings) => ZIO.succeed(settings)
@@ -28,8 +30,9 @@ object McpRequestContext:
     callerPathParams: Map[String, String] = Map.empty,
     capabilityErrors: Chunk[McpExtensionCapabilityParseError] = Chunk.empty,
     id: Option[RequestId] = None,
+    agent: Option[String] = None,
   ): McpRequestContext =
-    Context(version, info, capabilities, capabilityErrors, callerPrincipal, callerPathParams, id)
+    Context(version, info, capabilities, capabilityErrors, callerPrincipal, callerPathParams, id, agent)
 
   private final case class Context(
     override val protocolVersion: ProtocolVersion,
@@ -39,6 +42,7 @@ object McpRequestContext:
     override val principal: Option[Principal],
     override val pathParams: Map[String, String],
     override val requestId: Option[RequestId],
+    override val userAgent: Option[String],
   ) extends McpRequestContext
 
 final case class McpExtensionCapabilityParseError(
