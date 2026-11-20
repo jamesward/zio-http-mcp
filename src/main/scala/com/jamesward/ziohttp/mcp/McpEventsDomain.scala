@@ -169,6 +169,10 @@ enum McpEventError:
   case Unsupported(feature: String, value: Option[String] = None)
   /** A transient upstream failure: on a push stream it is reported and the stream goes on. */
   case Upstream(message: String, data: Option[Json] = None)
+  /** No webhook subscription matches the key given to `events/unsubscribe`. */
+  case SubscriptionNotFound
+  /** The webhook callback endpoint failed verification or couldn't be reached. */
+  case CallbackEndpoint(reason: McpWebhookFailure)
 
   def detail: ErrorDetail = this match
     case InvalidParams(message) => ErrorDetail(ErrorCode.InvalidParams.code, message)
@@ -184,6 +188,10 @@ enum McpEventError:
       ErrorDetail(McpEventError.UnsupportedCode, "Unsupported", Some(Json.Obj(Chunk[(String, Json)](
         "feature" -> Json.Str(feature)) ++ Chunk.fromIterable(value.map(v => "value" -> Json.Str(v))))))
     case Upstream(message, data) => ErrorDetail(ErrorCode.InternalError.code, message, data)
+    case SubscriptionNotFound =>
+      ErrorDetail(McpEventError.NotFoundCode, "No such subscription", Some(Json.Obj("kind" -> Json.Str("subscription"))))
+    case CallbackEndpoint(reason) =>
+      ErrorDetail(McpEventError.CallbackEndpointCode, "CallbackEndpointError", Some(Json.Obj("reason" -> Json.Str(reason.wire))))
 
 object McpEventError:
   given CanEqual[McpEventError, McpEventError] = CanEqual.derived
@@ -192,6 +200,7 @@ object McpEventError:
   val ForbiddenCode: Int         = -32024
   val ResourceExhaustedCode: Int = -32025
   val UnsupportedCode: Int       = -32026
+  val CallbackEndpointCode: Int  = -32027
 
 /** The JSON shapes of the Events messages: absent optional fields are omitted. */
 private[mcp] object McpEventsWire:
@@ -260,6 +269,116 @@ private[mcp] object McpEventsWire:
     obj(_).map(o => McpEventsStreamResult(subscriptionIdOf(o))),
     r => Right(Json.Obj(Chunk.fromIterable(r.subscriptionId.map(id => "_meta" -> subscriptionMeta(id))))),
   )
+
+  val subscribeParams: McpWireCodec[McpEventsSubscribeParams] = McpWireCodec(
+    obj(_).flatMap: o =>
+      for
+        name      <- eventName(o)
+        arguments <- argumentsOf(o)
+        delivery  <- o.get("delivery").flatMap(_.asObject).toRight("Missing or invalid 'delivery' object")
+        _         <- webhookMode(delivery)
+        url       <- webhookUrl(delivery)
+        rawSecret <- optionalString(delivery, "secret").flatMap(_.toRight("Missing 'delivery.secret'"))
+        secret    <- McpWebhookSecret.parse(rawSecret)
+        cursor    <- cursorOf(o)
+        maxAge    <- optionalLong(o, "maxAgeMs", min = 0)
+        ttl       <- ttlOf(o)
+      yield McpEventsSubscribeParams(name, arguments, url, secret, cursor, maxAge, ttl),
+    p =>
+      val ttl = p.ttl match
+        case McpWebhookTtl.ServerDefault  => Chunk.empty
+        case McpWebhookTtl.NoExpiry       => Chunk("ttlMs" -> Json.Null)
+        case McpWebhookTtl.Suggested(ttl) => Chunk("ttlMs" -> Json.Num(ttl.toMillis))
+      val delivery = Json.Obj("mode" -> Json.Str(McpEventDelivery.Webhook.wire), "url" -> Json.Str(p.url.value),
+        "secret" -> Json.Str(p.secret.value))
+      Right(Json.Obj(subscription(p.name, p.arguments, p.cursor, p.maxAgeMs) ++ Chunk("delivery" -> delivery) ++ ttl)),
+  )
+
+  val subscribeResult: McpWireCodec[McpEventsSubscribeResult] = McpWireCodec(
+    obj(_).flatMap: o =>
+      for
+        id        <- optionalString(o, "id").flatMap(_.toRight("Missing 'id'"))
+        refresh   <- optionalString(o, "refreshBefore").flatMap(r => traverse(Chunk.fromIterable(r))(instant("refreshBefore")))
+        cursor    <- cursorOf(o)
+        truncated <- optionalBoolean(o, "truncated")
+        status    <- o.get("deliveryStatus") match
+                       case None | Some(_: Json.Null.type) => Right(None)
+                       case Some(json)             => deliveryStatus(json).map(Some(_))
+      yield McpEventsSubscribeResult(McpWebhookSubscriptionId(id), refresh.headOption, cursor, truncated, status),
+    r => Right(Json.Obj(
+      Chunk[(String, Json)](
+        "id"            -> Json.Str(r.id.value),
+        "refreshBefore" -> r.refreshBefore.fold(Json.Null)(t => Json.Str(t.toString)),
+        "cursor"        -> cursorJson(r.cursor),
+        "truncated"     -> Json.Bool(r.truncated),
+      ) ++ Chunk.fromIterable(r.deliveryStatus.map(s => "deliveryStatus" -> deliveryStatusJson(s)))
+    )),
+  )
+
+  val unsubscribeParams: McpWireCodec[McpEventsUnsubscribeParams] = McpWireCodec(
+    obj(_).flatMap: o =>
+      for
+        name      <- eventName(o)
+        arguments <- argumentsOf(o)
+        delivery  <- o.get("delivery").flatMap(_.asObject).toRight("Missing or invalid 'delivery' object")
+        url       <- webhookUrl(delivery)
+      yield McpEventsUnsubscribeParams(name, arguments, url),
+    p => Right(Json.Obj("name" -> Json.Str(p.name.value), "arguments" -> p.arguments,
+      "delivery" -> Json.Obj("url" -> Json.Str(p.url.value)))),
+  )
+
+  val unsubscribeResult: McpWireCodec[Unit] = McpWireCodec(obj(_).map(_ => ()), _ => Right(Json.Obj()))
+
+  /** The body of a webhook event delivery. */
+  def webhookEvent(occ: McpEventOccurrence): Json.Obj = occurrenceJson(occ)
+
+  /** The body of a webhook `gap` control envelope. */
+  def webhookGap(cursor: Option[McpEventCursor]): Json.Obj =
+    Json.Obj("type" -> Json.Str("gap"), "cursor" -> cursorJson(cursor))
+
+  /** The body of a webhook `terminated` control envelope. */
+  def webhookTerminated(error: ErrorDetail): Json.Obj =
+    Json.Obj("type" -> Json.Str("terminated"), "error" -> errorJson(error))
+
+  /** The body of a webhook `verification` control envelope. */
+  def webhookVerification(challenge: String): Json.Obj =
+    Json.Obj("type" -> Json.Str("verification"), "challenge" -> Json.Str(challenge))
+
+  private def webhookMode(delivery: Json.Obj): Either[String, Unit] =
+    optionalString(delivery, "mode").flatMap:
+      case None | Some("webhook") => Right(())
+      case Some(other)            => Left(s"Invalid 'delivery.mode' '$other': events/subscribe is for webhook delivery")
+
+  private def webhookUrl(delivery: Json.Obj): Either[String, McpWebhookUrl] =
+    optionalString(delivery, "url").flatMap(_.toRight("Missing 'delivery.url'")).flatMap(McpWebhookUrl.parse)
+
+  // Absent asks for the server's default, null for no expiry.
+  private def ttlOf(o: Json.Obj): Either[String, McpWebhookTtl] =
+    o.get("ttlMs") match
+      case None              => Right(McpWebhookTtl.ServerDefault)
+      case Some(_: Json.Null.type) => Right(McpWebhookTtl.NoExpiry)
+      case Some(_)           => optionalLong(o, "ttlMs", min = 0).map(ms => McpWebhookTtl.Suggested(Duration.fromMillis(ms.getOrElse(0L))))
+
+  private def instant(field: String)(value: String): Either[String, Instant] =
+    Try(Instant.parse(value)).toEither.left.map(_ => s"Invalid '$field' '$value'")
+
+  private def deliveryStatus(json: Json): Either[String, McpWebhookDeliveryStatus] =
+    for
+      o           <- obj(json)
+      active      <- o.get("active").flatMap(_.asBoolean).toRight("Missing or invalid 'deliveryStatus.active'")
+      last        <- optionalString(o, "lastDeliveryAt").flatMap(v => traverse(Chunk.fromIterable(v))(instant("lastDeliveryAt")))
+      error       <- optionalString(o, "lastError")
+      failedSince <- optionalString(o, "failedSince").flatMap(v => traverse(Chunk.fromIterable(v))(instant("failedSince")))
+    yield McpWebhookDeliveryStatus(active, last.headOption, error.flatMap(McpWebhookFailure.fromWire), failedSince.headOption)
+
+  private def deliveryStatusJson(s: McpWebhookDeliveryStatus): Json =
+    Json.Obj(
+      Chunk[(String, Json)](
+        "active"         -> Json.Bool(s.active),
+        "lastDeliveryAt" -> s.lastDeliveryAt.fold(Json.Null)(t => Json.Str(t.toString)),
+        "lastError"      -> s.lastError.fold(Json.Null)(e => Json.Str(e.wire)),
+      ) ++ Chunk.fromIterable(s.failedSince.map(t => "failedSince" -> Json.Str(t.toString)))
+    )
 
   val ActiveMethod: McpMethodName     = McpMethodName.fromValid("notifications/events/active")
   val EventMethod: McpMethodName      = McpMethodName.fromValid("notifications/events/event")

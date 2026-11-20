@@ -740,7 +740,7 @@ yield
 
 ### Events
 
-[Events](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415) (`io.modelcontextprotocol/events`, SEP-3415) let a client subscribe to things that happen upstream, such as a new incident or a push to a repository. The SEP is a draft, so this support is experimental and will change with it. `McpEvents(...)` serves `events/list`, and poll (`events/poll`) and push (`events/stream`) delivery for each event type, on 2026-07-28 requests. Webhook delivery is not implemented yet.
+[Events](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415) (`io.modelcontextprotocol/events`, SEP-3415) let a client subscribe to things that happen upstream, such as a new incident or a push to a repository. The SEP is accepted, but the extension is new, so this support is experimental and may change with it. `McpEvents(...)` serves `events/list`, and poll (`events/poll`) and push (`events/stream`) delivery for each event type, on 2026-07-28 requests. `McpEvents.withWebhooks(...)` adds [webhook delivery](#webhook-delivery).
 
 An event type's events come from one of two places. For an upstream with no history to read, such as webhooks or a message bus, emit them into an `McpEventBuffer`, which keeps a window of them (by age and count) for poll clients and push subscribers. `buffered` can filter or reshape each event per subscription from its arguments, or with `None` leave a subscriber out:
 
@@ -801,6 +801,30 @@ val watch = ZIO.scoped:
 ```
 
 `delivery = Some(McpEventDelivery.Poll)` forces polling, at the interval the server suggests but no faster than `McpEventsSubscribeSettings.pollFloor` (1 second). `list`, `poll` and `stream` are the protocol's own requests, and `McpEventsClient.connectStdio` connects to a stdio server, where each push stream's notifications are routed by its subscription id.
+
+#### Webhook delivery
+
+`McpEvents.withWebhooks` serves `events/subscribe` and `events/unsubscribe` as well, for every event type that offers push. A client subscribes with a callback URL and a Standard Webhooks secret (`whsec_` and the base64 of 24 to 64 random bytes), and the server POSTs each event to the URL, signed (`webhook-id`, `webhook-timestamp`, `webhook-signature`, and `X-MCP-Subscription-Id`). Subscriptions are kept in an `McpWebhookStore`, provided as a layer, and their deliveries run in the scope `withWebhooks` is given, so the subscriptions in the store resume when it opens:
+
+```scala
+val webhookEvents: ZIO[McpWebhookStore & Scope, McpEventsError, McpExtensions[Any]] =
+  for
+    incidents <- McpEventBuffer.make[Incident]()
+    created    = McpEvent("incident.created")
+                   .buffered[IncidentFilter, Incident](incidents, (filter, incident, _) =>
+                     Option.when(filter.severity.forall(_ == incident.severity))(incident))
+    events    <- McpEvents.withWebhooks(McpWebhookConfig(maxTtl = 1.hour))(created)
+  yield events
+```
+
+- **Authenticated callers only.** A subscription belongs to the caller's principal (its issuer and subject), so `events/subscribe` without one is `Forbidden` (`-32024`): add [`.auth(...)`](#authorization). The event type's check function keeps running for the subscription in the background, with the subscriber's principal on `ctx` (without its token).
+- **Identity.** The subscription id is derived from the principal, URL, event name and arguments, so subscribing again with them refreshes it: a new TTL, a new secret (the old one keeps signing for `secretGrace`), and a `deliveryStatus` in the result. `events/unsubscribe` ends it, and so does a missed refresh.
+- **TTL.** `McpWebhookConfig` bounds the lifetime granted (`minTtl`, `maxTtl`, `defaultTtl`). No expiry (`ttlMs: null`) is granted only with `noExpiry = true` and a store whose `durable` is true, and only a durable store gets each subscription's cursor kept current, so delivery resumes from it after a restart.
+- **Verification.** Before the first delivery to a URL for a principal, the server POSTs a `verification` envelope and expects its `challenge` echoed back; otherwise `events/subscribe` fails with `CallbackEndpointError` (`-32027`). `preVerified` lists URLs that skip it.
+- **Targets.** By default (`McpWebhookTargets.public`) a callback URL must be `https`, and the server connects only to globally routable addresses, checked at every connection with the connection made to the address checked, and never follows a redirect. `McpWebhookTargets.unrestricted` is for tests and local development.
+- **Delivery.** Each subscription delivers its events in order, retrying a failed one after each of `retryDelays` and then giving up on it. `410` and `413` aren't retried. A body's `cursor` is the subscription's watermark, safe to persist. A gap is sent as a `gap` envelope, and a subscription the check function ends (`Forbidden`, for example) as a `terminated` envelope.
+
+Not implemented: the receiver's `/.well-known/mcp-webhook-receiver.json`, suspension after sustained failures (`deliveryStatus.active` stays `true`), `throttled`, ed25519 server signatures, and coordination between server instances that share a store: each delivers what it was asked for, and on start every subscription in the store.
 
 The extension kernel's `McpBoundOperation.streaming` is what serves `events/stream`: an operation answered with a stream of notifications and then its result, as SSE over HTTP and as lines on stdio. `McpExtensionClient.requestStream` calls one.
 
