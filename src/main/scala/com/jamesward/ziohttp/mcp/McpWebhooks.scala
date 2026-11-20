@@ -338,16 +338,17 @@ private[mcp] final case class McpWebhookRuntime[R](
       for
         (_, owner) <- caller(ctx)
         id          = McpWebhookKey(owner, params.url, params.name, params.arguments).id
-        _          <- locked(id):
+        removed    <- locked(id):
                         for
                           removed <- workers.modify(m => (m.get(id), m - id))
                           stored  <- store.get(id).storeFailure("events/unsubscribe", id)
                           _       <- McpWebhookLog.fields("subscription_id" -> id.value, "running" -> removed.isDefined.toString,
                                        "stored" -> stored.isDefined.toString)(ZIO.logInfo("events/unsubscribe"))
                           _       <- ZIO.fail(McpEventError.SubscriptionNotFound).when(removed.isEmpty && stored.isEmpty)
-                          _       <- ZIO.foreachDiscard(removed)(_.fiber.interrupt.fork)
                           _       <- store.delete(id).storeFailure("events/unsubscribe", id)
-                        yield ()
+                        yield removed
+        // Outside the lock, which the worker may be waiting for: once this returns, nothing more is delivered.
+        _          <- ZIO.foreachDiscard(removed)(_.fiber.interrupt)
       yield ()
     ).tapError(e => McpWebhookLog.fields("error" -> e.detail.message)(ZIO.logWarning("events/unsubscribe refused"))))
 
@@ -381,7 +382,7 @@ private[mcp] final case class McpWebhookRuntime[R](
 
   /** End a subscription found expired, unless a refresh came in since. */
   private def expire(id: McpWebhookSubscriptionId, token: Option[UUID]): UIO[Unit] =
-    locked(id):
+    locked(id)(
       for
         now     <- Clock.instant
         current <- workers.get.map(_.get(id))
@@ -390,9 +391,10 @@ private[mcp] final case class McpWebhookRuntime[R](
                      case Some(worker) if token.forall(_ == worker.token) => worker.state.get.map(_.subscription.isExpired(now))
                      case Some(_)                                         => ZIO.succeed(false)
                      case None                                            => ZIO.succeed(stored.forall(_.isExpired(now)))
-        _       <- (end(id, current.map(_.token)) *> ZIO.foreachDiscard(current)(_.fiber.interrupt.fork) *>
+        _       <- (end(id, current.map(_.token)) *>
                      McpWebhookLog.fields("subscription_id" -> id.value)(ZIO.logInfo("Webhook subscription expired"))).when(still)
-      yield ()
+      yield current.filter(_ => still)
+    ).flatMap(ZIO.foreachDiscard(_)(_.fiber.interrupt))
 
   private def offersWebhook(handler: McpEventHandler[R]): Boolean = McpWebhookRuntime.offersWebhook(handler.descriptor)
 
