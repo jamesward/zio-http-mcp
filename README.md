@@ -81,7 +81,7 @@ The output type determines how the result is serialized. The `McpOutput` type cl
 | `String` | Plain text content, no output schema |
 | `ToolContent` | Single content item (text, image, audio, embedded resource) |
 | `Chunk[ToolContent]` | Multiple content items |
-| Any type with `Schema` | JSON-serialized with `structuredContent` and `outputSchema` |
+| Any type with `Schema` | JSON-serialized with `structuredContent` and `outputSchema`; a `None` field is left out, not written as `null` |
 
 ```scala
 // Returns plain text
@@ -740,7 +740,7 @@ yield
 
 ### Events
 
-[Events](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415) (`io.modelcontextprotocol/events`, SEP-3415) let a client subscribe to things that happen upstream, such as a new incident or a push to a repository. The SEP is accepted, but the extension is new, so this support is experimental and may change with it. `McpEvents(...)` serves `events/list`, and poll (`events/poll`) and push (`events/stream`) delivery for each event type, on 2026-07-28 requests. `McpEvents.withWebhooks(...)` adds [webhook delivery](#webhook-delivery).
+[Events](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/seps/3415-events-extension.md) (`io.modelcontextprotocol/events`, SEP-3415) let a client subscribe to things that happen upstream, such as a new incident or a push to a repository. The SEP is accepted, but the extension is new, so this support is experimental and may change with it. `McpEvents(...)` serves `events/list`, and poll (`events/poll`) and push (`events/stream`) delivery for each event type, on 2026-07-28 requests. `McpEvents.withWebhooks(...)` adds [webhook delivery](#webhook-delivery), which ChatGPT can also use on a 2025 session. An event's `data` leaves out a `None` field rather than writing `null`, as its `payloadSchema` describes it.
 
 An event type's events come from one of two places. For an upstream with no history to read, such as webhooks or a message bus, emit them into an `McpEventBuffer`, which keeps a window of them (by age and count) for poll clients and push subscribers. `buffered` can filter or reshape each event per subscription from its arguments, or with `None` leave a subscriber out:
 
@@ -817,14 +817,17 @@ val webhookEvents: ZIO[McpWebhookStore & Scope, McpEventsError, McpExtensions[An
   yield events
 ```
 
+- **The store.** `McpWebhookStore` is a trait to implement: `get`, `all`, `put`, an atomic `update` and `delete` for subscriptions, `verification` and `putVerification` for verified endpoints, and `durable`, which says whether they survive a restart. The library ships no implementation. One in a `Ref` is enough for one instance with short TTLs: after a restart, each client's next refresh resubscribes from its cursor.
 - **Authenticated callers only.** A subscription belongs to the caller's principal (its issuer and subject), so `events/subscribe` without one is `Forbidden` (`-32024`): add [`.auth(...)`](#authorization). The event type's check function keeps running for the subscription in the background, with the subscriber's principal on `ctx` (without its token).
 - **Anonymous subscriptions.** `McpWebhookConfig(anonymous = true)` accepts callers without a principal, which SEP-3415 forbids. They all share one owner, so anyone who knows a subscription's URL, event name and arguments can unsubscribe it. Every new anonymous subscription is verified, without the per-URL cache, and a new secret on a refresh takes effect only once the endpoint answers a challenge signed with it.
 - **Identity.** The subscription id is derived from the principal, URL, event name and arguments, so subscribing again with them refreshes it: a new TTL, a new secret (the old one keeps signing for `secretGrace`), and a `deliveryStatus` in the result. `events/unsubscribe` ends it, and so does a missed refresh.
 - **TTL.** `McpWebhookConfig` bounds the lifetime granted (`minTtl`, `maxTtl`, `defaultTtl`). No expiry (`ttlMs: null`) is granted only with `noExpiry = true` and a store whose `durable` is true, and only a durable store gets each subscription's cursor kept current, so delivery resumes from it after a restart.
 - **Verification.** Before the first delivery to a URL for a principal, the server POSTs a `verification` envelope and expects its `challenge` echoed back; otherwise `events/subscribe` fails with `CallbackEndpointError` (`-32027`). `preVerified` lists URLs that skip it.
 - **Targets.** By default (`McpWebhookTargets.public`) a callback URL must be `https`, and the server connects only to globally routable addresses, checked at every connection with the connection made to the address checked, and never follows a redirect. `McpWebhookTargets.unrestricted` is for tests and local development.
-- **Delivery.** Each subscription delivers its events in order, retrying a failed one after each of `retryDelays` and then giving up on it. `410` and `413` aren't retried. A body's `cursor` is the subscription's watermark, safe to persist. A gap is sent as a `gap` envelope, and a subscription the check function ends (`Forbidden`, for example) as a `terminated` envelope.
+- **Delivery.** Each subscription delivers its events in order, retrying a failed one after each of `retryDelays` and then giving up on it. `410` and `413` aren't retried, and a body over 256 KiB isn't sent. A body's `cursor` is the subscription's watermark, safe to persist. A gap is sent as a `gap` envelope, and a subscription the check function ends (`Forbidden`, for example) as a `terminated` envelope.
 - **ChatGPT.** ChatGPT implements an earlier draft. `McpWebhookConfig.dialect` picks the dialect per request, and by default (`McpEventsDialect.auto`) a client that calls itself `openai-mcp` (its `clientInfo` name or `User-Agent`) gets ChatGPT's: `capabilities.events` next to `capabilities.extensions`, `events/list`, `events/subscribe` and `events/unsubscribe` on 2025 sessions too, `-32015` for `CallbackEndpointError`, the event's `eventId` as its `webhook-id`, and no `gap` or `terminated` envelopes. A subscription keeps the dialect of its last subscribe, through restarts. Once ChatGPT declares `io.modelcontextprotocol/events` in its capabilities, as a SEP-3415 client may, it gets the spec; `McpEventsDialect.spec` gives every client the spec.
+
+- **Logging.** Every events request logs who called (protocol, `clientInfo`, `User-Agent`, principal) and the dialect chosen; `events/subscribe` and `events/unsubscribe` log their arguments and outcome; every POST logs its `webhook-id`, kind, attempt, the endpoint's status or failure, and duration; each subscription's delivery logs as it starts, reads events, retries, gives up and stops. Each detail is a log annotation (`subscription_id`, `webhook_id`, `event`, ...). Secrets and tokens are never logged. `McpRequestContext.userAgent` is the request's `User-Agent`.
 
 Not implemented: the receiver's `/.well-known/mcp-webhook-receiver.json`, suspension after sustained failures (`deliveryStatus.active` stays `true`), `throttled`, ed25519 server signatures, and coordination between server instances that share a store: each delivers what it was asked for, and on start every subscription in the store.
 
