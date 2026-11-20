@@ -7,6 +7,7 @@ import zio.http.netty.NettyConfig
 import zio.json.*
 import zio.json.ast.Json
 import zio.stream.ZStream
+import nl.vroste.rezilience.{Bulkhead, CircuitBreaker, TrippingStrategy}
 
 import java.net.{Inet4Address, Inet6Address, InetAddress, UnknownHostException}
 import java.nio.charset.StandardCharsets.UTF_8
@@ -104,6 +105,10 @@ object McpWebhookTargets:
  * @param maxPerUrl       the most subscriptions one owner holds for one callback URL
  * @param verificationsPerHost the most verification POSTs to one host in a minute
  * @param storeSweep      how often expired subscriptions with no worker are deleted from the store
+ * @param suspension      when a subscription's delivery is suspended because its endpoint keeps failing
+ * @param maxConcurrentPosts the most webhook POSTs in flight at once, across all subscriptions
+ * @param maxQueuedPosts  the most POSTs waiting for one of those slots; a delivery past it waits and tries again,
+ *                        and a verification past it is `ResourceExhausted`
  * @param dialect         which version of the extension a request's client speaks:
  *                        by default ChatGPT's draft for ChatGPT, until it declares
  *                        the spec's extension, and the spec for everyone else
@@ -126,6 +131,9 @@ final case class McpWebhookConfig(
   maxPerUrl: Int = 100,
   verificationsPerHost: Int = 10,
   storeSweep: Duration = 10.minutes,
+  suspension: McpWebhookSuspension = McpWebhookSuspension(),
+  maxConcurrentPosts: Int = 64,
+  maxQueuedPosts: Int = 4096,
 ):
   /** The lifetime granted for a suggestion: `None` for no expiry. */
   def grant(ttl: McpWebhookTtl, durable: Boolean): Option[Duration] = ttl match
@@ -135,6 +143,20 @@ final case class McpWebhookConfig(
 
   private def clamp(ttl: Duration): Duration =
     if ttl < minTtl then minTtl else if ttl > maxTtl then maxTtl else ttl
+
+/**
+ * When to suspend a subscription's delivery, as SEP-3415 suggests: when at
+ * least `failureRate` of the POSTs in the last `window` failed, over at least
+ * `minAttempts` of them. While suspended, the subscription's pending event
+ * waits, without using up its retries; every `probeAfter` one POST probes the
+ * endpoint, and a success resumes delivery. So does a refresh, as the SEP says.
+ */
+final case class McpWebhookSuspension(
+  failureRate: Double = 0.95,
+  window: Duration = 60.minutes,
+  minAttempts: Int = 100,
+  probeAfter: Duration = 10.minutes,
+)
 
 /** Standard Webhooks signatures: `v1,` and the base64 HMAC-SHA256 of `id.timestamp.body`, one per secret. */
 private[mcp] object McpWebhookSignature:
@@ -257,6 +279,7 @@ private[mcp] final case class McpWebhookRuntime[R](
   workers: Ref.Synchronized[Map[McpWebhookSubscriptionId, McpWebhookRuntime.Worker]],
   locks: Chunk[Semaphore],
   verifications: Ref[Map[String, Chunk[Instant]]],
+  posts: Bulkhead,
   scope: Scope,
 ):
   import McpWebhookRuntime.{*, given}
@@ -400,17 +423,29 @@ private[mcp] final case class McpWebhookRuntime[R](
       // Anyone can refresh an anonymous subscription: its endpoint has to accept a new secret first.
       _       <- handshake(key, secret).when(key.principal.isAnonymous && current != secret)
       now     <- Clock.instant
-      updated <- worker.state.updateAndGet: s =>
+      active  <- worker.state.get.map(_.status.active)
+      // A refresh reactivates a suspended subscription: a new circuit breaker, and the waiting delivery goes on.
+      fresh   <- ZIO.foreach(Option.unless(active)(()))(_ => suspendable)
+      (updated, replaced) <- worker.state.modify: s =>
                    val sub = s.subscription
                    val previous =
                      if sub.secret == secret then sub.previousSecret
                      else Some(McpWebhookPreviousSecret(sub.secret, now.plus(config.secretGrace)))
-                   s.copy(subscription = sub.copy(secret = secret, previousSecret = previous, refreshBefore = refreshBefore,
-                     dialect = dialect),
-                     status = s.status.copy(active = true))
+                   val next = s.copy(
+                     subscription = sub.copy(secret = secret, previousSecret = previous, refreshBefore = refreshBefore,
+                       dialect = dialect),
+                     status = s.status.copy(active = true),
+                     breaker = fresh.fold(s.breaker)(_._1),
+                     resumed = fresh.fold(s.resumed)(_._2),
+                   )
+                   ((next, fresh.map(_ => (s.breaker, s.resumed))), next)
+      _       <- ZIO.foreachDiscard(replaced): (breaker, resumed) =>
+                   McpWebhookLog.fields("subscription_id" -> key.id.value)(ZIO.logInfo("Webhook delivery reactivated by a refresh")) *>
+                     breaker.scope.close(Exit.unit) *> resumed.succeed(())
       _       <- store.put(updated.subscription).storeFailure("events/subscribe", updated.subscription.id)
+    // The status says what it was: `active: false` tells the client this refresh reactivated it.
     yield McpEventsSubscribeResult(updated.subscription.id, refreshBefore, updated.watermark, truncated = false,
-      Some(updated.status))
+      Some(updated.status.copy(active = active)))
 
   /** A new subscription: within the limits, its endpoint verified, then its first read. */
   private def create(
@@ -467,7 +502,8 @@ private[mcp] final case class McpWebhookRuntime[R](
       body       = McpEventsWire.webhookVerification(challenge).toJson.getBytes(UTF_8)
       _         <- McpWebhookLog.fields("subscription_id" -> key.id.value, "webhook_id" -> messageId,
                      "url" -> McpWebhookLog.url(key.url))(ZIO.logInfo("Verifying webhook endpoint"))
-      outcome   <- McpWebhookLog.fields("kind" -> "verification")(sender.post(key.url, key.id, NonEmptyChunk(secret), messageId, body))
+      outcome   <- posts(McpWebhookLog.fields("kind" -> "verification")(sender.post(key.url, key.id, NonEmptyChunk(secret), messageId, body)))
+                     .orElseFail(McpEventError.ResourceExhausted("queuedPosts", Some(config.maxQueuedPosts.toLong)))
       _         <- verified(outcome, challenge)
                    .mapError(McpEventError.CallbackEndpoint(_))
                    .tapBoth(
@@ -525,8 +561,7 @@ private[mcp] final case class McpWebhookRuntime[R](
             ZIO.logInfo("Resuming webhook subscription")) *>
             handler.push(sub.key.arguments, sub.cursor, None, ctx).provideEnvironment(env).foldZIO(
               error => ZIO.logWarning(s"Webhook subscription ${sub.id} can't resume: ${error.detail.message}") *>
-                Ref.make(WorkerState(sub, sub.cursor, McpWebhookDeliveryStatus.initial)).flatMap(state =>
-                  terminate(state, sub.id, None, error.detail)),
+                ZIO.acquireReleaseWith(workerState(sub))(release)(state => terminate(state, sub.id, None, error.detail)),
               pushes => locked(sub.id)(install(sub, pushes, resumed = true)).unit,
             )
 
@@ -539,7 +574,7 @@ private[mcp] final case class McpWebhookRuntime[R](
     workers.modifyZIO: current =>
       for
         token <- Random.nextUUID
-        state <- Ref.make(WorkerState(sub, sub.cursor, McpWebhookDeliveryStatus.initial))
+        state <- workerState(sub)
         first <- Promise.make[Nothing, (Option[McpEventCursor], Boolean)]
         // The worker outlives the request: it logs with its subscription's fields, not the request's.
         fiber <- FiberRef.currentLogAnnotations.locally(Map(
@@ -548,7 +583,7 @@ private[mcp] final case class McpWebhookRuntime[R](
                    (ZIO.logInfo("Webhook delivery started") *> deliver(state, token, first, pushes, resumed))
                      .provideEnvironment(env)
                      .onExit(exit => ZIO.logInfo(s"Webhook delivery stopped: ${if exit.isInterrupted then "ended" else "finished"}"))
-                     .ensuring(first.succeed((sub.cursor, false)) *> forget(sub.id, token))
+                     .ensuring(first.succeed((sub.cursor, false)) *> forget(sub.id, token) *> release(state))
                      .forkIn(scope))
         _     <- ZIO.foreachDiscard(current.get(sub.id))(_.fiber.interrupt.fork)
       yield (first, current.updated(sub.id, Worker(token, fiber, state)))
@@ -612,14 +647,24 @@ private[mcp] final case class McpWebhookRuntime[R](
         s       <- state.get
         now     <- Clock.instant
         sub      = s.subscription
-        outcome <- McpWebhookLog.fields("kind" -> kind, "attempt" -> number.toString, "dialect" -> sub.dialect.toString)(
-                     sender.post(sub.key.url, sub.id, sub.signingSecrets(now), messageId, bytes))
+        post     = McpWebhookLog.fields("kind" -> kind, "attempt" -> number.toString, "dialect" -> sub.dialect.toString)(
+                     sender.post(sub.key.url, sub.id, sub.signingSecrets(now), messageId, bytes)).flatMap:
+                       case failed: Outcome.Failed => ZIO.fail(failed)
+                       case answered               => ZIO.succeed(answered)
+        outcome <- posts(s.breaker.circuit(post)).either
         done    <- Clock.instant
         _       <- outcome match
-                     case Outcome.Accepted(_, _) =>
-                       state.update(s => s.copy(status = s.status.copy(lastDeliveryAt = Some(done), lastError = None, failedSince = None)))
-                     case Outcome.Refused(_) => ZIO.unit
-                     case Outcome.Failed(failure, _, _) =>
+                     case Right(Outcome.Accepted(_, _)) =>
+                       state.update(s => s.copy(status = s.status.copy(active = true, lastDeliveryAt = Some(done),
+                         lastError = None, failedSince = None)))
+                     case Right(_) => ZIO.unit
+                     case Left(_: Bulkhead.BulkheadRejection.type) =>
+                       McpWebhookLog.fields("webhook_id" -> messageId, "kind" -> kind)(
+                         ZIO.logWarning("Too many webhook POSTs waiting: this one tries again in a second")) *>
+                         attempt(messageId, number, delays).delay(1.second)
+                     case Left(Bulkhead.WrappedError(_: CircuitBreaker.CircuitBreakerOpen.type)) =>
+                       suspended(state, messageId, kind) *> attempt(messageId, number, delays)
+                     case Left(Bulkhead.WrappedError(CircuitBreaker.WrappedError(Outcome.Failed(failure, _, _)))) =>
                        state.update(s => s.copy(status = s.status.copy(lastError = Some(failure),
                          failedSince = s.status.failedSince.orElse(Some(done))))) *>
                          (delays match
@@ -644,6 +689,37 @@ private[mcp] final case class McpWebhookRuntime[R](
         val own = eventId.filter(id => chatGpt && HeaderSafe.matches(id))
         randomToken(18).flatMap: r =>
           attempt(own.getOrElse(if kind == "event" then s"msg_$r" else s"msg_${kind}_$r"), 1, config.retryDelays.toList)
+
+  /**
+   * The endpoint failed too often: mark the subscription suspended, and wait
+   * for a refresh or for the circuit breaker to let a probe through.
+   */
+  private def suspended(state: Ref[WorkerState], messageId: String, kind: String): UIO[Unit] =
+    for
+      (wasActive, resumed) <- state.modify(s => ((s.status.active, s.resumed), s.copy(status = s.status.copy(active = false))))
+      _                    <- McpWebhookLog.fields("webhook_id" -> messageId, "kind" -> kind,
+                                "probe_in_ms" -> config.suspension.probeAfter.toMillis.toString)(
+                                ZIO.logWarning("Webhook delivery suspended: the endpoint keeps failing")).when(wasActive)
+      _                    <- resumed.await.timeout(config.suspension.probeAfter)
+    yield ()
+
+  /** A circuit breaker in its own scope, so a refresh can replace it, and a promise to wake a suspended delivery. */
+  private def suspendable: UIO[(Breaker, Promise[Nothing, Unit])] =
+    for
+      scope   <- Scope.make
+      circuit <- CircuitBreaker.make[Outcome.Failed](
+                   TrippingStrategy.failureRate(config.suspension.failureRate, config.suspension.window,
+                     config.suspension.minAttempts),
+                   resetPolicy = Schedule.spaced(config.suspension.probeAfter),
+                 ).provideEnvironment(ZEnvironment(scope))
+      resumed <- Promise.make[Nothing, Unit]
+    yield (Breaker(circuit, scope), resumed)
+
+  private def workerState(sub: McpWebhookSubscription): UIO[Ref[WorkerState]] =
+    suspendable.flatMap((breaker, resumed) =>
+      Ref.make(WorkerState(sub, sub.cursor, McpWebhookDeliveryStatus.initial, breaker, resumed)))
+
+  private def release(state: Ref[WorkerState]): UIO[Unit] = state.get.flatMap(_.breaker.scope.close(Exit.unit))
 
   /** Delete the subscription; and forget its worker, if it is still `token`'s. */
   private def end(id: McpWebhookSubscriptionId, token: Option[UUID]): UIO[Unit] =
@@ -671,10 +747,18 @@ private[mcp] object McpWebhookRuntime:
 
   final case class Worker(token: UUID, fiber: Fiber.Runtime[Nothing, Unit], state: Ref[WorkerState])
 
+  /** A circuit breaker, and the scope that owns it. */
+  final case class Breaker(circuit: CircuitBreaker[McpWebhookSender.Outcome.Failed], scope: Scope.Closeable)
+
+  /**
+   * @param resumed completed when a refresh reactivates a suspended delivery
+   */
   final case class WorkerState(
     subscription: McpWebhookSubscription,
     watermark: Option[McpEventCursor],
     status: McpWebhookDeliveryStatus,
+    breaker: Breaker,
+    resumed: Promise[Nothing, Unit],
   )
 
   def make[R](config: McpWebhookConfig, handlers: Map[McpEventName, McpEventHandler[R]])
@@ -687,7 +771,8 @@ private[mcp] object McpWebhookRuntime:
       workers <- Ref.Synchronized.make(Map.empty[McpWebhookSubscriptionId, Worker])
       locks   <- ZIO.foreach(Chunk.fill(64)(()))(_ => Semaphore.make(1))
       hosts   <- Ref.make(Map.empty[String, Chunk[Instant]])
-      runtime  = McpWebhookRuntime(config, env, store, sender, handlers, workers, locks, hosts, scope)
+      posts   <- Bulkhead.make(config.maxConcurrentPosts, config.maxQueuedPosts)
+      runtime  = McpWebhookRuntime(config, env, store, sender, handlers, workers, locks, hosts, posts, scope)
       _       <- runtime.resume
       _       <- runtime.expireLoop.forkIn(scope)
     yield runtime

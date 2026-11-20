@@ -56,7 +56,7 @@ object McpWebhooksSpec extends ZIOSpecDefault:
         mac.doFinal(s"${header("webhook-id").get}.${header("webhook-timestamp").get}.$body".getBytes(UTF_8)))
       header("webhook-signature").exists(_.split(' ').contains(expected))
 
-  final case class Receiver(received: Queue[Received], echo: Ref[Boolean], statuses: Ref[List[Int]]):
+  final case class Receiver(received: Queue[Received], echo: Ref[Boolean], statuses: Ref[List[Int]], delay: Ref[Duration]):
     val routes: Routes[Any, Response] = Routes(
       Method.POST / "hooks" / string("name") -> handler: (name: String, request: Request) =>
         for
@@ -65,6 +65,7 @@ object McpWebhooksSpec extends ZIOSpecDefault:
           _       <- received.offer(got)
           echoing <- echo.get
           status  <- statuses.modify(s => (s.headOption.getOrElse(200), s.drop(1)))
+          _       <- delay.get.flatMap(ZIO.sleep(_))
         yield got.kind match
           case Some("verification") if echoing =>
             Response.json(Json.Obj("challenge" -> Json.Str(got.str("challenge").get)).toJson)
@@ -83,7 +84,8 @@ object McpWebhooksSpec extends ZIOSpecDefault:
         q        <- Queue.unbounded[Received]
         echo     <- Ref.make(true)
         statuses <- Ref.make(List.empty[Int])
-      yield Receiver(q, echo, statuses)
+        delay    <- Ref.make(Duration.Zero)
+      yield Receiver(q, echo, statuses, delay)
 
   // --- the server under test ---
 
@@ -589,6 +591,51 @@ object McpWebhooksSpec extends ZIOSpecDefault:
             result <- call(fx.port, "events/subscribe", subscription(fx.url(), arguments = Json.Obj("severity" -> Json.Num(1))))
             posted <- fx.receiver.quiet(200)
           yield assertTrue(code(result).contains(-32602), posted.isEmpty)
+      ,
+      test("an endpoint that keeps failing is suspended; a refresh reactivates it, and the event waits rather than being given up"):
+        val config = testConfig.copy(
+          retryDelays = Chunk.fill(50)(50.millis),
+          suspension = McpWebhookSuspension(failureRate = 0.5, window = 500.millis, minAttempts = 3, probeAfter = 1.minute),
+        )
+        ZIO.scoped:
+          for
+            fx        <- install(config = config)
+            _         <- subscribed(fx, subscription(fx.url()))
+            _         <- fx.receiver.statuses.set(List.fill(1000)(500))
+            _         <- fx.incidents.emit(Incident("INC-1", "P1"), eventId = Some("INC-1"))
+            // Long enough for the breaker's window and its minimum attempts: then it opens.
+            _         <- ZIO.sleep(1500.millis)
+            failing   <- fx.receiver.received.takeAll
+            quiet     <- fx.receiver.quiet(300)
+            _         <- fx.receiver.statuses.set(Nil)
+            refreshed <- call(fx.port, "events/subscribe", subscription(fx.url()))
+            delivered <- fx.receiver.next
+          yield assertTrue(
+            failing.size >= 3,
+            failing.size < 50,
+            quiet.isEmpty,
+            field(refreshed, "result", "deliveryStatus", "active").contains(Json.Bool(false)),
+            str(refreshed, "result", "deliveryStatus", "lastError").contains("http_5xx"),
+            delivered.str("eventId").contains("INC-1"),
+            delivered.header("webhook-id") == failing.head.header("webhook-id"),
+          )
+      ,
+      test("a verification past the POST queue is ResourceExhausted"):
+        // Two subscriptions under different locks, so the second reaches the bulkhead.
+        def stripe(key: McpWebhookKey) = (key.id.value.hashCode & Int.MaxValue) % 64
+        val owner = McpWebhookPrincipalId("https://auth.test|sub:alice")
+        ZIO.scoped:
+          for
+            fx     <- install(config = testConfig.copy(maxConcurrentPosts = 1, maxQueuedPosts = 0))
+            keyOf   = (name: String) => McpWebhookKey(owner, McpWebhookUrl.parse(fx.url(name)).toOption.get,
+                        McpEventName("incident.created"), Json.Obj("severity" -> Json.Str("P1")))
+            other   = ('b' to 'z').map(_.toString).find(n => stripe(keyOf(n)) != stripe(keyOf("a"))).get
+            _      <- fx.receiver.delay.set(1.second)
+            first  <- call(fx.port, "events/subscribe", subscription(fx.url())).fork
+            _      <- ZIO.sleep(300.millis)
+            second <- call(fx.port, "events/subscribe", subscription(fx.url(other)))
+            _      <- first.join
+          yield assertTrue(code(second).contains(-32025), str(second, "error", "data", "limit").contains("queuedPosts"))
       ,
       test("a negative ttlMs is clamped, not refused"):
         ZIO.scoped:
