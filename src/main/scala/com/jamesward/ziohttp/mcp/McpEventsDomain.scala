@@ -193,6 +193,11 @@ enum McpEventError:
     case CallbackEndpoint(reason) =>
       ErrorDetail(McpEventError.CallbackEndpointCode, "CallbackEndpointError", Some(Json.Obj("reason" -> Json.Str(reason.wire))))
 
+  /** The error as a client of `dialect` expects it. */
+  def detail(dialect: McpEventsDialect): ErrorDetail = (this, dialect) match
+    case (CallbackEndpoint(_), McpEventsDialect.ChatGpt) => detail.copy(code = McpEventError.ChatGptCallbackEndpointCode)
+    case _                                                => detail
+
 object McpEventError:
   given CanEqual[McpEventError, McpEventError] = CanEqual.derived
 
@@ -201,6 +206,8 @@ object McpEventError:
   val ResourceExhaustedCode: Int = -32025
   val UnsupportedCode: Int       = -32026
   val CallbackEndpointCode: Int  = -32027
+  /** ChatGPT's code for `CallbackEndpointError`, from the draft it implements. */
+  val ChatGptCallbackEndpointCode: Int = -32015
 
 /** The JSON shapes of the Events messages: absent optional fields are omitted. */
 private[mcp] object McpEventsWire:

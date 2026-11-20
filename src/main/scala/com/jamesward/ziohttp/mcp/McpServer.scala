@@ -230,6 +230,8 @@ final class McpServer[-R] private (
         logging = Some(Json.Obj()),
         completions = Some(Json.Obj()),
         extensions = if extensionMap.nonEmpty then Some(Json.Obj(Chunk.fromIterable(extensionMap.toSeq))) else None,
+        events = extensions.values.find(e => e.id == McpEvents.Id && e.settings.topLevel(ctx))
+          .flatMap(e => registered.get(e.id)).flatMap(_.asObject),
       )
 
   def routes: Routes[R & McpServer.State, Response] =
@@ -536,7 +538,8 @@ final class McpServer[-R] private (
                       dispatchMethod(id, dm, ProtocolVersion.default, params, principal, pathParams,
                         statelessHandleToolsCall(request, ProtocolVersion.default, _, _, principal, pathParams))
                     case None =>
-                      val ctx = McpRequestContext(ProtocolVersion.default, callerPrincipal = principal, callerPathParams = pathParams, id = Some(id))
+                      val ctx = McpRequestContext(ProtocolVersion.default, callerPrincipal = principal, callerPathParams = pathParams, id = Some(id),
+                        agent = request.rawHeader("user-agent"))
                       dispatchExtension(request, id, method, ProtocolVersion.default, params, ctx, httpBinding)
         case JsonRpcMessage.Notification(method, params) =>
           ZIO.logAnnotate(
@@ -576,6 +579,7 @@ final class McpServer[-R] private (
    * calls are answered with a single augmented JSON result.
    */
   private def modernRequestContext(
+    request: Request,
     id: RequestId,
     version: ProtocolVersion,
     params: Option[Json.Obj],
@@ -595,6 +599,7 @@ final class McpServer[-R] private (
       pathParams,
       parsedCapabilities.invalid,
       Some(id),
+      request.rawHeader("user-agent"),
     )
 
   private def dispatchModern(
@@ -608,7 +613,7 @@ final class McpServer[-R] private (
     stateStore: McpRequestStateStore,
     httpBinding: Boolean = true,
   ): ZIO[R, Response, Response] =
-    val ctx = modernRequestContext(id, version, params, principal, pathParams)
+    val ctx = modernRequestContext(request, id, version, params, principal, pathParams)
     (McpDispatchMethod.parse(method), taskRuntime) match
       case (Some(McpDispatchMethod.TasksGet), Some(tasks))    => handleTasksGet(id, params, principal, tasks)
       case (Some(McpDispatchMethod.TasksCancel), Some(tasks)) => handleTasksCancel(id, params, principal, tasks)
@@ -1221,6 +1226,7 @@ final class McpServer[-R] private (
                 pathParams,
                 client.extensionCapabilityErrors,
                 Some(id),
+                request.rawHeader("user-agent"),
               )
               McpDispatchMethod.parse(method) match
                 case Some(dm) =>

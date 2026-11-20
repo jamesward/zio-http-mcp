@@ -126,10 +126,18 @@ object McpWebhooksSpec extends ZIOSpecDefault:
 
   private val Modern = ProtocolVersion.V2026_07_28.wire
 
-  private def call(port: Int, method: String, params: Json.Obj, token: Option[String] = Some("alice")): ZIO[Client & Scope, Throwable, Json.Obj] =
+  private def call(
+    port: Int,
+    method: String,
+    params: Json.Obj,
+    token: Option[String] = Some("alice"),
+    userAgent: Option[String] = None,
+    declaresEvents: Boolean = true,
+  ): ZIO[Client & Scope, Throwable, Json.Obj] =
+    val extensions = if declaresEvents then Json.Obj(McpEvents.Id.value -> Json.Obj()) else Json.Obj()
     val meta = Json.Obj(
       McpMeta.ProtocolVersion    -> Json.Str(Modern),
-      McpMeta.ClientCapabilities -> Json.Obj("extensions" -> Json.Obj(McpEvents.Id.value -> Json.Obj())),
+      McpMeta.ClientCapabilities -> Json.Obj("extensions" -> extensions),
     )
     val body = s"""{"jsonrpc":"2.0","id":7,"method":"$method","params":${(Json.Obj(params.fields :+ ("_meta" -> (meta: Json))): Json).toJson}}"""
     val base = Request.post(URL.decode(s"http://localhost:$port/mcp").toOption.get, Body.fromString(body))
@@ -139,7 +147,8 @@ object McpWebhooksSpec extends ZIOSpecDefault:
       .addHeader(Negotiation.MethodHeader, method)
     val named = params.get("name").flatMap(_.asString).fold(base)(n => base.addHeader(Negotiation.NameHeader, n))
     val authed = token.fold(named)(t => named.addHeader(Header.Authorization.Bearer(t)))
-    ZClient.batched(authed).flatMap(_.body.asString).flatMap(s => ZIO.fromEither(s.fromJson[Json.Obj]).mapError(RuntimeException(_)))
+    val agent = userAgent.fold(authed)(ua => authed.removeHeader("user-agent").addHeader("user-agent", ua))
+    ZClient.batched(agent).flatMap(_.body.asString).flatMap(s => ZIO.fromEither(s.fromJson[Json.Obj]).mapError(RuntimeException(_)))
 
   private def subscription(
     url: String,
@@ -162,6 +171,29 @@ object McpWebhooksSpec extends ZIOSpecDefault:
     path.foldLeft(Option(json))((acc, key) => acc.flatMap(_.asObject).flatMap(_.get(key)))
   private def str(json: Json, path: String*): Option[String] = field(json, path*).flatMap(_.asString)
   private def code(m: Json.Obj): Option[Int] = field(m, "error", "code").flatMap(_.asNumber).map(_.value.intValue)
+
+  /** A 2025 session, as ChatGPT opens one: `initialize`, then requests with its session id. */
+  final case class Session(port: Int, id: String, userAgent: String, capabilities: Json.Obj):
+    def call(method: String, params: Json.Obj): ZIO[Client & Scope, Throwable, Json.Obj] =
+      legacyPost(port, Some(id), userAgent, s"""{"jsonrpc":"2.0","id":2,"method":"$method","params":${params.toJson}}""").map(_._2)
+
+  private def legacyPost(port: Int, session: Option[String], userAgent: String, body: String): ZIO[Client & Scope, Throwable, (Response, Json.Obj)] =
+    val base = Request.post(URL.decode(s"http://localhost:$port/mcp").toOption.get, Body.fromString(body))
+      .addHeader(Header.ContentType(MediaType.application.json))
+      .addHeader("accept", "application/json, text/event-stream")
+      .removeHeader("user-agent").addHeader("user-agent", userAgent)
+    ZClient.batched(session.fold(base)(s => base.addHeader("mcp-session-id", s))).flatMap: response =>
+      response.body.asString.flatMap: text =>
+        // An SSE answer carries the message on its data line.
+        val json = text.linesIterator.find(_.startsWith("data:")).map(_.drop(5).trim).getOrElse(text)
+        ZIO.fromEither(json.fromJson[Json.Obj]).mapError(RuntimeException(_)).map(response -> _)
+
+  private def initialize(port: Int, clientName: String): ZIO[Client & Scope, Throwable, Session] =
+    val userAgent = s"$clientName/1.0"
+    legacyPost(port, None, userAgent,
+      s"""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"$clientName","version":"1.0.0"}}}""")
+      .map((response, json) => Session(port, response.rawHeader("mcp-session-id").get, userAgent,
+        field(json, "result", "capabilities").flatMap(_.asObject).get))
 
   /** Subscribe, and take the verification POST that comes with a first subscription. */
   private def subscribed(fx: Fixture, params: Json.Obj): ZIO[Client & Scope, Throwable, (Json.Obj, Received)] =
@@ -425,6 +457,72 @@ object McpWebhooksSpec extends ZIOSpecDefault:
             str(rotated, "result", "id") == str(first, "result", "id"),
             both.signedWith(secretA),
             both.signedWith(secretB),
+          )
+      ,
+    ),
+    suite("ChatGPT")(
+      test("on a 2025 session ChatGPT sees capabilities.events, subscribes anonymously, and gets its dialect's deliveries"):
+        ZIO.scoped:
+          for
+            fx           <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            session      <- initialize(fx.port, "openai-mcp")
+            listed       <- session.call("events/list", Json.Obj())
+            result       <- session.call("events/subscribe", subscription(fx.url()))
+            verification <- fx.receiver.next
+            _            <- fx.incidents.emit(Incident("INC-7", "P1"), eventId = Some("INC-7"))
+            delivery     <- fx.receiver.next
+            revoked      <- session.call("events/subscribe", subscription(fx.url("r"), name = "revoked", arguments = Json.Obj()))
+            _            <- fx.receiver.next
+            // The check function ends it; ChatGPT doesn't take a terminated envelope, so none is sent.
+            _            <- ZIO.sleep(400.millis)
+            after        <- fx.receiver.received.takeAll
+            stored       <- fx.store.all
+          yield assertTrue(
+            session.capabilities.get("events").contains(Json.Obj()),
+            field(listed, "result", "events").flatMap(_.asArray).exists(_.nonEmpty),
+            str(result, "result", "id").isDefined,
+            verification.kind.contains("verification"),
+            delivery.header("webhook-id").contains("INC-7"),
+            delivery.signedWith(secretA),
+            str(revoked, "result", "id").isDefined,
+            after.isEmpty,
+            stored.map(_.key.name.value) == Chunk("incident.created"),
+            stored.forall(_.dialect == McpEventsDialect.ChatGpt),
+          )
+      ,
+      test("ChatGPT gets -32015 for a callback endpoint error"):
+        ZIO.scoped:
+          for
+            fx      <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            _       <- fx.receiver.echo.set(false)
+            session <- initialize(fx.port, "openai-mcp")
+            result  <- session.call("events/subscribe", subscription(fx.url()))
+          yield assertTrue(code(result).contains(-32015), str(result, "error", "data", "reason").contains("challenge_failed"))
+      ,
+      test("any other client on a 2025 session gets the spec: no capabilities.events, and no events methods"):
+        ZIO.scoped:
+          for
+            fx      <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            session <- initialize(fx.port, "other-client")
+            listed  <- session.call("events/list", Json.Obj())
+          yield assertTrue(session.capabilities.get("events").isEmpty, code(listed).contains(-32601))
+      ,
+      test("on 2026-07-28, ChatGPT is known by its User-Agent, until it declares the extension"):
+        ZIO.scoped:
+          for
+            fx       <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            draft    <- call(fx.port, "server/discover", Json.Obj(), token = None, userAgent = Some("openai-mcp/1.0"),
+                          declaresEvents = false)
+            declared <- call(fx.port, "server/discover", Json.Obj(), token = None, userAgent = Some("openai-mcp/1.0"))
+            other    <- call(fx.port, "server/discover", Json.Obj(), token = None, declaresEvents = false)
+            _        <- fx.receiver.echo.set(false)
+            failed   <- call(fx.port, "events/subscribe", subscription(fx.url()), token = None, userAgent = Some("openai-mcp/1.0"))
+          yield assertTrue(
+            field(draft, "result", "capabilities", "events").contains(Json.Obj()),
+            field(draft, "result", "capabilities", "extensions", McpEvents.Id.value).isDefined,
+            field(declared, "result", "capabilities", "events").isEmpty,
+            field(other, "result", "capabilities", "events").isEmpty,
+            code(failed).contains(-32027),
           )
       ,
     ),

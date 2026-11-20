@@ -14,6 +14,41 @@ import scala.util.Try
 
 // --- MCP Events extension, webhook delivery (SEP-3415): the domain ---
 
+/** Which version of the Events extension a client speaks. */
+enum McpEventsDialect:
+  /** SEP-3415 as accepted. */
+  case Spec
+  /**
+   * The draft ChatGPT implements (developers.openai.com/plugins/build/mcp-events):
+   * it reads `capabilities.events`, calls the events methods on 2025 sessions
+   * too, expects `-32015` for a callback endpoint error and `webhook-id` equal
+   * to the body's `eventId`, and doesn't take `gap` or `terminated` envelopes.
+   */
+  case ChatGpt
+
+object McpEventsDialect:
+  given CanEqual[McpEventsDialect, McpEventsDialect] = CanEqual.derived
+
+  /**
+   * ChatGPT's dialect for a client that calls itself `openai-mcp` (its
+   * `clientInfo` name or `User-Agent`), unless it declares the extension
+   * (`io.modelcontextprotocol/events`) in its capabilities, as a client that
+   * follows SEP-3415 may: that one, and every other client, gets the spec.
+   */
+  val auto: McpRequestContext => McpEventsDialect = ctx =>
+    if ctx.extensionCapabilities.contains(McpEvents.Id) then Spec
+    else if isChatGpt(ctx) then ChatGpt
+    else Spec
+
+  /** The spec for every client. */
+  val spec: McpRequestContext => McpEventsDialect = _ => Spec
+
+  def isChatGpt(ctx: McpRequestContext): Boolean =
+    ctx.clientInfo.exists(_.name.equalsIgnoreCase(ChatGptClient)) ||
+      ctx.userAgent.exists(_.toLowerCase.startsWith(ChatGptClient))
+
+  private val ChatGptClient = "openai-mcp"
+
 /** A webhook callback URL: absolute `http` or `https`, with a host and no credentials or fragment.
   * Whether `http` is accepted is the server's [[McpWebhookTargets]] policy. */
 opaque type McpWebhookUrl = URI
@@ -125,6 +160,7 @@ object McpWebhookPreviousSecret:
  * @param cursor        the delivery watermark: what it was subscribed from, and,
  *                      in a durable store, kept up to date, so delivery resumes
  *                      from it after a restart
+ * @param dialect       how deliveries are made: the dialect of the client's last subscribe
  */
 final case class McpWebhookSubscription(
   key: McpWebhookKey,
@@ -133,6 +169,7 @@ final case class McpWebhookSubscription(
   principal: Option[Principal],
   refreshBefore: Option[Instant],
   cursor: Option[McpEventCursor],
+  dialect: McpEventsDialect = McpEventsDialect.Spec,
 ):
   def id: McpWebhookSubscriptionId = key.id
   def isExpired(now: Instant): Boolean = refreshBefore.exists(!_.isAfter(now))

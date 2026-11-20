@@ -447,9 +447,11 @@ object McpEvents:
 
   private def routing(name: McpEventName): Option[McpRoutingName] = McpRoutingName.parse(name.value).toOption
 
+  // `events/list`, `events/subscribe` and `events/unsubscribe` are bound for
+  // every revision so that ChatGPT can call them on a 2025 session; for any
+  // other client they answer only 2026-07-28 requests (see `revision`).
   val listOperation: McpOperation[McpEventsListParams, McpEventsListResult] =
-    McpOperation.wire(Id, ListMethod, McpEventsWire.listParams, McpEventsWire.listResult,
-      protocolSupport = ProtocolSupport.Modern)
+    McpOperation.wire(Id, ListMethod, McpEventsWire.listParams, McpEventsWire.listResult)
 
   val pollOperation: McpOperation[McpEventsPollParams, McpEventsPollResult] =
     McpOperation.wire(Id, PollMethod, McpEventsWire.pollParams, McpEventsWire.pollResult,
@@ -463,12 +465,12 @@ object McpEvents:
 
   val subscribeOperation: McpOperation[McpEventsSubscribeParams, McpEventsSubscribeResult] =
     McpOperation.wire(Id, SubscribeMethod, McpEventsWire.subscribeParams, McpEventsWire.subscribeResult,
-      protocolSupport = ProtocolSupport.Modern, routingName = p => routing(p.name),
+      routingName = p => routing(p.name),
       routingHeader = McpRoutingHeader.Required)
 
   val unsubscribeOperation: McpOperation[McpEventsUnsubscribeParams, Unit] =
     McpOperation.wire(Id, UnsubscribeMethod, McpEventsWire.unsubscribeParams, McpEventsWire.unsubscribeResult,
-      protocolSupport = ProtocolSupport.Modern, routingName = p => routing(p.name),
+      routingName = p => routing(p.name),
       routingHeader = McpRoutingHeader.Required)
 
   def apply[R](handlers: McpEventHandler[R]*): Either[McpEventsError, McpExtensions[R]] =
@@ -476,7 +478,8 @@ object McpEvents:
 
   def withHeartbeat[R](heartbeat: Duration)(handlers: McpEventHandler[R]*): Either[McpEventsError, McpExtensions[R]] =
     unique(handlers).map: byName =>
-      eventsExtension(Chunk(listBound(Chunk.fromIterable(handlers).map(_.descriptor)), pollBound(byName), streamBound(byName, heartbeat)))
+      eventsExtension(Chunk(listBound(Chunk.fromIterable(handlers).map(_.descriptor), McpEventsDialect.spec),
+        pollBound(byName), streamBound(byName, heartbeat)), McpEventsDialect.spec)
 
   /**
    * The Events extension with webhook delivery too, for every event type that
@@ -503,8 +506,8 @@ object McpEvents:
         if McpWebhookRuntime.offersWebhook(h.descriptor) then
           h.descriptor.copy(delivery = h.descriptor.delivery :+ McpEventDelivery.Webhook)
         else h.descriptor
-      eventsExtension(Chunk(listBound(descriptors), pollBound(byName), streamBound(byName, heartbeat),
-        subscribeBound(runtime), unsubscribeBound(runtime)))
+      eventsExtension(Chunk(listBound(descriptors, config.dialect), pollBound(byName), streamBound(byName, heartbeat),
+        subscribeBound(runtime), unsubscribeBound(runtime)), config.dialect)
 
   private def unique[R](handlers: Seq[McpEventHandler[R]]): Either[McpEventsError, Map[McpEventName, McpEventHandler[R]]] =
     val all = Chunk.fromIterable(handlers)
@@ -512,22 +515,36 @@ object McpEvents:
       case Some(name) => Left(McpEventsError.DuplicateEventName(name))
       case None       => Right(all.map(h => h.name -> h).toMap)
 
-  private def eventsExtension[R](operations: Chunk[McpBoundOperation[R]]): McpExtensions[R] =
-    McpExtensions.trustedVertical(McpServerExtension(Id, operations, Json.Obj()))
+  private def eventsExtension[R](operations: Chunk[McpBoundOperation[R]], dialect: McpRequestContext => McpEventsDialect)
+    : McpExtensions[R] =
+    val settings = new McpExtensionSettings[Any]:
+      def resolve(ctx: McpRequestContext): UIO[Json] = ZIO.succeed(Json.Obj())
+      override def topLevel(ctx: McpRequestContext): Boolean = dialect(ctx) == McpEventsDialect.ChatGpt
+    McpExtensions.trustedVertical(McpServerExtension(Id, operations, settings))
+
+  /** Refuse a legacy (2025) request, as an unknown method, unless it is from a client of ChatGPT's dialect. */
+  private def revision(ctx: McpRequestContext, dialect: McpRequestContext => McpEventsDialect): IO[McpMethodError, Unit] =
+    ZIO.fail(McpMethodError.UnsupportedProtocol(ctx.protocolVersion))
+      .unless(ctx.protocolVersion.isStateless || dialect(ctx) == McpEventsDialect.ChatGpt).unit
 
   /** The occurrences of a read, then its end position. */
   private[mcp] def delivered(read: McpEventRead): Chunk[McpEventPush] =
     read.events.map(e => McpEventPush.Signal(McpEventSignal.Event(e))) :+ McpEventPush.Position(read.end)
 
-  private def listBound(descriptors: Chunk[McpEventDescriptor]): McpBoundOperation[Any] =
-    McpBoundOperation(listOperation): (_, _) =>
-      ZIO.succeed(McpEventsListResult(descriptors))
+  private def listBound(descriptors: Chunk[McpEventDescriptor], dialect: McpRequestContext => McpEventsDialect)
+    : McpBoundOperation[Any] =
+    McpBoundOperation(listOperation): (_, ctx) =>
+      revision(ctx, dialect).as(McpEventsListResult(descriptors))
 
   private def subscribeBound[R](runtime: McpWebhookRuntime[R]): McpBoundOperation[Any] =
-    McpBoundOperation(subscribeOperation)((params, ctx) => runtime.subscribe(params, ctx).mapError(methodError))
+    McpBoundOperation(subscribeOperation): (params, ctx) =>
+      revision(ctx, runtime.config.dialect) *>
+        runtime.subscribe(params, ctx).mapError(e => methodError(e, runtime.config.dialect(ctx)))
 
   private def unsubscribeBound[R](runtime: McpWebhookRuntime[R]): McpBoundOperation[Any] =
-    McpBoundOperation(unsubscribeOperation)((params, ctx) => runtime.unsubscribe(params, ctx).mapError(methodError))
+    McpBoundOperation(unsubscribeOperation): (params, ctx) =>
+      revision(ctx, runtime.config.dialect) *>
+        runtime.unsubscribe(params, ctx).mapError(e => methodError(e, runtime.config.dialect(ctx)))
 
   private def pollBound[R](handlers: Map[McpEventName, McpEventHandler[R]]): McpBoundOperation[R] =
     McpBoundOperation(pollOperation): (params, ctx) =>
@@ -537,7 +554,7 @@ object McpEvents:
             // A poll result carries its cursor on the result, not on each event.
             McpEventsPollResult(read.events.map(_.copy(cursor = None)), read.end, read.truncated, read.hasMore,
               h.pollInterval.toMillis)
-      .mapError(methodError)
+      .mapError(methodError(_))
 
   private def streamBound[R](handlers: Map[McpEventName, McpEventHandler[R]], heartbeat: Duration): McpBoundOperation[R] =
     McpBoundOperation.streaming(streamOperation): (params, ctx) =>
@@ -555,7 +572,7 @@ object McpEvents:
           signals.mergeHaltLeft(heartbeats).map(McpEventsWire.notification(_, ctx.requestId)),
           McpEventsStreamResult(ctx.requestId),
         )
-      ).mapError(methodError)
+      ).mapError(methodError(_))
 
   private def track(position: Ref[Option[McpEventCursor]], signal: McpEventSignal): UIO[Unit] =
     signal match
@@ -571,6 +588,6 @@ object McpEvents:
     ZIO.fromOption(handlers.get(name)).orElseFail(McpEventError.NotFound(name)).filterOrFail(_.descriptor.delivery.contains(mode))(
       McpEventError.Unsupported("deliveryMode", Some(mode.wire)))
 
-  private def methodError(error: McpEventError): McpMethodError =
-    val detail = error.detail
+  private def methodError(error: McpEventError, dialect: McpEventsDialect = McpEventsDialect.Spec): McpMethodError =
+    val detail = error.detail(dialect)
     McpMethodError.Domain(detail.code, detail.message, detail.data)

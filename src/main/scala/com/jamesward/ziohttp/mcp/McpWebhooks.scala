@@ -84,6 +84,9 @@ object McpWebhookTargets:
  *                        refresh takes effect only after the endpoint verifies it
  *                        (the challenge is signed with it), and every new anonymous
  *                        subscription is verified, without the per-URL cache.
+ * @param dialect         which version of the extension a request's client speaks:
+ *                        by default ChatGPT's draft for ChatGPT, until it declares
+ *                        the spec's extension, and the spec for everyone else
  */
 final case class McpWebhookConfig(
   maxTtl: Duration = 1.hour,
@@ -98,6 +101,7 @@ final case class McpWebhookConfig(
   targets: McpWebhookTargets = McpWebhookTargets.public,
   preVerified: McpWebhookUrl => Boolean = _ => false,
   anonymous: Boolean = false,
+  dialect: McpRequestContext => McpEventsDialect = McpEventsDialect.auto,
 ):
   /** The lifetime granted for a suggestion: `None` for no expiry. */
   def grant(ttl: McpWebhookTtl, durable: Boolean): Option[Duration] = ttl match
@@ -210,7 +214,7 @@ private[mcp] final case class McpWebhookRuntime[R](
       refreshBefore       = config.grant(params.ttl, store.durable).map(now.plus(_))
       live               <- workers.get.map(_.get(key.id))
       result             <- live match
-                              case Some(worker) => refresh(worker, key, params.secret, refreshBefore)
+                              case Some(worker) => refresh(worker, key, params.secret, refreshBefore, config.dialect(ctx))
                               case None         => create(handler, key, principal, params, refreshBefore, ctx)
     yield result
 
@@ -250,7 +254,8 @@ private[mcp] final case class McpWebhookRuntime[R](
       case None if config.anonymous => ZIO.succeed(None -> McpWebhookPrincipalId.Anonymous)
       case None => ZIO.fail(McpEventError.Forbidden("Webhook subscriptions need an authenticated caller"))
 
-  private def refresh(worker: Worker, key: McpWebhookKey, secret: McpWebhookSecret, refreshBefore: Option[Instant])
+  private def refresh(worker: Worker, key: McpWebhookKey, secret: McpWebhookSecret, refreshBefore: Option[Instant],
+    dialect: McpEventsDialect)
     : IO[McpEventError, McpEventsSubscribeResult] =
     for
       current <- worker.state.get.map(_.subscription.secret)
@@ -262,7 +267,8 @@ private[mcp] final case class McpWebhookRuntime[R](
                    val previous =
                      if sub.secret == secret then sub.previousSecret
                      else Some(McpWebhookPreviousSecret(sub.secret, now.plus(config.secretGrace)))
-                   s.copy(subscription = sub.copy(secret = secret, previousSecret = previous, refreshBefore = refreshBefore),
+                   s.copy(subscription = sub.copy(secret = secret, previousSecret = previous, refreshBefore = refreshBefore,
+                     dialect = dialect),
                      status = s.status.copy(active = true))
       _       <- store.put(updated.subscription).storeFailure("events/subscribe", updated.subscription.id)
     yield McpEventsSubscribeResult(updated.subscription.id, refreshBefore, updated.watermark, truncated = false,
@@ -279,12 +285,13 @@ private[mcp] final case class McpWebhookRuntime[R](
     for
       pushes  <- handler.push(params.arguments, params.cursor, params.maxAgeMs.map(Duration.fromMillis), ctx).provideEnvironment(env)
       _       <- verify(key, params.secret, refreshBefore)
-      sub      = McpWebhookSubscription(key, params.secret, None, principal.map(_.copy(raw = "")), refreshBefore, params.cursor)
+      sub      = McpWebhookSubscription(key, params.secret, None, principal.map(_.copy(raw = "")), refreshBefore, params.cursor,
+                   config.dialect(ctx))
       _       <- store.put(sub).storeFailure("events/subscribe", key.id)
       started <- install(sub, pushes, resumed = false)
       result  <- started match
                    // Another subscribe for the same key got there first: this one refreshes it.
-                   case Left(existing) => refresh(existing, key, params.secret, refreshBefore)
+                   case Left(existing) => refresh(existing, key, params.secret, refreshBefore, config.dialect(ctx))
                    case Right(first)   =>
                      first.await.map((cursor, truncated) => McpEventsSubscribeResult(key.id, refreshBefore, cursor, truncated))
     yield result
@@ -369,7 +376,8 @@ private[mcp] final case class McpWebhookRuntime[R](
           val gap = !initial || (resumed && truncated)
           (send(state, "gap", McpEventsWire.webhookGap(cursor)).when(gap) *> advance(state, cursor)).as(true)
       case McpEventPush.Signal(McpEventSignal.Event(occurrence)) =>
-        (send(state, "event", McpEventsWire.webhookEvent(occurrence)) *> advance(state, occurrence.cursor)).as(true)
+        (send(state, "event", McpEventsWire.webhookEvent(occurrence), Some(occurrence.eventId)) *>
+          advance(state, occurrence.cursor)).as(true)
       case McpEventPush.Signal(McpEventSignal.Error(error)) =>
         state.get.flatMap(s => ZIO.logWarning(s"Webhook subscription ${s.subscription.id}: ${error.message}")).as(true)
       case McpEventPush.Signal(McpEventSignal.Terminated(error)) =>
@@ -391,7 +399,7 @@ private[mcp] final case class McpWebhookRuntime[R](
         .when(moved && store.durable).unit
 
   /** POST one message, retrying it after each of `config.retryDelays` until the endpoint takes it. */
-  private def send(state: Ref[WorkerState], kind: String, body: Json.Obj): UIO[Unit] =
+  private def send(state: Ref[WorkerState], kind: String, body: Json.Obj, eventId: Option[String] = None): UIO[Unit] =
     val bytes = body.toJson.getBytes(UTF_8)
     def attempt(messageId: String, delays: List[Duration]): UIO[Unit] =
       for
@@ -412,10 +420,17 @@ private[mcp] final case class McpWebhookRuntime[R](
                            case delay :: rest => attempt(messageId, rest).delay(delay)
                            case Nil => ZIO.logWarning(s"Webhook delivery $messageId to ${sub.id} given up: ${failure.wire}"))
       yield ()
-    if bytes.length > MaxBody then
-      state.get.flatMap(s => ZIO.logWarning(s"Webhook $kind for ${s.subscription.id} is over $MaxBody bytes: not sent"))
-    else
-      randomToken(18).flatMap(r => attempt(if kind == "event" then s"msg_$r" else s"msg_${kind}_$r", config.retryDelays.toList))
+    state.get.map(_.subscription).flatMap: sub =>
+      val chatGpt = sub.dialect == McpEventsDialect.ChatGpt
+      if bytes.length > MaxBody then
+        ZIO.logWarning(s"Webhook $kind for ${sub.id} is over $MaxBody bytes: not sent")
+      else if chatGpt && kind != "event" then
+        ZIO.logInfo(s"Webhook $kind for ${sub.id} not sent: ChatGPT doesn't take $kind envelopes")
+      else
+        // ChatGPT wants the event's own id as the webhook-id; SEP-3415 a fresh one.
+        val own = eventId.filter(id => chatGpt && HeaderSafe.matches(id))
+        randomToken(18).flatMap: r =>
+          attempt(own.getOrElse(if kind == "event" then s"msg_$r" else s"msg_${kind}_$r"), config.retryDelays.toList)
 
   /** Delete the subscription; and forget its worker, if it is still `token`'s. */
   private def end(id: McpWebhookSubscriptionId, token: Option[UUID]): UIO[Unit] =
@@ -434,6 +449,9 @@ private[mcp] object McpWebhookRuntime:
 
   /** Webhook delivery reads an event type's push stream, so it is offered where push is. */
   def offersWebhook(descriptor: McpEventDescriptor): Boolean = descriptor.delivery.contains(McpEventDelivery.Push)
+
+  /** What a `webhook-id` may hold. */
+  private val HeaderSafe = "[A-Za-z0-9_-]{1,200}".r
 
   /** SEP-3415's limit for a delivery body. */
   val MaxBody: Int = 256 * 1024

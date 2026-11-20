@@ -172,6 +172,9 @@ case class ServerCapabilities(
   // Extension capabilities (SEP-2133), keyed by reverse-domain extension id,
   // e.g. {"io.modelcontextprotocol/skills": {"directoryRead": true}}.
   extensions: Option[Json.Obj] = None,
+  // The Events extension's settings where ChatGPT reads them, from the draft it
+  // implements; SEP-3415 puts them under `extensions` only.
+  events: Option[Json.Obj] = None,
 )
 
 object ServerCapabilities:

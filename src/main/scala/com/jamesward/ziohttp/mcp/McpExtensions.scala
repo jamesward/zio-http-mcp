@@ -6,6 +6,10 @@ import zio.json.ast.Json
 trait McpExtensionSettings[-R]:
   def resolve(ctx: McpRequestContext): URIO[R, Json]
 
+  /** Whether the settings also go at the top level of the capabilities, for a
+    * client that reads a pre-extension draft there (only `events` is). */
+  def topLevel(ctx: McpRequestContext): Boolean = false
+
 object McpExtensionSettings:
   def static(value: Json): McpExtensionSettings[Any] =
     (_: McpRequestContext) => ZIO.succeed(value)
