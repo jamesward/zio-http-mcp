@@ -487,7 +487,9 @@ object McpWebhooksSpec extends ZIOSpecDefault:
             stored       <- fx.store.all
           yield assertTrue(
             session.capabilities.get("events").contains(Json.Obj()),
-            field(listed, "result", "events").flatMap(_.asArray).exists(_.nonEmpty),
+            // ChatGPT is offered webhook delivery only, and the poll-only type not at all.
+            field(listed, "result", "events").flatMap(_.asArray).exists(es => es.nonEmpty &&
+              es.forall(e => field(e, "delivery").map(_.toJson).contains("""["webhook"]"""))),
             str(result, "result", "id").isDefined,
             verification.kind.contains("verification"),
             delivery.header("webhook-id").contains("INC-7"),

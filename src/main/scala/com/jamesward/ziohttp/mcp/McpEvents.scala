@@ -550,9 +550,23 @@ object McpEvents:
     : McpBoundOperation[Any] =
     McpBoundOperation(listOp(ProtocolSupport.All)): (_, ctx) =>
       McpWebhookLog.fields(McpWebhookLog.caller(ctx, dialect(ctx))*)(
-        revision(ctx, dialect) *>
-          McpWebhookLog.fields("events" -> descriptors.map(d => s"${d.name.value}[${d.delivery.map(_.wire).mkString(",")}]").mkString(" "))(
-            ZIO.logInfo("events/list")).as(McpEventsListResult(descriptors)))
+        revision(ctx, dialect) *> {
+          val listed = forDialect(descriptors, dialect(ctx))
+          McpWebhookLog.fields("events" -> listed.map(d => s"${d.name.value}[${d.delivery.map(_.wire).mkString(",")}]").mkString(" "))(
+            ZIO.logInfo("events/list")).as(McpEventsListResult(listed))
+        })
+
+  /**
+   * ChatGPT takes only webhook delivery, and its own examples list only that:
+   * for its dialect an event type offers webhook alone, and one without webhook
+   * isn't listed.
+   */
+  private[mcp] def forDialect(descriptors: Chunk[McpEventDescriptor], dialect: McpEventsDialect): Chunk[McpEventDescriptor] =
+    dialect match
+      case McpEventsDialect.Spec    => descriptors
+      case McpEventsDialect.ChatGpt =>
+        descriptors.filter(_.delivery.contains(McpEventDelivery.Webhook))
+          .map(_.copy(delivery = NonEmptyChunk(McpEventDelivery.Webhook)))
 
   private def subscribeBound[R](runtime: McpWebhookRuntime[R]): McpBoundOperation[Any] =
     McpBoundOperation(subscribeOp(ProtocolSupport.All)): (params, ctx) =>
