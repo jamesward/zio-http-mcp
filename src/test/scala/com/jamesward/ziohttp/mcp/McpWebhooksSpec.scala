@@ -39,6 +39,8 @@ object McpWebhooksSpec extends ZIOSpecDefault:
     expiryCheck = 100.millis,
     targets = McpWebhookTargets.unrestricted,
   )
+  private val knownClients = testConfig.copy(compatibility = McpEventsCompatibility.KnownClients)
+  private val knownAnonymous = knownClients.copy(anonymous = true)
 
   // --- the receiving end ---
 
@@ -141,19 +143,23 @@ object McpWebhooksSpec extends ZIOSpecDefault:
     token: Option[String] = Some("alice"),
     userAgent: Option[String] = None,
     declaresEvents: Boolean = true,
+    mcpName: Option[Option[String]] = None,
+    clientName: Option[String] = None,
   ): ZIO[Client & Scope, Throwable, Json.Obj] =
     val extensions = if declaresEvents then Json.Obj(McpEvents.Id.value -> Json.Obj()) else Json.Obj()
-    val meta = Json.Obj(
+    val meta = Json.Obj(Chunk[(String, Json)](
       McpMeta.ProtocolVersion    -> Json.Str(Modern),
       McpMeta.ClientCapabilities -> Json.Obj("extensions" -> extensions),
-    )
+    ) ++ Chunk.fromIterable(clientName.map(n =>
+      McpMeta.ClientInfo -> Json.Obj("name" -> Json.Str(n), "version" -> Json.Str("1.0.0")))))
     val body = s"""{"jsonrpc":"2.0","id":7,"method":"$method","params":${(Json.Obj(params.fields :+ ("_meta" -> (meta: Json))): Json).toJson}}"""
     val base = Request.post(URL.decode(s"http://localhost:$port/mcp").toOption.get, Body.fromString(body))
       .addHeader(Header.ContentType(MediaType.application.json))
       .addHeader("accept", "application/json, text/event-stream")
       .addHeader(Negotiation.ProtocolVersionHeader, Modern)
       .addHeader(Negotiation.MethodHeader, method)
-    val named = params.get("name").flatMap(_.asString).fold(base)(n => base.addHeader(Negotiation.NameHeader, n))
+    // The Mcp-Name header: params.name by default; `mcpName` overrides it, `Some(None)` leaving it out.
+    val named = mcpName.getOrElse(params.get("name").flatMap(_.asString)).fold(base)(n => base.addHeader(Negotiation.NameHeader, n))
     val authed = token.fold(named)(t => named.addHeader(Header.Authorization.Bearer(t)))
     val agent = userAgent.fold(authed)(ua => authed.removeHeader("user-agent").addHeader("user-agent", ua))
     ZClient.batched(agent).flatMap(_.body.asString).flatMap(s => ZIO.fromEither(s.fromJson[Json.Obj]).mapError(RuntimeException(_)))
@@ -297,6 +303,69 @@ object McpWebhooksSpec extends ZIOSpecDefault:
           rotated.signedWith(secretB),
           str(other, "result", "id").exists(_ != str(first, "result", "id").get),
           extra.isEmpty,
+        )
+    ,
+    test("the challenge and webhook-ids don't come from ZIO's Random, which is not a secure source"):
+      ZIO.scoped:
+        for
+          fx                <- install()
+          _                 <- TestRandom.feedBytes(Chunk.fill(64)(0.toByte), Chunk.fill(64)(0.toByte), Chunk.fill(64)(0.toByte))
+          (_, verification) <- subscribed(fx, subscription(fx.url()))
+          _                 <- fx.incidents.emit(Incident("INC-5", "P1"))
+          delivery          <- fx.receiver.next
+        yield
+          val zeros = "AAAAAAAAAAAAAAAAAAAAAAAA"
+          assertTrue(
+            !verification.str("challenge").exists(_.startsWith(zeros)),
+            !verification.header("webhook-id").exists(_.contains(zeros)),
+            !delivery.header("webhook-id").exists(_.contains(zeros)),
+          )
+    ,
+    test("a client that doesn't declare the extension gets a fresh webhook-id by default, and the eventId with KnownClients"):
+      ZIO.scoped:
+        for
+          spec      <- install()
+          _         <- call(spec.port, "events/subscribe", subscription(spec.url()), declaresEvents = false)
+          _         <- spec.receiver.next
+          _         <- spec.incidents.emit(Incident("INC-3", "P1"), eventId = Some("INC-3"))
+          fresh     <- spec.receiver.next
+          known     <- install(config = knownClients)
+          result    <- call(known.port, "events/subscribe", subscription(known.url()), declaresEvents = false)
+          _         <- known.receiver.next
+          _         <- known.incidents.emit(Incident("INC-3", "P1"), eventId = Some("INC-3"))
+          delivery  <- known.receiver.next
+          stored    <- known.store.all
+        yield assertTrue(
+          fresh.header("webhook-id").exists(w => w.startsWith("msg_") && !w.contains("INC-3")),
+          str(result, "result", "id").isDefined,
+          delivery.header("webhook-id").contains("INC-3"),
+          delivery.signedWith(secretA),
+          stored.map(_.webhookId) == Chunk(McpWebhookIdFormat.EventId),
+        )
+    ,
+    test("with KnownClients, @tanstack/ai-mcp gets the eventId as its webhook-id, though it declares the extension"):
+      ZIO.scoped:
+        for
+          fx       <- install(config = knownClients)
+          _        <- call(fx.port, "events/subscribe", subscription(fx.url()), clientName = Some("tanstack-ai-mcp"))
+          _        <- fx.receiver.next
+          _        <- fx.incidents.emit(Incident("INC-4", "P1"), eventId = Some("INC-4"))
+          delivery <- fx.receiver.next
+        yield assertTrue(delivery.header("webhook-id").contains("INC-4"))
+    ,
+    test("events/subscribe needs Mcp-Name, except with KnownClients; a mismatched one is refused either way"):
+      ZIO.scoped:
+        for
+          strict     <- install()
+          missing    <- call(strict.port, "events/subscribe", subscription(strict.url()), mcpName = Some(None))
+          lenient    <- install(config = knownClients)
+          accepted   <- call(lenient.port, "events/subscribe", subscription(lenient.url()), mcpName = Some(None))
+          _          <- lenient.receiver.next
+          mismatched <- call(lenient.port, "events/subscribe", subscription(lenient.url("b")), mcpName = Some(Some("other")))
+        yield assertTrue(
+          code(missing).contains(ErrorCode.HeaderMismatch.code),
+          str(accepted, "result", "id").isDefined,
+          code(mismatched).contains(ErrorCode.HeaderMismatch.code),
         )
     ,
     test("a failed delivery is retried with the same webhook-id; 410 is not retried"):
@@ -468,11 +537,11 @@ object McpWebhooksSpec extends ZIOSpecDefault:
           )
       ,
     ),
-    suite("ChatGPT")(
+    suite("ChatGPT, with KnownClients")(
       test("on a 2025 session ChatGPT sees capabilities.events, subscribes anonymously, and gets its dialect's deliveries"):
         ZIO.scoped:
           for
-            fx           <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            fx           <- install(config = knownAnonymous, authenticated = false)
             session      <- initialize(fx.port, "openai-mcp")
             listed       <- session.call("events/list", Json.Obj())
             result       <- session.call("events/subscribe", subscription(fx.url()))
@@ -487,7 +556,9 @@ object McpWebhooksSpec extends ZIOSpecDefault:
             stored       <- fx.store.all
           yield assertTrue(
             session.capabilities.get("events").contains(Json.Obj()),
-            field(listed, "result", "events").flatMap(_.asArray).exists(_.nonEmpty),
+            // ChatGPT is offered webhook delivery only, and the poll-only type not at all.
+            field(listed, "result", "events").flatMap(_.asArray).exists(es => es.nonEmpty &&
+              es.forall(e => field(e, "delivery").map(_.toJson).contains("""["webhook"]"""))),
             str(result, "result", "id").isDefined,
             verification.kind.contains("verification"),
             delivery.header("webhook-id").contains("INC-7"),
@@ -501,7 +572,7 @@ object McpWebhooksSpec extends ZIOSpecDefault:
       test("ChatGPT gets -32015 for a callback endpoint error"):
         ZIO.scoped:
           for
-            fx      <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            fx      <- install(config = knownAnonymous, authenticated = false)
             _       <- fx.receiver.echo.set(false)
             session <- initialize(fx.port, "openai-mcp")
             result  <- session.call("events/subscribe", subscription(fx.url()))
@@ -510,15 +581,15 @@ object McpWebhooksSpec extends ZIOSpecDefault:
       test("any other client on a 2025 session gets the spec: no capabilities.events, and no events methods"):
         ZIO.scoped:
           for
-            fx      <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            fx      <- install(config = knownAnonymous, authenticated = false)
             session <- initialize(fx.port, "other-client")
             listed  <- session.call("events/list", Json.Obj())
           yield assertTrue(session.capabilities.get("events").isEmpty, code(listed).contains(-32601))
       ,
-      test("on 2026-07-28, ChatGPT is known by its User-Agent, until it declares the extension"):
+      test("on 2026-07-28, every client gets capabilities.events, and ChatGPT is known by its User-Agent until it declares the extension"):
         ZIO.scoped:
           for
-            fx       <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            fx       <- install(config = knownAnonymous, authenticated = false)
             draft    <- call(fx.port, "server/discover", Json.Obj(), token = None, userAgent = Some("openai-mcp/1.0"),
                           declaresEvents = false)
             declared <- call(fx.port, "server/discover", Json.Obj(), token = None, userAgent = Some("openai-mcp/1.0"))
@@ -528,9 +599,28 @@ object McpWebhooksSpec extends ZIOSpecDefault:
           yield assertTrue(
             field(draft, "result", "capabilities", "events").contains(Json.Obj()),
             field(draft, "result", "capabilities", "extensions", McpEvents.Id.value).isDefined,
-            field(declared, "result", "capabilities", "events").isEmpty,
-            field(other, "result", "capabilities", "events").isEmpty,
+            field(declared, "result", "capabilities", "events").contains(Json.Obj()),
+            field(other, "result", "capabilities", "events").contains(Json.Obj()),
             code(failed).contains(-32027),
+          )
+      ,
+      test("by default, ChatGPT gets the spec: no capabilities.events, -32027, and no events methods on a 2025 session"):
+        ZIO.scoped:
+          for
+            fx       <- install(config = testConfig.copy(anonymous = true), authenticated = false)
+            discover <- call(fx.port, "server/discover", Json.Obj(), token = None, userAgent = Some("openai-mcp/1.0"),
+                          declaresEvents = false)
+            _        <- fx.receiver.echo.set(false)
+            failed   <- call(fx.port, "events/subscribe", subscription(fx.url()), token = None,
+                          userAgent = Some("openai-mcp/1.0"), declaresEvents = false)
+            session  <- initialize(fx.port, "openai-mcp")
+            listed   <- session.call("events/list", Json.Obj())
+          yield assertTrue(
+            field(discover, "result", "capabilities", "events").isEmpty,
+            field(discover, "result", "capabilities", "extensions", McpEvents.Id.value).isDefined,
+            code(failed).contains(-32027),
+            session.capabilities.get("events").isEmpty,
+            code(listed).contains(-32601),
           )
       ,
     ),
@@ -636,6 +726,39 @@ object McpWebhooksSpec extends ZIOSpecDefault:
             second <- call(fx.port, "events/subscribe", subscription(fx.url(other)))
             _      <- first.join
           yield assertTrue(code(second).contains(-32025), str(second, "error", "data", "limit").contains("queuedPosts"))
+      ,
+      test("an endpoint that doesn't answer fails at deliveryTimeout, and its POST gives back its slot"):
+        ZIO.scoped:
+          for
+            fx      <- install(config = testConfig.copy(deliveryTimeout = 500.millis, maxConcurrentPosts = 1, maxQueuedPosts = 0))
+            _       <- fx.receiver.delay.set(1.minute)
+            started <- Clock.nanoTime
+            stuck   <- call(fx.port, "events/subscribe", subscription(fx.url()))
+            ended   <- Clock.nanoTime
+            _       <- fx.receiver.delay.set(Duration.Zero)
+            next    <- call(fx.port, "events/subscribe", subscription(fx.url("b")))
+          yield assertTrue(
+            code(stuck).contains(-32027),
+            str(stuck, "error", "data", "reason").contains("timeout"),
+            (ended - started) < 5.seconds.toNanos,
+            str(next, "result", "id").isDefined,
+          )
+      ,
+      test("an endpoint that sends its headers and never finishes its body fails at deliveryTimeout"):
+        ZIO.scoped:
+          for
+            fx      <- install(config = testConfig.copy(deliveryTimeout = 500.millis))
+            hanging <- Server.install(Routes(Method.POST / "hooks" / "stuck" -> handler(
+                         Response(Status.Ok, Headers(Header.ContentType(MediaType.application.json)),
+                           Body.fromStreamChunked(zio.stream.ZStream.never)))))
+            started <- Clock.nanoTime
+            stuck   <- call(fx.port, "events/subscribe", subscription(s"http://localhost:$hanging/hooks/stuck"))
+            ended   <- Clock.nanoTime
+          yield assertTrue(
+            code(stuck).contains(-32027),
+            str(stuck, "error", "data", "reason").contains("timeout"),
+            (ended - started) < 5.seconds.toNanos,
+          )
       ,
       test("a negative ttlMs is clamped, not refused"):
         ZIO.scoped:

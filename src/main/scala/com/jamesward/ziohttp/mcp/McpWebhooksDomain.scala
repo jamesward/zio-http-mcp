@@ -20,34 +20,84 @@ enum McpEventsDialect:
   case Spec
   /**
    * The draft ChatGPT implements (developers.openai.com/plugins/build/mcp-events):
-   * it reads `capabilities.events`, calls the events methods on 2025 sessions
-   * too, expects `-32015` for a callback endpoint error and `webhook-id` equal
-   * to the body's `eventId`, and doesn't take `gap` or `terminated` envelopes.
+   * it calls the events methods on 2025 sessions too, expects `-32015` for a
+   * callback endpoint error, and doesn't take `gap` or `terminated` envelopes.
+   * Its `webhook-id` is [[McpWebhookIdFormat]]'s to choose.
    */
   case ChatGpt
 
 object McpEventsDialect:
   given CanEqual[McpEventsDialect, McpEventsDialect] = CanEqual.derived
 
-  /**
-   * ChatGPT's dialect for a client that calls itself `openai-mcp` (its
-   * `clientInfo` name or `User-Agent`), unless it declares the extension
-   * (`io.modelcontextprotocol/events`) in its capabilities, as a client that
-   * follows SEP-3415 may: that one, and every other client, gets the spec.
-   */
-  val auto: McpRequestContext => McpEventsDialect = ctx =>
-    if ctx.extensionCapabilities.contains(McpEvents.Id) then Spec
-    else if isChatGpt(ctx) then ChatGpt
-    else Spec
+/**
+ * Which clients the Events extension is served for. No client known (November 2026) follows SEP-3415 in full, so
+ * each works only with `KnownClients`; each workaround names the client it is for, to be dropped once it is fixed.
+ */
+enum McpEventsCompatibility:
+  /** SEP-3415 for every client. */
+  case Spec
 
-  /** The spec for every client. */
-  val spec: McpRequestContext => McpEventsDialect = _ => Spec
+  /**
+   * The workarounds the known clients need, on top of the spec:
+   *  - ChatGPT's dialect ([[McpEventsDialect.ChatGpt]]) for a client that calls itself `openai-mcp` (its
+   *    `clientInfo` name or `User-Agent`), unless it declares the extension (`io.modelcontextprotocol/events`).
+   *  - `capabilities.events` next to the extension on 2026-07-28 sessions (and on ChatGPT's 2025 ones):
+   *    ChatGPT and `@ai-sdk/mcp` 2.0 read only it.
+   *  - The event's `eventId` as its `webhook-id` for a client that doesn't declare the extension (ChatGPT,
+   *    `@ai-sdk/mcp` 2.0), and for `@tanstack/ai-mcp` 1.3, which declares it: they refuse a delivery without it.
+   *  - Events requests without the `Mcp-Name` header, which clients on the MCP TypeScript SDK 2.4 (`@mastra/mcp`
+   *    2.10, `@ai-sdk/mcp` 2.0) don't send there. A header that doesn't match the event name is still refused.
+   */
+  case KnownClients
+
+  /** Which dialect a request's client gets. */
+  def dialect(ctx: McpRequestContext): McpEventsDialect = this match
+    case Spec         => McpEventsDialect.Spec
+    case KnownClients =>
+      if declaresEvents(ctx) || !McpEventsCompatibility.isChatGpt(ctx) then McpEventsDialect.Spec
+      else McpEventsDialect.ChatGpt
+
+  /** What a subscription made by this request's client carries as its `webhook-id`. */
+  def webhookId(ctx: McpRequestContext): McpWebhookIdFormat = this match
+    case Spec         => McpWebhookIdFormat.PerMessage
+    case KnownClients =>
+      if !declaresEvents(ctx) || McpEventsCompatibility.isTanStack(ctx) then McpWebhookIdFormat.EventId
+      else McpWebhookIdFormat.PerMessage
+
+  /** Whether `capabilities.events` goes next to the extension for this request's client. */
+  def topLevelCapability(ctx: McpRequestContext): Boolean = this match
+    case Spec         => false
+    case KnownClients => ctx.protocolVersion.isStateless || dialect(ctx) == McpEventsDialect.ChatGpt
+
+  /** Whether the events methods that name an event type need the `Mcp-Name` header over HTTP. */
+  def mcpNameHeader: McpRoutingHeader = this match
+    case Spec         => McpRoutingHeader.Required
+    case KnownClients => McpRoutingHeader.Optional
+
+  private def declaresEvents(ctx: McpRequestContext): Boolean = ctx.extensionCapabilities.contains(McpEvents.Id)
+
+object McpEventsCompatibility:
+  given CanEqual[McpEventsCompatibility, McpEventsCompatibility] = CanEqual.derived
 
   def isChatGpt(ctx: McpRequestContext): Boolean =
     ctx.clientInfo.exists(_.name.equalsIgnoreCase(ChatGptClient)) ||
       ctx.userAgent.exists(_.toLowerCase.startsWith(ChatGptClient))
 
+  private def isTanStack(ctx: McpRequestContext): Boolean = ctx.clientInfo.exists(_.name.equalsIgnoreCase(TanStackClient))
+
   private val ChatGptClient = "openai-mcp"
+  private val TanStackClient = "tanstack-ai-mcp"
+
+/** What a webhook delivery of an event carries as its `webhook-id`. Control envelopes always get a fresh one. */
+enum McpWebhookIdFormat:
+  /** The event's `eventId`, when it is header-safe, and a fresh id otherwise: what clients written before SEP-3415 made
+    * it per message expect (ChatGPT, `@ai-sdk/mcp` 2.0, `@tanstack/ai-mcp` 1.3), refusing a delivery without it. */
+  case EventId
+  /** A fresh id for each message, kept across its retries: SEP-3415. */
+  case PerMessage
+
+object McpWebhookIdFormat:
+  given CanEqual[McpWebhookIdFormat, McpWebhookIdFormat] = CanEqual.derived
 
 /** A webhook callback URL: absolute `http` or `https`, with a host and no credentials or fragment.
   * Whether `http` is accepted is the server's [[McpWebhookTargets]] policy. */
@@ -161,6 +211,7 @@ object McpWebhookPreviousSecret:
  *                      in a durable store, kept up to date, so delivery resumes
  *                      from it after a restart
  * @param dialect       how deliveries are made: the dialect of the client's last subscribe
+ * @param webhookId     what its event deliveries carry as `webhook-id`, chosen on the client's last subscribe
  */
 final case class McpWebhookSubscription(
   key: McpWebhookKey,
@@ -170,6 +221,7 @@ final case class McpWebhookSubscription(
   refreshBefore: Option[Instant],
   cursor: Option[McpEventCursor],
   dialect: McpEventsDialect = McpEventsDialect.Spec,
+  webhookId: McpWebhookIdFormat = McpWebhookIdFormat.PerMessage,
 ):
   def id: McpWebhookSubscriptionId = key.id
   def isExpired(now: Instant): Boolean = refreshBefore.exists(!_.isAfter(now))

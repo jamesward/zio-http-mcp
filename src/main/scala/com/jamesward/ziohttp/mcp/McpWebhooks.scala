@@ -11,7 +11,7 @@ import nl.vroste.rezilience.{Bulkhead, CircuitBreaker, TrippingStrategy}
 
 import java.net.{Inet4Address, Inet6Address, InetAddress, UnknownHostException}
 import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
+import java.security.{MessageDigest, SecureRandom}
 import java.time.Instant
 import java.util.{Base64, UUID}
 import javax.crypto.Mac
@@ -109,9 +109,9 @@ object McpWebhookTargets:
  * @param maxConcurrentPosts the most webhook POSTs in flight at once, across all subscriptions
  * @param maxQueuedPosts  the most POSTs waiting for one of those slots; a delivery past it waits and tries again,
  *                        and a verification past it is `ResourceExhausted`
- * @param dialect         which version of the extension a request's client speaks:
- *                        by default ChatGPT's draft for ChatGPT, until it declares
- *                        the spec's extension, and the spec for everyone else
+ * @param compatibility   SEP-3415 for every client (`Spec`, the default), or the
+ *                        workarounds the known clients need (`KnownClients`): see
+ *                        [[McpEventsCompatibility]]
  */
 final case class McpWebhookConfig(
   maxTtl: Duration = 1.hour,
@@ -126,7 +126,7 @@ final case class McpWebhookConfig(
   targets: McpWebhookTargets = McpWebhookTargets.public,
   preVerified: McpWebhookUrl => Boolean = _ => false,
   anonymous: Boolean = false,
-  dialect: McpRequestContext => McpEventsDialect = McpEventsDialect.auto,
+  compatibility: McpEventsCompatibility = McpEventsCompatibility.Spec,
   maxSubscriptions: Int = 10000,
   maxPerUrl: Int = 100,
   verificationsPerHost: Int = 10,
@@ -286,7 +286,7 @@ private[mcp] final case class McpWebhookRuntime[R](
   import McpWebhookSender.Outcome
 
   def subscribe(params: McpEventsSubscribeParams, ctx: McpRequestContext): IO[McpEventError, McpEventsSubscribeResult] =
-    val dialect = config.dialect(ctx)
+    val dialect = config.compatibility.dialect(ctx)
     McpWebhookLog.fields(McpWebhookLog.caller(ctx, dialect)*)(McpWebhookLog.fields(
       "event" -> params.name.value, "url" -> McpWebhookLog.url(params.url), "arguments" -> params.arguments.toJson,
       "cursor_in" -> params.cursor.fold("null")(_.value), "max_age_ms" -> params.maxAgeMs.fold("-")(_.toString),
@@ -325,15 +325,16 @@ private[mcp] final case class McpWebhookRuntime[R](
       key                 = McpWebhookKey(owner, params.url, params.name, params.arguments)
       now                <- Clock.instant
       refreshBefore       = config.grant(params.ttl, store.durable).map(now.plus(_))
+      webhookId           = config.compatibility.webhookId(ctx)
       result             <- locked(key.id):
                               workers.get.map(_.get(key.id)).flatMap:
-                                case Some(worker) => refresh(worker, key, params.secret, refreshBefore, dialect)
+                                case Some(worker) => refresh(worker, key, params.secret, refreshBefore, dialect, webhookId)
                                 case None =>
-                                  create(handler, key, params, refreshBefore, dialect, background(ctx, principal))
+                                  create(handler, key, params, refreshBefore, dialect, webhookId, background(ctx, principal))
     yield result
 
   def unsubscribe(params: McpEventsUnsubscribeParams, ctx: McpRequestContext): IO[McpEventError, Unit] =
-    McpWebhookLog.fields(McpWebhookLog.caller(ctx, config.dialect(ctx))*)(McpWebhookLog.fields(
+    McpWebhookLog.fields(McpWebhookLog.caller(ctx, config.compatibility.dialect(ctx))*)(McpWebhookLog.fields(
       "event" -> params.name.value, "url" -> McpWebhookLog.url(params.url), "arguments" -> params.arguments.toJson)(
       for
         (_, owner) <- caller(ctx)
@@ -416,12 +417,13 @@ private[mcp] final case class McpWebhookRuntime[R](
     locks((id.value.hashCode & Int.MaxValue) % locks.size).withPermit(zio)
 
   private def refresh(worker: Worker, key: McpWebhookKey, secret: McpWebhookSecret, refreshBefore: Option[Instant],
-    dialect: McpEventsDialect)
+    dialect: McpEventsDialect, webhookId: McpWebhookIdFormat)
     : IO[McpEventError, McpEventsSubscribeResult] =
     for
       current <- worker.state.get.map(_.subscription.secret)
       _       <- McpWebhookLog.fields("subscription_id" -> key.id.value, "new_secret" -> (current != secret).toString,
-                   "dialect" -> dialect.toString)(ZIO.logInfo("Refreshing a live webhook subscription"))
+                   "dialect" -> dialect.toString, "webhook_id_format" -> webhookId.toString)(
+                   ZIO.logInfo("Refreshing a live webhook subscription"))
       // Anyone can refresh an anonymous subscription: its endpoint has to accept a new secret first.
       _       <- handshake(key, secret).when(key.principal.isAnonymous && current != secret)
       now     <- Clock.instant
@@ -435,7 +437,7 @@ private[mcp] final case class McpWebhookRuntime[R](
                      else Some(McpWebhookPreviousSecret(sub.secret, now.plus(config.secretGrace)))
                    val next = s.copy(
                      subscription = sub.copy(secret = secret, previousSecret = previous, refreshBefore = refreshBefore,
-                       dialect = dialect),
+                       dialect = dialect, webhookId = webhookId),
                      status = s.status.copy(active = true),
                      breaker = fresh.fold(s.breaker)(_._1),
                      resumed = fresh.fold(s.resumed)(_._2),
@@ -456,13 +458,15 @@ private[mcp] final case class McpWebhookRuntime[R](
     params: McpEventsSubscribeParams,
     refreshBefore: Option[Instant],
     dialect: McpEventsDialect,
+    webhookId: McpWebhookIdFormat,
     ctx: McpRequestContext,
   ): IO[McpEventError, McpEventsSubscribeResult] =
     for
       _      <- withinLimits(key)
       _      <- verify(key, params.secret, refreshBefore)
       pushes <- handler.push(params.arguments, params.cursor, params.maxAgeMs.map(Duration.fromMillis), ctx).provideEnvironment(env)
-      sub     = McpWebhookSubscription(key, params.secret, None, ctx.principal, refreshBefore, params.cursor, dialect)
+      sub     = McpWebhookSubscription(key, params.secret, None, ctx.principal, refreshBefore, params.cursor, dialect,
+                  webhookId)
       _      <- store.put(sub).storeFailure("events/subscribe", key.id)
       first  <- install(sub, pushes, resumed = false)
       result <- first.await.map((cursor, truncated) => McpEventsSubscribeResult(key.id, refreshBefore, cursor, truncated))
@@ -559,7 +563,8 @@ private[mcp] final case class McpWebhookRuntime[R](
           val ctx = McpRequestContext(ProtocolVersion.V2026_07_28, callerPrincipal = sub.principal)
           McpWebhookLog.fields("subscription_id" -> sub.id.value, "event" -> sub.key.name.value,
             "url" -> McpWebhookLog.url(sub.key.url), "cursor" -> sub.cursor.fold("null")(_.value),
-            "dialect" -> sub.dialect.toString, "refresh_before" -> sub.refreshBefore.fold("never")(_.toString))(
+            "dialect" -> sub.dialect.toString, "webhook_id_format" -> sub.webhookId.toString,
+            "refresh_before" -> sub.refreshBefore.fold("never")(_.toString))(
             ZIO.logInfo("Resuming webhook subscription")) *>
             handler.push(sub.key.arguments, sub.cursor, None, ctx).provideEnvironment(env).foldZIO(
               error => ZIO.logWarning(s"Webhook subscription ${sub.id} can't resume: ${error.detail.message}") *>
@@ -687,8 +692,8 @@ private[mcp] final case class McpWebhookRuntime[R](
       else if chatGpt && kind != "event" then
         McpWebhookLog.fields("kind" -> kind)(ZIO.logInfo("Webhook envelope not sent: ChatGPT doesn't take it"))
       else
-        // ChatGPT wants the event's own id as the webhook-id; SEP-3415 a fresh one.
-        val own = eventId.filter(id => chatGpt && HeaderSafe.matches(id))
+        // ChatGPT, the AI SDK and TanStack AI want the event's own id as the webhook-id; SEP-3415 a fresh one.
+        val own = eventId.filter(id => sub.webhookId == McpWebhookIdFormat.EventId && HeaderSafe.matches(id))
         randomToken(18).flatMap: r =>
           attempt(own.getOrElse(if kind == "event" then s"msg_$r" else s"msg_${kind}_$r"), 1, config.retryDelays.toList)
 
@@ -779,8 +784,14 @@ private[mcp] object McpWebhookRuntime:
       _       <- runtime.expireLoop.forkIn(scope)
     yield runtime
 
+  // Challenges and message ids come from SecureRandom, not ZIO's Random, which is java.util.Random when live.
+  private val secureRandom = SecureRandom()
+
   private def randomToken(bytes: Int): UIO[String] =
-    Random.nextBytes(bytes).map(b => Base64.getUrlEncoder.withoutPadding.encodeToString(b.toArray))
+    ZIO.succeed:
+      val buffer = Array.ofDim[Byte](bytes)
+      secureRandom.nextBytes(buffer)
+      Base64.getUrlEncoder.withoutPadding.encodeToString(buffer)
 
 /** Structured logging for events and webhooks: each field is a top-level log annotation. */
 private[mcp] object McpWebhookLog:
