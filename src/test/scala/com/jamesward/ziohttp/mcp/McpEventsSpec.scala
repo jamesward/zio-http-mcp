@@ -447,7 +447,7 @@ object McpEventsSpec extends ZIOSpecDefault:
             incidents <- McpEventBuffer.make[Incident]()
             events    <- ZIO.fromEither(McpEvents(McpEvent("incident.created").buffered(incidents)))
             p         <- pipes(McpServer("stdio-events", "1.0.0").withExtensions(events))
-            meta       = s""""_meta":{"${McpMeta.ProtocolVersion}":"$Modern"}"""
+            meta       = s""""_meta":{"${McpMeta.ProtocolVersion}":"$Modern","${McpMeta.ClientCapabilities}":{}}"""
             _         <- p.send(s"""{"jsonrpc":"2.0","id":"sub-1","method":"events/stream","params":{"name":"incident.created",$meta}}""")
             active    <- p.next
             _         <- incidents.emit(incident("S1"), eventId = Some("S1"))

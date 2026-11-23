@@ -499,6 +499,54 @@ object ConformanceSpec extends ZIOSpecDefault:
         val greeting = results.json("greeting").fold("not asked")(_ => sampledText(results.sampling("greeting")))
         Chunk(ToolContent.text(s"greeting=$greeting, name=$name"))
 
+  // --- http-custom-header-server-validation (SEP-2243) ---
+
+  case class RegionQuery(region: String) derives Schema
+
+  /**
+   * A tool whose `region` parameter is mirrored into `Mcp-Param-Region`. The tool
+   * DSL has no setting for `x-mcp-header`, so the annotation is added to the
+   * built definition.
+   */
+  val testParamHeaders: McpToolHandler =
+    val base = McpTool("test_param_headers")
+      .description("Echoes the region its Mcp-Param-Region header mirrors")
+      .handle((q: RegionQuery) => ZIO.succeed(s"region=${q.region}"))
+    new McpToolHandler:
+      def name: ToolName = base.name
+      def definition: ToolDefinition =
+        val schema = base.definition.inputSchema
+        val properties = schema.get("properties").flatMap(_.asObject).getOrElse(Json.Obj())
+        val region = properties.get("region").flatMap(_.asObject).getOrElse(Json.Obj())
+        val annotated = Json.Obj(properties.fields.filterNot(_._1 == "region") :+
+          ("region" -> Json.Obj(region.fields :+ ("x-mcp-header" -> Json.Str("Region")))))
+        base.definition.copy(inputSchema = Json.Obj(schema.fields.filterNot(_._1 == "properties") :+ ("properties" -> annotated)))
+      def call(args: Option[Json.Obj]): UIO[CallToolResult] = base.call(args)
+      override def callWithContext(args: Option[Json.Obj], ctx: McpToolContext): UIO[CallToolResult] =
+        base.callWithContext(args, ctx)
+
+  // --- server-stateless (SEP-2575) fixtures; the names are fixed by the kit ---
+
+  /** Needs sampling. The kit calls it without declaring sampling and expects `-32021`, HTTP 400. */
+  val testMissingCapability: McpToolHandler = McpTool("test_missing_capability")
+    .description("Asks the client to sample, which needs the sampling capability")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.sample("Say hello", 20).map(result => Chunk(ToolContent.text(sampledText(result))))
+
+  /** Elicits. Its response stream may carry notifications and the `input_required` result, never a request. */
+  val testStreamingElicitation: McpToolHandler = McpTool("test_streaming_elicitation")
+    .description("Elicits the user's name")
+    .handleWithContext[Any, ToolError, Chunk[ToolContent]]: ctx =>
+      ctx.elicit("user_name", "What is your name?", nameSchema).map: result =>
+        Chunk(ToolContent.text(s"Hello, ${elicited(result, "name", "stranger")}"))
+
+  /** Logs. A request without `_meta.io.modelcontextprotocol/logLevel` gets no `notifications/message`. */
+  val testLoggingTool: McpToolHandler = McpTool("test_logging_tool")
+    .description("Logs while it runs")
+    .handleWithContext: ctx =>
+      ctx.log(com.jamesward.ziohttp.mcp.LogLevel.Info, "test_logging_tool ran")
+        .as(Chunk(ToolContent.text("Logged.")))
+
   val testInputRequiredPrompt: McpPromptHandler = McpPrompt("test_input_required_result_prompt")
     .description("Prompt that elicits its context before it renders")
     .getWithContext: (_, ctx) =>
@@ -557,6 +605,24 @@ object ConformanceSpec extends ZIOSpecDefault:
   /** The Tasks extension, which the `tasks-*` scenarios need registered, and the
     * Events extension. The kit grades the first event type offering a mode, and
     * terminates another push type, so `conformance.tick` comes first. */
+  /**
+   * The skills the `sep-2640-skills-*` scenarios read: this build's own test skills
+   * (`local-greeting`, with a `references/` subdirectory, and `release-notes`, with
+   * `scripts/`), loaded from the test resources alone. The kit reads the directory of
+   * the first skill listed and needs a subdirectory in it, which the SkillsJars on the
+   * test classpath can't promise.
+   */
+  private lazy val conformanceSkills: McpSkillsJars =
+    val marker = "META-INF/skills/local-greeting/SKILL.md"
+    val url = getClass.getClassLoader.getResource(marker)
+    val entry: Path = url.getProtocol match
+      case "jar" =>
+        val jarUrl = url.getPath.substring(0, url.getPath.indexOf("!/"))
+        Paths.get(java.net.URI.create(jarUrl))
+      case _ =>
+        Paths.get(url.toURI).getParent.getParent.getParent.getParent
+    Unsafe.unsafe(implicit unsafe => Runtime.default.unsafe.run(McpSkillsJars.load(Chunk(entry))).getOrThrowFiberFailure())
+
   private val tasksExtension: McpExtensions[Any] =
     Unsafe.unsafe(implicit unsafe => Runtime.default.unsafe.run(
       for
@@ -568,7 +634,8 @@ object ConformanceSpec extends ZIOSpecDefault:
                     controlledTicks(McpEvent("conformance.push-only").pushOnly),
                   ))
         all    <- ZIO.fromEither(tasks ++ events)
-      yield all
+        withSkills <- ZIO.fromEither(all ++ conformanceSkills.extensions)
+      yield withSkills
     ).getOrThrowFiberFailure())
 
   val testServer = McpServer("test-server", "0.1.0")
@@ -590,6 +657,7 @@ object ConformanceSpec extends ZIOSpecDefault:
     .resource(staticBinaryResource)
     .resource(watchedResource)
     .resourceTemplate(templateResource)
+    .resourceSource(conformanceSkills.resources)
     .prompt(testSimplePrompt)
     .prompt(testPromptWithArguments)
     .prompt(testPromptWithEmbeddedResource)
@@ -603,6 +671,10 @@ object ConformanceSpec extends ZIOSpecDefault:
     .tool(testInputRequiredTamperedState)
     .tool(testInputRequiredCapabilities)
     .prompt(testInputRequiredPrompt)
+    .tool(testMissingCapability)
+    .tool(testStreamingElicitation)
+    .tool(testLoggingTool)
+    .tool(testParamHeaders)
     .tool(tasksGreet)
     .tool(tasksSlowCompute)
     .tool(tasksFailingJob)
@@ -614,28 +686,21 @@ object ConformanceSpec extends ZIOSpecDefault:
     .tool(eventControls(2))
 
   /**
-   * `server-stateless` is baselined: running the modern suite by its frozen
-   * requirements (rather than by `--spec-version`) reaches scenarios the older
-   * selector never ran, and this is one of them. Its failing checks are
-   * SEP-2575 gaps unrelated to this suite's other scenarios — we do not reject
-   * a modern request whose `_meta` omits `protocolVersion` /
-   * `clientCapabilities` with `-32602` + HTTP 400, and we have no
-   * `MissingRequiredClientCapabilityError` (-32021) path. Fixing those is separate work; the
-   * baseline keeps them visible rather than silently unrun.
-   *
    * Bridged networking cannot give the kit a localhost URL, so
    * `dns-rebinding-protection` is baselined in that mode only.
    *
-   * Everything else is expected to pass, the `input-required-result-*` (MRTR)
-   * scenarios included. The kit's not-scored scenarios — the `tasks-*`
-   * extension and the ones added to the suite after 2026-07-28 shipped — run
-   * and report but never count toward conformance, so they need no baseline.
+   * Everything else is expected to pass, `server-stateless` (SEP-2575) and the
+   * `input-required-result-*` (MRTR) scenarios included. The kit's not-scored
+   * scenarios (the `tasks-*` and `sep-2640-*` extensions, and the ones added
+   * after 2026-07-28 shipped) run and report but never count toward
+   * conformance, so they need no baseline; the extension ones are run on their
+   * own below.
    */
   private val expectedFailuresYaml: String =
     val baselined =
-      Chunk("server-stateless") ++
-        (if DockerSupport.useHostNetwork then Chunk.empty else Chunk("dns-rebinding-protection"))
-    baselined.map(s => s"  - $s").mkString("server:\n", "\n", "\n")
+      if DockerSupport.useHostNetwork then Chunk.empty else Chunk("dns-rebinding-protection")
+    if baselined.isEmpty then "server: []\n"
+    else baselined.map(s => s"  - $s").mkString("server:\n", "\n", "\n")
 
   /**
    * The kit's `tasks-*` scenarios we hold ourselves to. Left out:
@@ -660,6 +725,21 @@ object ConformanceSpec extends ZIOSpecDefault:
   )
 
   /**
+   * The kit's SEP-2640 (`io.modelcontextprotocol/skills`) scenarios, run against
+   * [[conformanceSkills]]. Like the Tasks ones they are off the spec timeline,
+   * so they run one at a time under `--force`, on both eras.
+   */
+  private val SkillsScenarios = Chunk(
+    "sep-2640-skills-enumeration",
+    "sep-2640-skills-manifest",
+    "sep-2640-skills-directory",
+  )
+
+  /** The failed checks in a scenario's output. */
+  private def checkFailures(output: String): Chunk[String] =
+    Chunk.fromIterable(output.linesIterator.toSeq).filter(line => line.contains("FAILURE") && line.contains("["))
+
+  /**
    * The failed checks in a scenario's output, except `wire-schema-valid`: the
    * kit validates every `tools/call` result against the core `CallToolResult`
    * schema, special-casing only `input_required`, so a spec-shaped
@@ -678,7 +758,7 @@ object ConformanceSpec extends ZIOSpecDefault:
   // `npx` invocation.
   private val ConformancePackage = "@modelcontextprotocol/conformance"
   private val LegacyKitVersion   = "0.1.16"
-  private val ModernKitVersion   = "0.2.0-alpha.11"
+  private val ModernKitVersion   = "0.2.0-alpha.12"
 
   /**
    * Build an image with the kit preinstalled, so the test needs Docker and nothing
@@ -813,6 +893,17 @@ object ConformanceSpec extends ZIOSpecDefault:
                                    scenario = Some(scenario), extraArgs = Seq("--force"))
             failures           = taskCheckFailures(output)
             _                 <- ZIO.logInfo(s"$scenario output:\n$output").when(failures.nonEmpty)
+          yield assertTrue(output.contains("SUCCESS"), failures.isEmpty)
+        .map(_.reduce(_ && _))
+      ,
+      test("Skills extension (io.modelcontextprotocol/skills) scenarios pass"):
+        ZIO.foreach(SkillsScenarios.flatMap(s => Chunk("2025-11-25", "2026-07-28").map(s -> _))): (scenario, version) =>
+          for
+            port              <- Server.install(testServer.routes)
+            (_, output)       <- runConformance(modernImage, port, version, expectedFailuresYaml,
+                                   scenario = Some(scenario), extraArgs = Seq("--force"))
+            failures           = checkFailures(output)
+            _                 <- ZIO.logInfo(s"$scenario ($version) output:\n$output").when(failures.nonEmpty)
           yield assertTrue(output.contains("SUCCESS"), failures.isEmpty)
         .map(_.reduce(_ && _))
     ).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@

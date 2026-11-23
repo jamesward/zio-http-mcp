@@ -68,7 +68,8 @@ private[mcp] object AuthMiddleware:
       raw       <- ZIO.fromEither(extractBearerToken(request))
       principal <- auth.verifier.verify(raw)
       _         <- ZIO.fail(AuthError.AudienceMismatch(resourceUri, principal.audience))
-                     .when(!principal.audience.exists(a => resourceUri.matchesAudience(a) || resourceUri.origin.matchesAudience(a)))
+                     .when(!principal.audience.exists(a =>
+                       resourceUri.matchesAudience(a) || (auth.acceptOriginAudience && resourceUri.origin.matchesAudience(a))))
       _         <- ZIO.fail(AuthError.InsufficientScope(required, principal.scopes))
                      .when(!principal.hasAllScopes(required))
     yield principal

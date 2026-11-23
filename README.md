@@ -234,6 +234,8 @@ val specs = Chunk(
 ).flatten
 ```
 
+On a modern (2026-07-28) request, a handler that asks for input the client didn't declare in `_meta.io.modelcontextprotocol/clientCapabilities` doesn't get an `input_required` result. The call fails with `MissingRequiredClientCapabilityError` (`-32021`, HTTP `400`), whose `data.requiredCapabilities` names what's missing, as SEP-2575 requires.
+
 ### Tools with ZIO Layers
 
 Tools can declare ZIO environment requirements. These propagate through the server to the routes:
@@ -512,7 +514,7 @@ ZIO.scoped:
     client.listTools
 ```
 
-Pin the era with `preferredVersion`, and supply an `onInputRequest` handler to satisfy a modern server's MRTR sampling, elicitation and `roots/list` requests. The client drives the whole exchange — it answers each request under the id the server asked with, echoes the server's `requestState`, and retries until the call completes:
+Pin the era with `preferredVersion`, and supply an `onInputRequest` handler to satisfy a server's sampling, elicitation and `roots/list` requests. Setting it declares the `elicitation`, `sampling` and `roots` client capabilities; without it the client declares none, and a server that needs input answers `-32021`. Against a modern server the client drives the whole MRTR exchange: it answers each request under the id the server asked with, echoes the server's `requestState`, and retries until the call completes. On a legacy session it answers the requests the server sends on a call's SSE stream, and opens the session's standalone `GET` stream for the ones the server sends on its own:
 
 ```scala
 val config = McpClientConfig(
@@ -523,6 +525,25 @@ val config = McpClientConfig(
 ```
 
 `client.protocolVersion` reports the negotiated revision.
+
+`listTools` leaves out, with a warning, a tool whose definition the spec rules out, such as an `inputSchema` that isn't a JSON Schema object (`true`, `null`, or missing), so one bad tool doesn't hide the others. It doesn't rewrite such a schema into a valid one.
+
+Over Streamable HTTP the client also:
+
+- mirrors tool parameters a server annotates with `x-mcp-header` into `Mcp-Param-*` headers on `tools/call`, encoded as the 2026-07-28 Streamable HTTP binding says (Base64 for values a header can't carry plainly). It learns the annotations from `listTools`, which leaves out a tool whose annotations are invalid, with a warning. A `HeaderMismatch` (`-32020`) makes it list the tools again and retry once;
+- resumes an SSE response the server closes before the result: it reconnects with `GET` and `Last-Event-ID` after the stream's `retry` delay.
+
+A server checks those headers in turn. A modern `tools/call` whose `Mcp-Param-*` header is missing, can't be decoded, or doesn't match the argument it mirrors is refused with `400` and `-32020`. The tool DSL has no setting for `x-mcp-header` yet, so a tool gets one by adding it to its definition's `inputSchema`, as `ConformanceSpec.testParamHeaders` does.
+
+A modern request must carry `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` in its `_meta`. One that doesn't is refused with `-32602` and HTTP `400` (SEP-2575).
+
+Upgrading from 0.15.0: these defaults now follow the 2026-07-28 spec where they didn't.
+
+- **Server.** A modern request without the required `_meta` is refused. `-32021` comes with HTTP `400` on 2026-07-28. Input a client didn't declare is `-32021` rather than `input_required`. `skills/get` carries `ttlMs` and `cacheScope`.
+- **Server, with `.auth(...)`.** A token whose `aud` is only the resource's origin is refused; set `McpAuth(acceptOriginAudience = true)` for an authorization server that shortens the `resource` to its origin. It no longer answers `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration` on its own origin with a 302 to the authorization server. That redirect served an older kiro-cli that ignored the protected resource metadata; kiro-cli 3.5.0 reads it on both engines (`KiroCliDiscoverySpec`), so every client now gets a 404 there.
+- **Client.** It declares `elicitation`, `sampling` and `roots` only when `onInputRequest` is set. `listTools` leaves out tools with an invalid `inputSchema` instead of treating it as `{}`. The issuer in authorization-server metadata must match exactly, trailing `/` included. With OAuth, it authorizes on the first `401` rather than before its first request.
+
+The interop specs (TypeScript, Python and Java SDKs, tachyon, `@ai-sdk/mcp`, Mastra, TanStack) pass unchanged, so no quirks mode was needed. The server changes apply to 2026-07-28 requests only, and the clients Claude and ChatGPT use, as `PythonSdkSpec` and the Events specs see them, connect on 2025-11-25.
 
 ## Tasks
 
@@ -910,6 +931,8 @@ When auth is enabled the library:
 - Returns `401 Unauthorized` with a `WWW-Authenticate: Bearer realm=…, resource_metadata=…, scope=…` challenge on missing or invalid tokens, and `403 Forbidden` with `error="insufficient_scope"` when scopes are missing.
 - Validates token audience binding ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707)) — only tokens whose `aud` matches the resolved `resourceUri` are accepted.
 
+**Quirk: `acceptOriginAudience`.** Off by default. Some authorization servers shorten the `resource` a client asks for (`https://host/tenant-a`) to its origin (`https://host`) when they mint the token's `aud`, which RFC 8707 §2.1 allows. The server refuses those tokens, since the MCP spec requires it to check that a token was issued for it specifically. `McpAuth(..., acceptOriginAudience = true)` accepts them, at the cost that a token for the origin then works at every path on it, so the mounts of one host no longer keep their tokens apart. `ParameterizedMountAudienceCompatSpec` covers both settings.
+
 ### Token Verifiers
 
 `TokenVerifier` is the pluggable seam for token validation. It's responsible for signature, `iss`, `exp`, and `nbf` validation only — audience binding and scope enforcement happen in the auth middleware so that `resourceUri` can be derived per request.
@@ -1158,12 +1181,12 @@ Note that decoding validates *shape, types, and required fields*, not JSON-Schem
 
 For servers that require authorization, supply `OAuthClientCredentials`. The client runs the machine-to-machine `client_credentials` flow with automatic discovery per the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization):
 
-1. Probe the MCP endpoint; on `401` read the `resource_metadata` URL from the `WWW-Authenticate` challenge (falling back to the well-known path under the server origin).
+1. On the first `401`, read the `resource_metadata` URL from its `WWW-Authenticate` challenge (falling back to the well-known path under the server origin).
 2. Fetch the [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) Protected Resource Metadata to learn the canonical `resource` (audience) and the `authorization_servers`.
 3. Fetch the [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) Authorization Server Metadata (OIDC discovery fallback) to learn the `token_endpoint`.
 4. Request a token with `grant_type=client_credentials` (HTTP Basic client auth), binding it to the resource via the [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) `resource` parameter.
 
-The token is cached and reused until shortly before it expires; a `401` despite a valid-looking token triggers a single refresh-and-retry.
+The client authorizes when the server asks: its requests go without a token until one is answered `401`, and the challenge's `scope` then picks the scopes. The token is cached and reused until shortly before it expires; a `401` despite a valid-looking token triggers a single refresh-and-retry. When the authorization server returns a client secret, or advertises `token_endpoint_auth_methods_supported`, the client authenticates the way it registered or the server supports (`client_secret_basic`, else `client_secret_post`).
 
 ```scala
 import com.jamesward.ziohttp.mcp.*
@@ -1192,13 +1215,19 @@ Supply `tokenEndpoint` and/or `resource` on `OAuthClientCredentials` to pin thos
 
 For the [MCP `2026-07-28` hardened authorization flow](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization), supply `OAuthAuthorizationCode`. The client runs the full flow:
 
-1. Probe the MCP endpoint; on `401` read the `resource_metadata` URL and `scope` hint from the `WWW-Authenticate` challenge (falling back to the [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) well-known forms — path-inserted first, then root).
+1. On the first `401`, read the `resource_metadata` URL and `scope` hint from its `WWW-Authenticate` challenge (falling back to the [RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728) well-known forms — path-inserted first, then root).
 2. Fetch the Protected Resource Metadata; **verify its `resource` matches the server URL** (a PRM naming a different resource aborts the flow); pick the advertised authorization server.
-3. Discover AS metadata, trying the [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) and [OIDC Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html) well-known forms in the spec's priority order (path-aware for issuers with a path component), and verify the metadata `issuer` matches.
+3. Discover AS metadata, trying the [RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414) and [OIDC Discovery](https://openid.net/specs/openid-connect-discovery-1_0.html) well-known forms in the spec's priority order (path-aware for issuers with a path component), and verify the metadata `issuer` is identical to the issuer asked for (RFC 8414 §3.3, so not even a trailing `/` may differ).
 4. Obtain a client id by the spec's registration priority: pre-registered `clientId` → **Client ID Metadata Documents** (`clientMetadataUrl` used as the `client_id` when the AS advertises `client_id_metadata_document_supported`) → Dynamic Client Registration (deprecated fallback).
 5. Send the authorization request with **PKCE S256**, the [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) `resource` parameter, and `state`; scopes follow the spec's selection strategy (explicit config → `WWW-Authenticate` `scope` hint → PRM `scopes_supported`).
 6. Validate the authorization response: `state` round-trip and the [RFC 9207](https://datatracker.ietf.org/doc/html/rfc9207) `iss` parameter (exact string comparison, no normalization; required when the AS advertises `authorization_response_iss_parameter_supported`).
 7. Exchange the code (+ `code_verifier` + `resource`) for tokens; refresh via `grant_type=refresh_token` when the token expires.
+
+Then, while it runs:
+
+- **Step-up.** A `403` with `error="insufficient_scope"` whose `scope` asks for something not yet requested starts a new authorization with the union of the scopes requested so far and those challenged, at most twice per request.
+- **A new authorization server.** A `401` that a refreshed token doesn't fix makes the client read the protected resource metadata again. If it names another authorization server, the client registers there and authorizes again. A pre-registered `clientId` belongs to the old server, so for it a change is an error.
+- **2025-03-26 servers.** A server that names no protected resource metadata, and has none at the well-known URLs, is treated as that revision does: its origin is the authorization server, with RFC 8414 metadata or, without it, the default `/authorize`, `/token` and `/register` endpoints.
 
 ```scala
 ZIO.scoped:
@@ -1220,7 +1249,7 @@ How the authorization URL reaches the resource owner is pluggable via `OAuthAuth
 
 Pre-registered credentials take priority when set (`clientId` / optional `clientSecret`); with neither `clientId` nor a CIMD-supporting AS, the client falls back to Dynamic Client Registration when the AS has a `registration_endpoint` (registering with `application_type: "native"` for loopback redirect URIs per SEP-837).
 
-The client-side flow is validated two ways: end-to-end in-process tests against a CIMD-capable test IDP (`CimdAuthSpec`), and the official [MCP conformance kit](https://github.com/modelcontextprotocol/conformance)'s client auth scenarios (`ClientConformanceSpec`) — `auth/basic-cimd`, the `auth/iss-*` issuer-validation family, `auth/metadata-*` discovery forms, `auth/resource-mismatch`, `auth/scope-*` selection, `auth/pre-registration`, and `auth/client-credentials-basic`.
+The client-side flow is validated two ways: end-to-end in-process tests against a CIMD-capable test IDP (`CimdAuthSpec`), and the official [MCP conformance kit](https://github.com/modelcontextprotocol/conformance)'s client scenarios (`ClientConformanceSpec`): every scenario of the 2025-11-25 and 2026-07-28 revisions, `auth/client-credentials-basic`, and the `sep-2640-client-*` Skills ones. The kit's other auth extensions (`auth/client-credentials-jwt`, `auth/dpop`, `auth/dpop-nonce`, `auth/enterprise-managed-authorization`, `auth/wif-jwt-bearer`) aren't implemented.
 
 ### Static auth headers
 
@@ -1301,4 +1330,4 @@ val server = McpServer("multi", "1.0.0")
   .mountedAtParam("slug")        // serves /<slug> for any slug
 ```
 
-When auth is configured, a parameterised mount derives its resource URI / audience from the host root (not the per-`<value>` path), keeping the audience host-wide. `mountedAt` and `mountedAtParam` are mutually exclusive — the last one called wins.
+When auth is configured and `resourceUri` isn't set, a parameterised mount derives its resource URI, and so the audience it accepts, from the `/<value>` the request arrived on, so a token minted for one value isn't valid at another. Set `resourceUri` to pin one host-wide resource instead. `mountedAt` and `mountedAtParam` are mutually exclusive — the last one called wins.

@@ -53,12 +53,8 @@ object ResourceUri:
       ResourceUri.canonicalize(r) == ResourceUri.canonicalize(audience)
 
     /**
-     * The origin (`scheme://host[:port]`) of this resource, with any path stripped.
-     * Used so a path-bearing per-mount resource also accepts a host-origin `aud`,
-     * which is what an authorization server produces when it canonicalizes the
-     * requested `resource` to its origin (RFC 8707 §2.1 permits this, and real ASes
-     * do it). Without this, RFC 9728 §3.3-strict clients that request the per-mount
-     * `resource` still fail with an audience mismatch on the origin-folded token.
+     * The origin (`scheme://host[:port]`) of this resource, with any path stripped:
+     * the audience [[McpAuth.acceptOriginAudience]] also accepts.
      */
     def origin: ResourceUri =
       val schemeIdx = r.indexOf("://")
@@ -118,6 +114,15 @@ object AuthorizationServer:
  *                             or `TokenVerifier.introspection(...)`.
  * @param requiredScopes       Server-wide scope requirements. Per-tool scopes are additive.
  * @param realm                `WWW-Authenticate` realm parameter.
+ * @param acceptOriginAudience A quirk, off by default: also accept a token whose `aud` is
+ *                             only the resource's origin (`https://host` for
+ *                             `https://host/tenant-a`). For an authorization server
+ *                             that shortens the requested `resource` to its origin when
+ *                             minting a token. The MCP spec requires a server to check
+ *                             that a token was issued for it specifically, and with this
+ *                             on, a token for the origin is accepted at every path on
+ *                             it, so the mounts of one host no longer keep their tokens
+ *                             apart.
  */
 final case class McpAuth[-R](
   authorizationServers: NonEmptyChunk[AuthorizationServer],
@@ -128,6 +133,7 @@ final case class McpAuth[-R](
   resourceDocumentation: Option[String] = None,
   requiredScopes: Set[OauthScope] = Set.empty,
   realm: String = "mcp",
+  acceptOriginAudience: Boolean = false,
 ):
   def withResourceUri(uri: ResourceUri): McpAuth[R] =
     copy(resourceUri = Some(uri))

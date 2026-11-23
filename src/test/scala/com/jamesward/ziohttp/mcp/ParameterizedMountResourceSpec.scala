@@ -15,9 +15,9 @@ import java.time.Instant
  * RFC 9728 §3.3 compliant: the advertised Protected Resource Metadata `resource`
  * must identify the exact URL the client accessed (`http://host/<value>`), and the
  * `WWW-Authenticate` challenge must point at the matching path-inserted PRM URL.
- * The audience check accepts a token whose `aud` is that per-mount resource OR its
- * host origin — an AS may canonicalize the requested `resource` to its origin
- * (RFC 8707 §2.1), so both must pass; only an unrelated audience is rejected.
+ * The audience check accepts a token whose `aud` is that per-mount resource, and
+ * refuses its host origin and an unrelated audience. The host origin is accepted
+ * only with the `acceptOriginAudience` quirk ([[ParameterizedMountAudienceCompatSpec]]).
  */
 object ParameterizedMountResourceSpec extends ZIOSpecDefault:
 
@@ -106,7 +106,7 @@ object ParameterizedMountResourceSpec extends ZIOSpecDefault:
           )
       ,
 
-      test("audience: the per-mount resource AND its host origin are accepted; a foreign audience is rejected"):
+      test("audience: the per-mount resource is accepted; the host origin and a foreign audience are refused"):
         for
           port     <- installStateless(server)
           perMount <- post(port, "/tenant-a", toolsListRequest, token = Some(s"http://localhost:$port/tenant-a"))
@@ -114,7 +114,7 @@ object ParameterizedMountResourceSpec extends ZIOSpecDefault:
           foreign  <- post(port, "/tenant-a", toolsListRequest, token = Some("https://evil.example.com"))
         yield assertTrue(
           perMount.status.code == 200, // exact per-mount audience
-          origin.status.code == 200,   // host-origin audience (AS canonicalized the resource, RFC 8707 §2.1) — accepted
+          origin.status.code == 401,   // host-origin audience: only with acceptOriginAudience
           foreign.status.code == 401,  // an unrelated audience is still rejected
         )
       ,

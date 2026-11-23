@@ -29,6 +29,15 @@ private[client] trait McpWire:
   /** Releases the connection. */
   def close: IO[McpClientError, Unit]
 
+  /** Whether tool parameters annotated `x-mcp-header` travel as `Mcp-Param-*`
+    * headers too: on Streamable HTTP they MUST, and other transports MAY ignore
+    * the annotations (2026-07-28 Streamable HTTP, Custom Headers from Tool Parameters). */
+  def mirrorsParamHeaders: Boolean = false
+
+  /** Listen, for as long as `Scope` lasts, for requests the server sends outside
+    * any request of the client's, and answer them. */
+  def listen: URIO[Scope, Unit] = ZIO.unit
+
 /**
  * An outgoing request body plus the transport decisions for it: correlation id,
  * extra (modern routing) headers, and whether to attach the session. The last

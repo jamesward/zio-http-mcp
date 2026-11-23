@@ -292,6 +292,41 @@ object CimdAuthSpec extends ZIOSpecDefault:
             events.tokens.isEmpty,
           )
       ,
+
+      test("client refuses AS metadata whose issuer differs from the PRM's by a trailing slash"):
+        // RFC 8414 §3.3: the metadata's issuer MUST be identical to the one asked for.
+        ZIO.scoped:
+          for
+            idp     <- TestIdp.serveScoped(extraRoutes = cimdRoutes(redirectUri))
+            port    <- AuthTestHelpers.findFreePort
+            prm      = Json.Obj(Chunk(
+                         "resource" -> Json.Str(s"http://localhost:$port/mcp"),
+                         "authorization_servers" -> Json.Arr(Chunk(Json.Str(s"${idp.issuer}/"))),
+                       )).toJson
+            routes   = Routes(
+                         Method.GET / ".well-known" / "oauth-protected-resource" / trailing -> handler(Response.json(prm)),
+                         Method.GET / ".well-known" / "oauth-protected-resource" -> handler(Response.json(prm)),
+                         Method.POST / "mcp" -> handler(
+                           Response.json("""{"jsonrpc":"2.0","error":{"code":-32001,"message":"Unauthorized"},"id":null}""")
+                             .status(Status.Unauthorized)
+                         ),
+                       )
+            _       <- Server.serve(routes)
+                         .provide(Server.defaultWithPort(port))
+                         .forkScoped
+            _       <- AuthTestHelpers.waitForBind(port)
+            result  <- connectAndCall(port, OAuthAuthorizationCode(
+                         clientMetadataUrl = Some(cimdDocUrl(idpUrlPort(idp))),
+                         redirectUri = redirectUri,
+                       )).exit
+            events  <- idp.recordedEvents
+          yield assertTrue(
+            result.isFailure,
+            result.causeOption.exists(_.prettyPrint.contains("issuer mismatch")),
+            events.authorizations.isEmpty,
+            events.tokens.isEmpty,
+          )
+      ,
     ).provide(Client.default) @@ sequential @@ withLiveClock @@ timeout(120.seconds)
 
   /** The TestIdp's port (its issuer is always `http://localhost:<port>`). */

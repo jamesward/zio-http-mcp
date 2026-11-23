@@ -40,6 +40,29 @@ object McpClientPaginationSpec extends ZIOSpecDefault:
       }
     ).sandbox
 
+  /** A server listing one valid tool among definitions the spec rules out. */
+  private val invalidToolsServer: Routes[Any, Response] =
+    Routes(
+      Method.POST / "mcp" -> handler { (request: Request) =>
+        request.body.asString.map: body =>
+          val json = body.fromJson[Json.Obj].toOption.getOrElse(Json.Obj())
+          val id = json.get("id").getOrElse(Json.Null)
+          json.get("method").flatMap(_.asString).getOrElse("") match
+            case "initialize" =>
+              rpcResult(id, """{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"odd","version":"1"}}""")
+                .addHeader("mcp-session-id", "invalid-tools-session")
+            case "tools/list" =>
+              rpcResult(id, """{"tools":[
+                {"name":"boolean_schema","inputSchema":true},
+                {"name":"null_schema","inputSchema":null},
+                {"name":"no_schema"},
+                {"name":"boolean_output","inputSchema":{"type":"object"},"outputSchema":false},
+                {"name":"valid","inputSchema":{"type":"object"}}
+              ]}""")
+            case _ => Response.status(Status.Accepted)
+      }
+    ).sandbox
+
   def spec = suite("McpClient tools/list pagination")(
     test("listTools follows nextCursor and preserves page order") {
       for
@@ -58,6 +81,16 @@ object McpClientPaginationSpec extends ZIOSpecDefault:
         tools.map(_.name.value).toList == List("first", "second"),
         cursors == List(None, Some("page-2")),
       )
+    }
+    ,
+    test("listTools leaves out a tool whose inputSchema or outputSchema isn't a JSON Schema object, and keeps the rest") {
+      // The spec: inputSchema MUST be a valid JSON Schema object (not null).
+      for
+        port  <- Server.install(invalidToolsServer)
+        tools <- ZIO.scoped:
+                   McpClient.connect(McpClientConfig(s"http://localhost:$port/mcp", preferredVersion = ProtocolVersion.V2025_11_25))
+                     .flatMap(_.listTools)
+      yield assertTrue(tools.map(_.name.value).toList == List("valid"))
     }
   ).provide(Server.defaultWith(_.onAnyOpenPort), Client.default) @@
     withLiveClock @@ timeout(1.minute) @@ sequential

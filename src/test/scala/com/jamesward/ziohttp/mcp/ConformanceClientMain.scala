@@ -39,8 +39,10 @@ object ConformanceClientMain extends ZIOAppDefault:
       context    = Option(java.lang.System.getenv("MCP_CONFORMANCE_CONTEXT"))
                      .flatMap(_.fromJson[Json.Obj].toOption)
       version    = Option(java.lang.System.getenv("MCP_CONFORMANCE_PROTOCOL_VERSION"))
-      _         <- runScenario(serverUrl, scenario, context, version)
-                     .provideSome[Scope](Client.default)
+      // The client's scope closes inside the one Client.default lives in, so the
+      // client's DELETE on close still has an HTTP client to send it with.
+      _         <- ZIO.scoped(runScenario(serverUrl, scenario, context, version))
+                     .provide(Client.default)
     yield ()
 
   private def contextString(context: Option[Json.Obj], field: String): Option[String] =
@@ -75,10 +77,66 @@ object ConformanceClientMain extends ZIOAppDefault:
                   serverUrl = serverUrl,
                   oauth = oauthFor(scenario, context),
                   preferredVersion = preferred,
+                  onInputRequest = Some(answerInput),
                 ))
       tools  <- client.listTools
       _      <- Console.printLine(s"tools: ${tools.map(_.name.value).mkString(", ")}")
-      _      <- ZIO.foreachDiscard(tools.headOption): tool =>
-                  client.callTool(tool.name.value, Json.Obj())
-                    .flatMap(r => Console.printLine(s"called ${tool.name.value}: isError=${r.isError}"))
+      _      <- exercise(client, scenario, context, tools)
     yield ()
+
+  /**
+   * What each scenario asks the client to do once it has listed the tools.
+   * A scenario whose context lists `toolCalls` gets exactly those; the others
+   * get the calls their descriptions ask for, and by default the first tool is
+   * called without arguments.
+   */
+  private def exercise(
+    client: McpClient,
+    scenario: String,
+    context: Option[Json.Obj],
+    tools: Chunk[ToolDefinition],
+  ): IO[Throwable, Unit] =
+    def call(name: String, arguments: Json.Obj): IO[Throwable, Unit] =
+      client.callTool(name, arguments)
+        .flatMap(r => Console.printLine(s"called $name: isError=${r.isError}"))
+    val toolCalls = context.flatMap(_.get("toolCalls")).flatMap(_.asArray).getOrElse(Chunk.empty).flatMap(_.asObject)
+    if toolCalls.nonEmpty then
+      ZIO.foreachDiscard(toolCalls): tc =>
+        call(tc.get("name").flatMap(_.asString).getOrElse(""), tc.get("arguments").flatMap(_.asObject).getOrElse(Json.Obj()))
+    else scenario match
+      case "tools_call" =>
+        call("add_numbers", Json.Obj("a" -> Json.Num(5), "b" -> Json.Num(3)))
+      case "json-schema-2020-12-preservation" =>
+        // Echo the focal tool's inputSchema verbatim, to show nothing was lost in parsing.
+        ZIO.foreachDiscard(tools.find(_.name.value == "json_schema_2020_12_tool")): focal =>
+          call("json_schema_echo", Json.Obj("schema" -> focal.inputSchema))
+      case "json-schema-ref-no-deref" =>
+        ZIO.unit // listing the tools is the whole scenario
+      case "sep-2322-client-request-state" =>
+        // Every MRTR tool, concurrently, so each exchange keeps its own state.
+        ZIO.foreachParDiscard(tools)(tool => call(tool.name.value, Json.Obj()))
+      case _ =>
+        ZIO.foreachDiscard(tools.headOption)(tool => call(tool.name.value, Json.Obj()))
+
+  /**
+   * The answers a user would give: an elicitation accepted with the form's
+   * defaults (SEP-1034: a client pre-populates them), a sampled greeting, and no roots.
+   */
+  private def answerInput(request: InputRequest): IO[McpClientError, Json] =
+    ZIO.succeed:
+      request.method match
+        case "elicitation/create" =>
+          val properties = request.params.get("requestedSchema").flatMap(_.asObject)
+            .flatMap(_.get("properties")).flatMap(_.asObject).getOrElse(Json.Obj())
+          val defaults = properties.fields.flatMap: (name, schema) =>
+            schema.asObject.flatMap(_.get("default")).map(name -> _)
+          Json.Obj("action" -> Json.Str("accept"), "content" -> Json.Obj(defaults))
+        case "sampling/createMessage" =>
+          Json.Obj(
+            "role" -> Json.Str("assistant"),
+            "content" -> Json.Obj("type" -> Json.Str("text"), "text" -> Json.Str("Hello from the conformance client")),
+            "model" -> Json.Str("conformance-model"),
+            "stopReason" -> Json.Str("endTurn"),
+          )
+        case "roots/list" => Json.Obj("roots" -> Json.Arr())
+        case _            => Json.Obj()

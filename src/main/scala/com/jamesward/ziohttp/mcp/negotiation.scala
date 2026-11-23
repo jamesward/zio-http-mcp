@@ -32,6 +32,8 @@ enum NegotiationError:
   case UnsupportedVersion(requested: String)
   /** An HTTP routing header is missing or disagrees with the body (`-32020`). */
   case HeaderMismatch(message: String)
+  /** The request's `_meta` is missing, or lacks the protocol version or the client capabilities (`-32602`). */
+  case InvalidMeta(message: String)
 
 object NegotiationError:
   given CanEqual[NegotiationError, NegotiationError] = CanEqual.derived
@@ -116,6 +118,10 @@ object Negotiation:
    *     accepted: the spec lets a server that still supports pre-2025-06-18
    *     clients (this one serves 2025-03-26) tolerate a missing header, and the
    *     body remains the source of truth.
+   *   - the body's `_meta` must carry `io.modelcontextprotocol/protocolVersion`
+   *     and `io.modelcontextprotocol/clientCapabilities` (an object): SEP-2575
+   *     makes both REQUIRED on every request, and a request without them is
+   *     `-32602` Invalid params (`clientInfo` is only a SHOULD);
    *   - the resolved version must be one the server supports.
    *
    * `requireHeaders = false` checks only header↔body agreement, for a binding
@@ -159,10 +165,21 @@ object Negotiation:
               s"Mcp-Name header '${decodeHeaderValue(h)}' does not match body '$field' value '$b'"))
           case _ => Right(())
 
+    val meta = McpMeta.of(params)
+    val metaCheck: Either[NegotiationError, Unit] =
+      if params.flatMap(_.get("_meta")).flatMap(_.asObject).isEmpty then
+        Left(NegotiationError.InvalidMeta(s"Request '$method' has no _meta"))
+      else if bodyVersion.isEmpty then
+        Left(NegotiationError.InvalidMeta(s"Request '$method' has no _meta['${McpMeta.ProtocolVersion}']"))
+      else if McpMeta.raw(meta, McpMeta.ClientCapabilities).flatMap(_.asObject).isEmpty then
+        Left(NegotiationError.InvalidMeta(s"Request '$method' has no _meta['${McpMeta.ClientCapabilities}'] object"))
+      else Right(())
+
     for
       _       <- methodCheck
       _       <- versionHeaderCheck
       _       <- nameCheck
+      _       <- metaCheck
       // Resolve: prefer body-declared version, then header, then latest.
       wire     = bodyVersion.orElse(protocolHeader).getOrElse(ProtocolVersion.latest.wire)
       version <- ProtocolVersion.parse(wire).toRight(NegotiationError.UnsupportedVersion(wire))

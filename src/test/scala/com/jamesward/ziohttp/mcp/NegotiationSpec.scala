@@ -60,8 +60,14 @@ object NegotiationSpec extends ZIOSpecDefault:
 
   // --- modern request builders ---
 
+  /** The required per-request `_meta` (SEP-2575), from a client that can answer
+    * every kind of input. */
   private def meta(version: String): Json.Obj =
-    Json.Obj(McpMeta.ProtocolVersion -> Json.Str(version))
+    Json.Obj(
+      McpMeta.ProtocolVersion -> Json.Str(version),
+      McpMeta.ClientCapabilities -> Json.Obj(
+        "elicitation" -> Json.Obj(), "sampling" -> Json.Obj(), "roots" -> Json.Obj()),
+    )
 
   private def modernBody(
     id: Long,
@@ -70,7 +76,9 @@ object NegotiationSpec extends ZIOSpecDefault:
     version: String = Modern,
     metaExtra: Chunk[(String, Json)] = Chunk.empty,
   ): String =
-    val fullMeta = Json.Obj(meta(version).fields ++ metaExtra)
+    // An extra key replaces the default one.
+    val overridden = metaExtra.map(_._1).toSet
+    val fullMeta = Json.Obj(meta(version).fields.filterNot((k, _) => overridden.contains(k)) ++ metaExtra)
     val params = Json.Obj(extra :+ ("_meta" -> (fullMeta: Json)))
     s"""{"jsonrpc":"2.0","id":$id,"method":"$method","params":${(params: Json).toJson}}"""
 
@@ -368,6 +376,26 @@ object NegotiationSpec extends ZIOSpecDefault:
         resp <- postModern(port, modernBody(1, "resources/read", extra), "resources/read", name = Some("test://missing"))
         b    <- bodyJson(resp)
       yield assertTrue(codeOf(b).contains(ErrorCode.InvalidParams.code))
+    ,
+
+    test("a modern request missing required _meta fields -> 400 with -32602"):
+      // SEP-2575: protocolVersion and clientCapabilities are REQUIRED on every request.
+      val noMeta     = """{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}"""
+      val noVersion  = """{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{}}}}"""
+      val noCaps     = s"""{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"$Modern"}}}"""
+      for
+        port <- Server.install(testServer.routes)
+        r1   <- postModern(port, noMeta, "server/discover")
+        b1   <- bodyJson(r1)
+        r2   <- postModern(port, noVersion, "server/discover")
+        b2   <- bodyJson(r2)
+        r3   <- postModern(port, noCaps, "tools/list")
+        b3   <- bodyJson(r3)
+      yield assertTrue(
+        Chunk(r1, r2, r3).forall(_.status == Status.BadRequest),
+        Chunk(b1, b2, b3).forall(codeOf(_).contains(ErrorCode.InvalidParams.code)),
+        b1.get("id").contains(Json.Num(1)), b3.get("id").contains(Json.Num(3)),
+      )
     ,
 
     test("unsupported protocol version -> 400 with -32022 and supported list"):
@@ -905,6 +933,27 @@ object NegotiationSpec extends ZIOSpecDefault:
         r    <- postModern(port, call, "tools/call", name = Some("ask_name"))
         b    <- bodyJson(r)
       yield assertTrue(textOf(b).contains("hello Ada (accept)"))
+    ,
+
+    test("input the client has no capability for -> 400 with -32021 and requiredCapabilities"):
+      // SEP-2575: a server MUST NOT rely on an undeclared capability.
+      val call = modernBody(1, "tools/call",
+        Chunk("name" -> Json.Str("summarize"), "arguments" -> Json.Obj()),
+        metaExtra = Chunk(McpMeta.ClientCapabilities -> Json.Obj("elicitation" -> Json.Obj())),
+      )
+      for
+        port <- Server.install(mrtrServer.routes)
+        r    <- postModern(port, call, "tools/call", name = Some("summarize"))
+        b    <- bodyJson(r)
+      yield
+        val required = errorOf(b).flatMap(_.get("data")).flatMap(_.asObject)
+          .flatMap(_.get("requiredCapabilities")).flatMap(_.asObject)
+        assertTrue(
+          r.status == Status.BadRequest,
+          codeOf(b).contains(ErrorCode.MissingRequiredClientCapability.code),
+          required.exists(_.get("sampling").isDefined),
+          b.get("id").contains(Json.Num(1)),
+        )
     ,
 
     test("only capabilities the client declared are asked for"):

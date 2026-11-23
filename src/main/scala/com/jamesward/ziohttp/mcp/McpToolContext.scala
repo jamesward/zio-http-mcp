@@ -81,6 +81,8 @@ object Root:
 sealed trait InputSpec:
   def id: String
   private[mcp] def toRequest: InputRequest
+  /** The client capability answering this input needs (`elicitation`, `sampling`, `roots`). */
+  private[mcp] def capability: String
 
 object InputSpec:
   given CanEqual[InputSpec, InputSpec] = CanEqual.derived
@@ -97,12 +99,14 @@ object InputSpec:
   def listRoots(id: String): InputSpec = ListRoots(id)
 
   private[mcp] final case class Elicit(id: String, message: String, schema: Json.Obj) extends InputSpec:
+    def capability: String = "elicitation"
     def toRequest: InputRequest = InputRequest(id, "elicitation/create", Json.Obj(Chunk(
       "message" -> Json.Str(message),
       "requestedSchema" -> (schema: Json),
     )))
 
   private[mcp] final case class Sample(id: String, prompt: String, maxTokens: Int) extends InputSpec:
+    def capability: String = "sampling"
     def toRequest: InputRequest = InputRequest(id, "sampling/createMessage", Json.Obj(Chunk(
       "messages" -> Json.Arr(Chunk(Json.Obj(Chunk(
         "role" -> Json.Str("user"),
@@ -112,6 +116,7 @@ object InputSpec:
     )))
 
   private[mcp] final case class ListRoots(id: String) extends InputSpec:
+    def capability: String = "roots"
     def toRequest: InputRequest = InputRequest(id, "roots/list", Json.Obj())
 
 /**
@@ -325,6 +330,21 @@ object McpToolContext:
   ) extends RuntimeException(s"MCP input required: ${requests.map(_.method).mkString(", ")}")
 
   /**
+   * Defect raised by a modern (2026-07-28) tool context when the handler asks
+   * for input that needs a capability the client did not declare in
+   * `_meta.io.modelcontextprotocol/clientCapabilities`. SEP-2575: a server MUST
+   * NOT rely on an undeclared capability, and answers with
+   * `MissingRequiredClientCapabilityError` (`-32021`, HTTP `400`) instead.
+   *
+   * @param capabilities the undeclared capabilities (`sampling`, `elicitation`, `roots`)
+   */
+  private[mcp] final case class MissingCapabilitySignal(capabilities: Chunk[String])
+      extends RuntimeException(s"MCP client capability required: ${capabilities.mkString(", ")}"):
+    /** The error's `data`: `requiredCapabilities` as a `ClientCapabilities` object. */
+    def data: Json =
+      Json.Obj("requiredCapabilities" -> Json.Obj(capabilities.map(_ -> Json.Obj())*))
+
+  /**
    * A modern tool context. Server-initiated interactions do not stream as
    * JSON-RPC requests; instead each input is answered from the `inputResponses`
    * the client sent on its retry, matched by correlation id, or — when an
@@ -401,7 +421,11 @@ object McpToolContext:
       def inputs(specs: InputSpec*): ZIO[Any, ToolError, InputResults] =
         val asked = Chunk.fromIterable(specs)
         val missing = asked.filterNot(spec => inputResponses.contains(spec.id))
-        if missing.nonEmpty then
+        val undeclared = declaredCapabilities.fold(Chunk.empty[String]): declared =>
+          missing.map(_.capability).distinct.filterNot(declared.contains)
+        if undeclared.nonEmpty then
+          ZIO.die(MissingCapabilitySignal(undeclared))
+        else if missing.nonEmpty then
           pending.get.flatMap(state => ZIO.die(InputRequiredSignal(missing.map(_.toRequest), state)))
         else
           ZIO.succeed(InputResults(asked.map(spec => spec.id -> inputResponses(spec.id)).toMap))

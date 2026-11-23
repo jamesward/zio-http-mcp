@@ -188,6 +188,9 @@ private[client] final case class ResolvedOAuth(
   clientId: Option[String] = None,
   clientSecret: Option[Config.Secret] = None,
   scopes: Set[String] = Set.empty,
+  /** How the client authenticates at the token endpoint when it has a secret:
+    * `client_secret_basic` or `client_secret_post` (RFC 7591 §2). */
+  tokenEndpointAuthMethod: String = ClientOAuth.ClientSecretBasic,
 )
 
 /**
@@ -196,14 +199,33 @@ private[client] final case class ResolvedOAuth(
  */
 private[client] object ClientOAuth:
 
-  /** Resolve endpoints, audience, and (for authorization-code) the client identity. */
+  /**
+   * Resolve endpoints, audience, and (for authorization-code) the client identity.
+   * `challenge` is the `WWW-Authenticate` of the `401` that asked for
+   * authorization, when there was one: its `resource_metadata` and `scope` are
+   * used rather than probing the server for them.
+   */
   def resolve(
     client: Client,
     serverUrl: String,
     oauth: McpClientOAuth,
+    challenge: Option[String] = None,
   ): IO[McpClientError, ResolvedOAuth] = oauth match
-    case cc: OAuthClientCredentials  => resolveClientCredentials(client, serverUrl, cc)
-    case ac: OAuthAuthorizationCode  => resolveAuthorizationCode(client, serverUrl, ac)
+    case cc: OAuthClientCredentials  => resolveClientCredentials(client, serverUrl, cc, challenge)
+    case ac: OAuthAuthorizationCode  => resolveAuthorizationCode(client, serverUrl, ac, challenge)
+
+  /** The scopes a `WWW-Authenticate` challenge names, if any. */
+  def challengeScopes(challenge: Option[String]): Set[String] =
+    challenge.flatMap(parseChallengeParam(_, "scope")).map(_.split(' ').toSet.filter(_.nonEmpty)).getOrElse(Set.empty)
+
+  /** The authorization server the protected resource metadata names now, read
+    * without registering anything. `None` when the server has no metadata. */
+  def currentAuthorizationServer(client: Client, serverUrl: String): IO[McpClientError, Option[String]] =
+    for
+      probe <- discoverPrm(client, serverUrl)
+      found <- fetchPrm(client, probe).option
+      as    <- ZIO.foreach(found)((prmUrl, prm) => firstAuthorizationServer(prm, prmUrl))
+    yield as
 
   /** Obtain a fresh access token, using the refresh token from `previous` if present. */
   def fetchToken(
@@ -226,13 +248,14 @@ private[client] object ClientOAuth:
     client: Client,
     serverUrl: String,
     oauth: OAuthClientCredentials,
+    challenge: Option[String],
   ): IO[McpClientError, ResolvedOAuth] =
     (oauth.tokenEndpoint, oauth.resource) match
       case (Some(te), Some(res)) =>
         decodeUrl(te).map(ResolvedOAuth(_, res))
       case (explicitTe, explicitRes) =>
         for
-          probe         <- discoverPrm(client, serverUrl)
+          probe         <- discoverPrm(client, serverUrl, challenge)
           (prmUrl, prm) <- fetchPrm(client, probe)
           resource      <- explicitRes match
                              case Some(r) => ZIO.succeed(r)
@@ -270,18 +293,30 @@ private[client] object ClientOAuth:
     client: Client,
     serverUrl: String,
     oauth: OAuthAuthorizationCode,
+    challenge: Option[String],
   ): IO[McpClientError, ResolvedOAuth] =
     for
-      probe         <- discoverPrm(client, serverUrl)
-      (prmUrl, prm) <- fetchPrm(client, probe)
-      resource      <- prmResource(prm, prmUrl, serverUrl)
-      issuer        <- firstAuthorizationServer(prm, prmUrl)
-      meta     <- discoverAsMetadata(client, issuer)
+      probe    <- discoverPrm(client, serverUrl, challenge)
+      found    <- fetchPrm(client, probe).either
+      located  <- found match
+                    case Right((prmUrl, prm)) =>
+                      for
+                        resource <- prmResource(prm, prmUrl, serverUrl)
+                        issuer   <- firstAuthorizationServer(prm, prmUrl)
+                        meta     <- discoverAsMetadata(client, issuer)
+                      yield (resource, meta, selectScopes(oauth.scopes, probe.scopeHint, prm))
+                    // A server that names no PRM and has none at the well-known URLs
+                    // predates RFC 9728: a 2025-03-26 server.
+                    case Left(prmError) if !probe.advertised && prmError.getMessage.contains("returned 404") =>
+                      legacyAuthorizationServer(client, serverUrl, prmError)
+                        .map(meta => (serverUrl, meta, selectScopes(oauth.scopes, probe.scopeHint, Json.Obj())))
+                    case Left(prmError) =>
+                      ZIO.fail(prmError)
+      (resource, meta, scopes) = located
       authEp   <- ZIO.fromOption(meta.authorizationEndpoint)
-                    .orElseFail(McpClientError.Auth(s"AS metadata for $issuer missing 'authorization_endpoint'"))
+                    .orElseFail(McpClientError.Auth(s"AS metadata for ${meta.issuer} missing 'authorization_endpoint'"))
                     .flatMap(decodeUrl)
       tokenEp  <- decodeUrl(meta.tokenEndpoint)
-      scopes    = selectScopes(oauth.scopes, probe.scopeHint, prm)
       identity <- resolveClientIdentity(client, oauth, meta, scopes)
     yield ResolvedOAuth(
       tokenEndpoint = tokenEp,
@@ -289,10 +324,67 @@ private[client] object ClientOAuth:
       authorizationEndpoint = Some(authEp),
       issuer = Some(meta.issuer),
       issAdvertised = meta.issParameterSupported,
-      clientId = Some(identity._1),
-      clientSecret = identity._2,
+      clientId = Some(identity.clientId),
+      clientSecret = identity.secret,
       scopes = scopes,
+      tokenEndpointAuthMethod = tokenAuthMethod(identity.registeredAuthMethod, meta.tokenEndpointAuthMethods),
     )
+
+  /**
+   * The authorization server of a server without Protected Resource Metadata, as
+   * the 2025-03-26 revision locates it: the MCP server URL's origin is the
+   * authorization base URL, with RFC 8414 metadata at
+   * `/.well-known/oauth-authorization-server`, and without metadata the default
+   * endpoints `/authorize`, `/token` and `/register` (2025-03-26 Authorization
+   * §2.3.2 and §2.3.3).
+   */
+  private def legacyAuthorizationServer(
+    client: Client,
+    serverUrl: String,
+    prmError: McpClientError,
+  ): IO[McpClientError, AsMetadata] =
+    for
+      url    <- decodeUrl(serverUrl)
+      origin  = s"${url.scheme.map(_.encode).getOrElse("https")}://${url.host.getOrElse("localhost")}" +
+                  url.port.fold("")(p => s":$p")
+      _      <- ZIO.logInfo(
+                  s"No protected resource metadata for '$serverUrl' (${prmError.getMessage}); " +
+                    s"using '$origin' as the authorization server, as the 2025-03-26 revision does")
+      meta   <- discoverAsMetadata(client, origin).catchAll: _ =>
+                  ZIO.logInfo(s"No authorization server metadata at '$origin'; using its default endpoints")
+                    .as(AsMetadata(
+                      issuer = origin,
+                      tokenEndpoint = s"$origin/token",
+                      authorizationEndpoint = Some(s"$origin/authorize"),
+                      registrationEndpoint = Some(s"$origin/register"),
+                      clientIdMetadataDocumentSupported = false,
+                      issParameterSupported = false,
+                      scopesSupported = Chunk.empty,
+                      tokenEndpointAuthMethods = Chunk.empty,
+                    ))
+    yield meta
+
+  /**
+   * The token endpoint authentication method for a client with a secret: the one
+   * it registered with (RFC 7591 §3.2.1), then `client_secret_basic` when the
+   * authorization server supports it or doesn't say (its RFC 8414 default), then
+   * `client_secret_post` when that is all it supports.
+   */
+  private def tokenAuthMethod(registered: Option[String], supported: Chunk[String]): String =
+    registered.filter(m => m == ClientSecretBasic || m == ClientSecretPost).getOrElse:
+      if supported.isEmpty || supported.contains(ClientSecretBasic) then ClientSecretBasic
+      else if supported.contains(ClientSecretPost) then ClientSecretPost
+      else ClientSecretBasic
+
+  val ClientSecretBasic = "client_secret_basic"
+  val ClientSecretPost  = "client_secret_post"
+
+  /** The client identity resolved for an authorization server. */
+  private final case class ClientIdentity(
+    clientId: String,
+    secret: Option[Config.Secret],
+    registeredAuthMethod: Option[String] = None,
+  )
 
   /**
    * Client identification, in the spec's priority order: pre-registered client id →
@@ -304,20 +396,20 @@ private[client] object ClientOAuth:
     oauth: OAuthAuthorizationCode,
     meta: AsMetadata,
     scopes: Set[String],
-  ): IO[McpClientError, (String, Option[Config.Secret])] =
+  ): IO[McpClientError, ClientIdentity] =
     oauth.clientId match
       case Some(id) =>
         ZIO.logInfo(
           s"OAuth client identity: using pre-registered client_id '$id' for issuer '${meta.issuer}' " +
             "(CIMD and Dynamic Client Registration skipped)")
-          .as((id, oauth.clientSecret))
+          .as(ClientIdentity(id, oauth.clientSecret))
       case None =>
         oauth.clientMetadataUrl match
           case Some(url) if meta.clientIdMetadataDocumentSupported =>
             ZIO.logInfo(
               s"OAuth client identity: using CIMD (Client ID Metadata Document) client_id '$url' " +
                 s"— issuer '${meta.issuer}' advertises client_id_metadata_document_supported")
-              .as((url, None))
+              .as(ClientIdentity(url, None))
           case _ =>
             // Explain why CIMD was not used, then fall back to DCR (or fail).
             val cimdSkipReason =
@@ -343,7 +435,7 @@ private[client] object ClientOAuth:
     registrationEndpoint: String,
     oauth: OAuthAuthorizationCode,
     scopes: Set[String],
-  ): IO[McpClientError, (String, Option[Config.Secret])] =
+  ): IO[McpClientError, ClientIdentity] =
     val isLoopback =
       oauth.redirectUri.startsWith("http://127.0.0.1") ||
         oauth.redirectUri.startsWith("http://localhost") ||
@@ -376,7 +468,11 @@ private[client] object ClientOAuth:
       id   <- ZIO.fromOption(json.get("client_id").flatMap(_.asString))
                 .orElseFail(McpClientError.Auth("Registration response missing 'client_id'"))
       _    <- ZIO.logInfo(s"Dynamic Client Registration succeeded at '$registrationEndpoint': registered client_id '$id'")
-    yield (id, json.get("client_secret").flatMap(_.asString).map(Config.Secret(_)))
+    yield ClientIdentity(
+      id,
+      json.get("client_secret").flatMap(_.asString).map(Config.Secret(_)),
+      json.get("token_endpoint_auth_method").flatMap(_.asString),
+    )
 
   /** The authorization-code round trip: authorize (PKCE, resource, state) → validate → exchange. */
   private def authorizationCodeDance(
@@ -479,6 +575,8 @@ private[client] object ClientOAuth:
   /** Build a token-endpoint request with the right client authentication. */
   private def tokenRequest(resolved: ResolvedOAuth, form: String, clientId: String): Request =
     val (body, auth) = resolved.clientSecret match
+      case Some(secret) if resolved.tokenEndpointAuthMethod == ClientSecretPost =>
+        (s"$form&client_id=${urlEncode(clientId)}&client_secret=${urlEncode(String(secret.value.toArray))}", None)
       case Some(secret) => (form, Some(Header.Authorization.Basic(clientId, String(secret.value.toArray))))
       case None         => (s"$form&client_id=${urlEncode(clientId)}", None)
     val base = Request.post(resolved.tokenEndpoint, Body.fromString(body))
@@ -508,7 +606,8 @@ private[client] object ClientOAuth:
 
   // --- discovery internals ---
 
-  private[client] final case class PrmProbe(prmUrls: List[URL], scopeHint: Option[String])
+  /** @param advertised whether the server's `WWW-Authenticate` challenge named the PRM URL */
+  private[client] final case class PrmProbe(prmUrls: List[URL], scopeHint: Option[String], advertised: Boolean = false)
 
   /** Authorization-server metadata (RFC 8414 / OIDC Discovery), the fields we use. */
   private[client] final case class AsMetadata(
@@ -519,6 +618,7 @@ private[client] object ClientOAuth:
     clientIdMetadataDocumentSupported: Boolean,
     issParameterSupported: Boolean,
     scopesSupported: Chunk[String],
+    tokenEndpointAuthMethods: Chunk[String],
   )
 
   /**
@@ -527,7 +627,21 @@ private[client] object ClientOAuth:
    * `resource_metadata` parameter from the `WWW-Authenticate` challenge. Otherwise
    * fall back to the well-known path under the server origin (RFC 9728 §3.1).
    */
-  private def discoverPrm(client: Client, serverUrl: String): IO[McpClientError, PrmProbe] =
+  private def discoverPrm(client: Client, serverUrl: String, challenge: Option[String] = None): IO[McpClientError, PrmProbe] =
+    challenge match
+      case Some(www) => decodeUrl(serverUrl).flatMap(url => probeFrom(url, Some(www)))
+      case None      => probeServer(client, serverUrl)
+
+  /** The PRM URLs and scope hint a challenge gives, or the well-known URLs without one. */
+  private def probeFrom(url: URL, www: Option[String]): IO[McpClientError, PrmProbe] =
+    val advertised = www.flatMap(parseChallengeParam(_, "resource_metadata"))
+    for
+      prmUrls <- advertised match
+                   case Some(metaUrl) => decodeUrl(metaUrl).map(List(_))
+                   case None          => ZIO.foreach(defaultPrmUrls(url))(decodeUrl)
+    yield PrmProbe(prmUrls, www.flatMap(parseChallengeParam(_, "scope")), advertised.isDefined)
+
+  private def probeServer(client: Client, serverUrl: String): IO[McpClientError, PrmProbe] =
     val probeBody =
       """{"jsonrpc":"2.0","id":"probe","method":"initialize",""" +
         """"params":{"protocolVersion":"2025-11-25","capabilities":{},""" +
@@ -539,11 +653,8 @@ private[client] object ClientOAuth:
                 .addHeader("accept", "application/json, text/event-stream")
       resp <- client.batched(req)
                 .mapError(t => McpClientError.Auth(s"Auth discovery probe failed: ${t.getMessage}"))
-      www     = resp.rawHeader("www-authenticate")
-      prmUrls <- www.flatMap(parseChallengeParam(_, "resource_metadata")) match
-                   case Some(metaUrl) => decodeUrl(metaUrl).map(List(_))
-                   case None          => ZIO.foreach(defaultPrmUrls(url))(decodeUrl)
-    yield PrmProbe(prmUrls, www.flatMap(parseChallengeParam(_, "scope")))
+      probe <- probeFrom(url, resp.rawHeader("www-authenticate"))
+    yield probe
 
   /** Fetch the PRM document, trying each candidate well-known URL in priority order. */
   private def fetchPrm(client: Client, probe: PrmProbe): IO[McpClientError, (URL, Json.Obj)] =
@@ -679,7 +790,8 @@ private[client] object ClientOAuth:
                     .orElseFail(McpClientError.Auth(s"AS metadata for '$issuer' missing 'issuer'"))
       _        <- ZIO.fail(McpClientError.Auth(
                     s"AS metadata issuer mismatch: requested '$issuer' but metadata declares '$metaIss'"))
-                    .when(metaIss.stripSuffix("/") != issuer.stripSuffix("/"))
+                    // RFC 8414 §3.3: identical, so not even a trailing `/` may differ.
+                    .when(metaIss != issuer)
       tokenEp  <- ZIO.fromOption(json.get("token_endpoint").flatMap(_.asString))
                     .orElseFail(McpClientError.Auth(s"AS metadata for '$issuer' missing 'token_endpoint'"))
     yield AsMetadata(
@@ -693,6 +805,9 @@ private[client] object ClientOAuth:
         json.get("authorization_response_iss_parameter_supported").flatMap(_.asBoolean).getOrElse(false),
       scopesSupported =
         json.get("scopes_supported").flatMap(_.asArray).map(_.flatMap(_.asString)).getOrElse(Chunk.empty),
+      tokenEndpointAuthMethods =
+        json.get("token_endpoint_auth_methods_supported").flatMap(_.asArray).map(_.flatMap(_.asString))
+          .getOrElse(Chunk.empty),
     )
 
   private[client] def asMetadataUrls(issuer: String): List[String] =

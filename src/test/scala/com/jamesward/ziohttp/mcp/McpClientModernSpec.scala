@@ -152,16 +152,23 @@ object McpClientModernSpec extends ZIOSpecDefault:
             assertTrue(text.contains("done: blue"))
       ,
 
-      test("modern client without an input handler surfaces a clear error on MRTR"):
+      test("modern client without an input handler declares no input capabilities, so the server answers -32021"):
+        // Without `onInputRequest` the client declares no `sampling`, so a tool
+        // that needs it gets MissingRequiredClientCapabilityError (SEP-2575)
+        // rather than an input_required the client could not answer.
         ZIO.scoped:
           for
             port   <- Server.install(server.routes)
             client <- McpClient.connect(s"http://localhost:$port/mcp")
             err    <- client.callTool("summarize").flip
-          yield assertTrue(
-            err.isInstanceOf[McpClientError.Protocol],
-            err.getMessage.contains("MRTR") || err.getMessage.contains("input"),
-          )
+          yield err match
+            case McpClientError.JsonRpc(code, _, data) =>
+              assertTrue(
+                code == ErrorCode.MissingRequiredClientCapability.code,
+                data.flatMap(_.asObject).flatMap(_.get("requiredCapabilities")).flatMap(_.asObject)
+                  .exists(_.get("sampling").isDefined),
+              )
+            case other => assertNever(s"expected -32021, got $other")
       ,
 
     ).provide(

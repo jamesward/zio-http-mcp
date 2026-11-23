@@ -411,7 +411,7 @@ final class McpServer[-R] private (
         Routes(
           Method.GET / ".well-known" / "oauth-protected-resource" -> handlerFn,
           Method.GET / ".well-known" / "oauth-protected-resource" / trailing -> trailingHandler,
-        ) ++ McpServer.asMetadataRedirectRoutes(a)
+        )
 
   /**
    * Run the auth middleware if [[auth]] is configured, otherwise yield `None`.
@@ -630,7 +630,7 @@ final class McpServer[-R] private (
         modernHandlePromptsGet(id, version, params, principal, pathParams, stateStore)
       case (Some(dm), _) =>
         dispatchMethod(id, dm, version, params, principal, pathParams,
-          modernHandleToolsCall(request, version, _, _, principal, pathParams, stateStore))
+          modernHandleToolsCall(request, version, _, _, principal, pathParams, stateStore, httpBinding))
       case (None, _) =>
         dispatchExtension(request, id, method, version, params, ctx, httpBinding)
 
@@ -727,7 +727,7 @@ final class McpServer[-R] private (
           Some(id),
           ErrorCode.MissingRequiredClientCapability,
           s"Client must declare extension '${extensionId.value}'",
-          Status.Ok,
+          missingCapabilityStatus(version),
         )
       case McpMethodError.RoutingNameMismatch(expected, actual) =>
         jsonRpcErrorResponseWith(
@@ -839,8 +839,12 @@ final class McpServer[-R] private (
                 prompt.getWithContext(getParams.arguments.getOrElse(Map.empty), ctx)
                   .foldCauseZIO(
                     cause =>
-                      cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
-                        case Some(signal) => inputRequiredJson(signal, stateStore).map(rawResultResponse(id, _))
+                      cause.defects.collectFirst {
+                        case s: McpToolContext.InputRequiredSignal    => Left(s)
+                        case s: McpToolContext.MissingCapabilitySignal => Right(s)
+                      } match
+                        case Some(Left(signal)) => inputRequiredJson(signal, stateStore).map(rawResultResponse(id, _))
+                        case Some(Right(signal)) => ZIO.fail(missingCapabilityResponse(id, signal))
                         case None =>
                           val message = cause.failureOption.map(_.message)
                             .getOrElse("Prompt execution failed")
@@ -874,12 +878,16 @@ final class McpServer[-R] private (
     principal: Option[Principal],
     pathParams: Map[String, String],
     stateStore: McpRequestStateStore,
+    httpBinding: Boolean = true,
   ): ZIO[R, Response, Response] =
     parseToolCallParams(id, params).flatMap: callParams =>
       toolsByName.get(callParams.name) match
         case None =>
           // Dynamic tool sources do not participate in MRTR.
           dispatchToSource(id, version, callParams, principal, pathParams)
+        case Some(tool) if httpBinding && paramHeaderMismatch(request, tool, callParams).isDefined =>
+          ZIO.fail(jsonRpcErrorResponseWith(Some(id), ErrorCode.HeaderMismatch,
+            paramHeaderMismatch(request, tool, callParams).getOrElse(""), Status.BadRequest))
         case Some(tool) =>
           val meta           = McpMeta.of(params)
           val clientHasTasks = McpTasks.clientDeclares(params)
@@ -890,7 +898,7 @@ final class McpServer[-R] private (
                 ZIO.fail(jsonRpcErrorResponseWith(
                   Some(id), ErrorCode.MissingRequiredClientCapability,
                   s"Tool '${tool.name.value}' runs as a task: the client must declare the '${McpTasks.ExtensionId}' extension",
-                  Status.Ok, Some(McpTasks.requiredCapabilityData)))
+                  Status.BadRequest, Some(McpTasks.requiredCapabilityData)))
               case (TaskExecution.Required | TaskExecution.WhenSupported, Some(tasks)) if clientHasTasks =>
                 runToolAsTask(id, tool, callParams, params, principal, pathParams, tasks)
               case (TaskExecution.WhenSlow(after), Some(tasks)) if clientHasTasks =>
@@ -906,28 +914,59 @@ final class McpServer[-R] private (
                     input.context(principal, pathParams).flatMap: ctx =>
                       tool.callWithContext(callParams.arguments, ctx)
                         .foldCauseZIO(
-                          cause => modernToolFailureJson(cause, stateStore).map(rawResultResponse(id, _)),
+                          cause => modernToolFailure(cause, stateStore).flatMap:
+                            case Left(detail) => ZIO.fail(jsonRpcErrorResponseWith(
+                                                   Some(id), ErrorCode.MissingRequiredClientCapability,
+                                                   detail.message, Status.BadRequest, detail.data))
+                            case Right(json)  => ZIO.succeed(rawResultResponse(id, json)),
                           result => resultResponse(id, version, result),
                         )
           }
 
-  /** The final result object for a failed modern tool call: an
-    * [[InputRequiredResult]] when the failure is an MRTR input signal,
-    * otherwise a generic `isError` [[CallToolResult]] in the modern envelope. */
-  private def modernToolFailureJson(
+  /**
+   * Why a Streamable HTTP `tools/call`'s `Mcp-Param-*` headers don't match its
+   * arguments, for a tool whose `inputSchema` annotates parameters with
+   * `x-mcp-header` (2026-07-28 Streamable HTTP, Server Behavior for Custom
+   * Headers); `None` when they match or the tool annotates none.
+   */
+  private def paramHeaderMismatch(request: Request, tool: McpToolHandlerR[R], callParams: ToolCallParams): Option[String] =
+    McpParamHeaders.annotations(tool.definition.inputSchema).toOption.filter(_.nonEmpty).flatMap: annotated =>
+      McpParamHeaders.validate(annotated, callParams.arguments.getOrElse(Json.Obj()), request.rawHeader(_)).left.toOption
+
+  /** The outcome of a failed modern tool call: a `-32021` error when the handler
+    * asked for input the client has no capability for, an [[InputRequiredResult]]
+    * when the failure is an MRTR input signal, and otherwise a generic `isError`
+    * [[CallToolResult]] in the modern envelope. */
+  private def modernToolFailure(
     cause: Cause[Any],
     stateStore: McpRequestStateStore,
-  ): UIO[Json.Obj] =
-    cause.defects.collectFirst { case s: McpToolContext.InputRequiredSignal => s } match
-      case Some(signal) =>
-        inputRequiredJson(signal, stateStore)
+  ): UIO[Either[ErrorDetail, Json.Obj]] =
+    cause.defects.collectFirst {
+      case s: McpToolContext.InputRequiredSignal    => Left(s)
+      case s: McpToolContext.MissingCapabilitySignal => Right(s)
+    } match
+      case Some(Left(signal)) =>
+        inputRequiredJson(signal, stateStore).map(Right(_))
+      case Some(Right(signal)) =>
+        ZIO.succeed(Left(missingCapabilityDetail(signal)))
       case None =>
         val errorResult = CallToolResult(
           content = Chunk(ToolContent.text("Tool execution failed")),
           isError = Some(true),
         )
         val obj = callToolResultJson(errorResult).asObject.getOrElse(Json.Obj())
-        ZIO.succeed(ModernEnvelope.complete(obj, serverInfo, cacheable = false))
+        ZIO.succeed(Right(ModernEnvelope.complete(obj, serverInfo, cacheable = false)))
+
+  private def missingCapabilityDetail(signal: McpToolContext.MissingCapabilitySignal): ErrorDetail =
+    ErrorDetail(
+      ErrorCode.MissingRequiredClientCapability.code,
+      s"Missing required client capability: ${signal.capabilities.mkString(", ")}",
+      Some(signal.data),
+    )
+
+  private def missingCapabilityResponse(id: RequestId, signal: McpToolContext.MissingCapabilitySignal): Response =
+    val detail = missingCapabilityDetail(signal)
+    jsonRpcErrorResponseWith(Some(id), ErrorCode.MissingRequiredClientCapability, detail.message, Status.BadRequest, detail.data)
 
   /** Modern `tools/call` answered as an SSE stream: the tool runs on a forked
     * fiber feeding request-scoped notifications into the stream, and the final
@@ -945,13 +984,13 @@ final class McpServer[-R] private (
   ): ZIO[R, Response, Response] =
     Queue.unbounded[JsonRpcMessage].flatMap: queue =>
       input.context(principal, pathParams, Some(queue), progressToken, logLevel).flatMap: ctx =>
-       Promise.make[Nothing, Json].flatMap: resultPromise =>
+       Promise.make[Nothing, Either[ErrorDetail, Json]].flatMap: resultPromise =>
         val runTool = tool.callWithContext(callParams.arguments, ctx)
           .foldCauseZIO(
-            cause => modernToolFailureJson(cause, stateStore),
+            cause => modernToolFailure(cause, stateStore),
             result =>
               val obj = callToolResultJson(result).asObject.getOrElse(Json.Obj())
-              ZIO.succeed(ModernEnvelope.complete(obj, serverInfo, cacheable = false)),
+              ZIO.succeed(Right(ModernEnvelope.complete(obj, serverInfo, cacheable = false))),
           )
           .flatMap(json => resultPromise.succeed(json))
           .ensuring(drainThenShutdown(queue))
@@ -1047,7 +1086,7 @@ final class McpServer[-R] private (
       ZIO.fail(jsonRpcErrorResponseWith(
         Some(id), ErrorCode.MissingRequiredClientCapability,
         s"The client must declare the '${McpTasks.ExtensionId}' extension to use tasks",
-        Status.Ok, Some(McpTasks.requiredCapabilityData)))
+        Status.BadRequest, Some(McpTasks.requiredCapabilityData)))
     else
       params.flatMap(_.get("taskId")).flatMap(_.asString) match
         case None => ZIO.fail(jsonRpcErrorResponse(Some(id), ErrorCode.InvalidParams, "Missing 'taskId'"))
@@ -1449,12 +1488,12 @@ final class McpServer[-R] private (
               val toolEffect = tool.callWithContext(callParams.arguments, ctx)
 
               // Fork the tool, stream messages + result as SSE
-              Promise.make[Nothing, Json].flatMap: resultPromise =>
+              Promise.make[Nothing, Either[ErrorDetail, Json]].flatMap: resultPromise =>
                 val runTool = toolEffect
-                  .flatMap(r => resultPromise.succeed(callToolResultJson(r)))
+                  .flatMap(r => resultPromise.succeed(Right(callToolResultJson(r))))
                   .catchAllDefect: defect =>
                     McpTool.defectResult(tool.name, Cause.die(defect))
-                      .flatMap(errorResult => resultPromise.succeed(callToolResultJson(errorResult)))
+                      .flatMap(errorResult => resultPromise.succeed(Right(callToolResultJson(errorResult))))
                   .ensuring(drainThenShutdown(queue))
                 runTool.fork.as:
                   sseToolCallResponse(id, queue, resultPromise)
@@ -1631,7 +1670,7 @@ final class McpServer[-R] private (
     if requestedTasks.isDefined && !McpTasks.clientDeclares(params) then
       ZIO.fail(jsonRpcErrorResponseWith(
         Some(id), ErrorCode.MissingRequiredClientCapability,
-        "Missing required client capability", Status.Ok, Some(McpTasks.requiredCapabilityData)))
+        "Missing required client capability", Status.BadRequest, Some(McpTasks.requiredCapabilityData)))
     else
       val asked = requestedTasks.flatMap(_.asArray).getOrElse(Chunk.empty).flatMap(_.asString).distinct.map(TaskId(_))
       val owner = McpTaskOwner.of(principal)
@@ -1739,14 +1778,15 @@ final class McpServer[-R] private (
   private def sseToolCallResponse(
     id: RequestId,
     queue: Queue[JsonRpcMessage],
-    resultPromise: Promise[Nothing, Json],
+    resultPromise: Promise[Nothing, Either[ErrorDetail, Json]],
     endAfterResult: Boolean = false,
   ): Response =
     val messageStream = ZStream.fromQueue(queue).map: msg =>
       sseEvent(msg.toJson)
 
-    val resultStream = ZStream.fromZIO(resultPromise.await).map: json =>
-      sseEvent(JsonRpcResponse(id, json).toJson)
+    val resultStream = ZStream.fromZIO(resultPromise.await).map:
+      case Right(json)  => sseEvent(JsonRpcResponse(id, json).toJson)
+      case Left(detail) => sseEvent(JsonRpcError(Some(id), detail).toJson)
 
     val keepalive = ZStream.tick(30.seconds).as(": keepalive\n\n")
 
@@ -1818,6 +1858,8 @@ final class McpServer[-R] private (
     err match
       case NegotiationError.HeaderMismatch(message) =>
         jsonRpcErrorResponseWith(id, ErrorCode.HeaderMismatch, message, Status.BadRequest)
+      case NegotiationError.InvalidMeta(message) =>
+        jsonRpcErrorResponseWith(id, ErrorCode.InvalidParams, message, Status.BadRequest)
       case NegotiationError.UnsupportedVersion(requested) =>
         jsonRpcErrorResponseWith(
           id,
@@ -1826,6 +1868,12 @@ final class McpServer[-R] private (
           Status.BadRequest,
           Some(Negotiation.unsupportedVersionData(requested)),
         )
+
+  /** The HTTP status of a `MissingRequiredClientCapabilityError` (`-32021`): `400` on
+    * 2026-07-28 and later, as its Streamable HTTP binding requires, and `200` on the
+    * legacy revisions, which carry JSON-RPC errors in a `200`. */
+  private def missingCapabilityStatus(version: ProtocolVersion): Status =
+    if version.isStateless then Status.BadRequest else Status.Ok
 
   /** Method-not-found response. Modern requests get HTTP `404` (per the
     * Streamable HTTP spec); legacy requests keep the JSON-RPC-only `200`. */
@@ -1870,86 +1918,10 @@ object McpServer:
         LogAnnotation("resource", resourceUri.value),
       )(ZIO.logInfo("PRM document requested"))
         .as(Response.json(prm.toJson).addHeader(Header.CacheControl.MaxAge(3600)))
-    // Backwards-compat AS-metadata discovery (see asMetadataRedirectRoutes) is
-    // bundled here so multi-mount hosts get it alongside the shared PRM routes.
     Routes(
       Method.GET / ".well-known" / "oauth-protected-resource" -> handler((req: Request) => respondPRM(req)),
       Method.GET / ".well-known" / "oauth-protected-resource" / trailing -> handler((_: zio.http.Path, req: Request) => respondPRM(req)),
-    ) ++ asMetadataRedirectRoutes(auth)
-
-  /**
-   * Backwards-compat OAuth authorization-server metadata discovery for pre-RFC-9728
-   * clients (e.g. the Rust `rmcp` client used by some MCP CLIs). Such clients IGNORE
-   * the PRM `authorization_servers` and instead probe the RESOURCE origin for AS
-   * metadata — both RFC 8414 `oauth-authorization-server` and OIDC
-   * `openid-configuration`, in root and path-inserted forms.
-   *
-   * The response is keyed on the probe's `User-Agent` (the only client signal on
-   * these unauthenticated discovery GETs — captured/logged here):
-   *   - Legacy origin-probing clients that FOLLOW the redirect and use its target
-   *     (the Rust `rmcp` client behind older kiro-cli, and any unknown / no-UA
-   *     client) get a 302 to the configured AS so discovery succeeds.
-   *   - PRM-capable clients that strictly validate the AS metadata `issuer`
-   *     against the probed origin (RFC 8414 §3.3) — MCP Inspector (Node), Claude
-   *     — REJECT a cross-origin redirect ("issuer mismatch"), so we 404 their
-   *     origin probe and let them fall back to the PRM, which advertises the real
-   *     (cross-origin) AS. See [[isPrmCapableClient]].
-   *
-   * Skipped entirely when the AS is same-origin as the resource (the AS serves its
-   * own metadata there — avoids a redirect-to-self loop). Bundled into both
-   * [[prmStatelessRoutes]] (multi-mount) and the single-mount [[statelessRoutes]].
-   */
-  private[mcp] def asMetadataRedirectRoutes(auth: McpAuth[?]): Routes[Any, Response] =
-    def redirectToAsMetadata(request: Request): UIO[Response] =
-      val userAgent = request.rawHeader("user-agent")
-      val proto     = request.rawHeader(Negotiation.ProtocolVersionHeader)
-      val issuer    = auth.authorizationServers.head.issuer.stripSuffix("/")
-      val origin    = ResourceUriResolver.resolve(None, "", request).value.stripSuffix("/")
-      // Capture the discovery request's identifying headers — there's no auth or
-      // body on this GET, so the client is only visible via these.
-      val logProbe  = ZIO.logAnnotate(
-        LogAnnotation("url", request.url.encode),
-        LogAnnotation("userAgent", userAgent.getOrElse("-")),
-        LogAnnotation("mcpProtocolVersion", proto.getOrElse("-")),
-      )(ZIO.logInfo("AS-metadata origin probe"))
-      if issuer == origin then
-        logProbe.as(Response.status(Status.NotFound))
-      else if isPrmCapableClient(userAgent) then
-        (logProbe *> ZIO.logAnnotate(
-          LogAnnotation("userAgent", userAgent.getOrElse("-")),
-        )(ZIO.logInfo("AS-metadata 404 (PRM-capable client; use protected-resource metadata)")))
-          .as(Response.status(Status.NotFound))
-      else
-        val target = s"$issuer/.well-known/oauth-authorization-server"
-        URL.decode(target) match
-          case Right(u) =>
-            (logProbe *> ZIO.logAnnotate(
-              LogAnnotation("url", request.url.encode),
-              LogAnnotation("target", target),
-            )(ZIO.logInfo("AS-metadata compat redirect (legacy origin discovery)")))
-              .as(Response(status = Status.Found).addHeader(Header.Location(u)))
-          case Left(_) => logProbe.as(Response.status(Status.NotFound))
-    Routes(
-      Method.GET / ".well-known" / "oauth-authorization-server" -> handler((req: Request) => redirectToAsMetadata(req)),
-      Method.GET / ".well-known" / "oauth-authorization-server" / trailing -> handler((_: zio.http.Path, req: Request) => redirectToAsMetadata(req)),
-      Method.GET / ".well-known" / "openid-configuration" -> handler((req: Request) => redirectToAsMetadata(req)),
-      Method.GET / ".well-known" / "openid-configuration" / trailing -> handler((_: zio.http.Path, req: Request) => redirectToAsMetadata(req)),
     )
-
-  /**
-   * Whether a client (identified by its `User-Agent`) does RFC 9728
-   * protected-resource-metadata discovery and strictly validates AS metadata per
-   * RFC 8414 §3.3 — so a cross-origin AS-metadata redirect would fail with an
-   * "issuer mismatch". For these we 404 the origin AS-metadata probe (they fall
-   * back to the PRM). Matched: Node runtimes (MCP Inspector's `fetch`/undici) and
-   * Claude (Claude Code / Desktop). NOT matched (→ keep the 302 compat redirect):
-   * the Rust `rmcp` client behind older kiro-cli, and any unknown / no-UA client.
-   */
-  private[mcp] def isPrmCapableClient(userAgent: Option[String]): Boolean =
-    userAgent.exists { raw =>
-      val ua = raw.toLowerCase
-      ua.contains("node") || ua.contains("undici") || ua.contains("claude")
-    }
 
   trait State:
     def sessions: Ref[Map[SessionId, SessionState]]

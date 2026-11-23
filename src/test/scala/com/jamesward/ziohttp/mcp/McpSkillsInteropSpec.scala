@@ -137,8 +137,9 @@ object McpSkillsInteropSpec extends ZIOSpecDefault:
           raw.flatMap(_.get("ttlMs")).isDefined == version.isStateless,
           raw.flatMap(_.get("cacheScope")).isDefined == version.isStateless,
           getWire.flatMap(_.get("resultType")).flatMap(_.asString).contains("complete") == version.isStateless,
-          getWire.flatMap(_.get("ttlMs")).isEmpty,
-          getWire.flatMap(_.get("cacheScope")).isEmpty,
+          // GetSkillResult extends CacheableResult, so on 2026-07-28 it carries both.
+          getWire.flatMap(_.get("ttlMs")).isDefined == version.isStateless,
+          getWire.flatMap(_.get("cacheScope")).isDefined == version.isStateless,
           directoryWire.flatMap(_.get("resultType")).flatMap(_.asString).contains("complete") == version.isStateless,
           directoryWire.flatMap(_.get("ttlMs")).isEmpty,
           directoryWire.flatMap(_.get("cacheScope")).isEmpty,

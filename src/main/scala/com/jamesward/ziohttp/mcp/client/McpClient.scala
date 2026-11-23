@@ -215,8 +215,13 @@ final case class McpClientConfig(
    * [[InputRequest]] (a `sampling/createMessage`, `elicitation/create`, or
    * `roots/list` the server needs answered), it returns the result JSON to send
    * back in `inputResponses` — on the retry of a Multi Round-Trip Request, or
-   * in `tasks/update` for a task that is `input_required`. When unset, a server
-   * that asks for input fails the call with [[McpClientError.Protocol]].
+   * in `tasks/update` for a task that is `input_required`.
+   *
+   * Setting it declares the `elicitation`, `sampling` and `roots` client
+   * capabilities on every modern request, since the handler answers all three
+   * kinds; a server MUST NOT ask for input the client has not declared. When
+   * unset, the client declares none of them, and a server that needs input
+   * answers with `-32021` (`MissingRequiredClientCapabilityError`).
    */
   onInputRequest: Option[InputRequest => IO[McpClientError, Json]] = None,
 )
@@ -275,9 +280,11 @@ object McpClient:
   ): ZIO[Scope, McpClientError, McpExtensionClient] =
     for
       idRef      <- Ref.make(0L)
-      transport   = Transport(settings, extensions, wire, stateRef, idRef)
+      headersRef <- Ref.make(Map.empty[String, Chunk[McpParamHeader]])
+      transport   = Transport(settings, extensions, wire, stateRef, idRef, headersRef)
       negotiated <- transport.negotiate
       _          <- ZIO.addFinalizer(transport.close.ignore)
+      _          <- wire.listen
     yield Live(transport, negotiated)
 
   /** Connect to an MCP server at `serverUrl` with no authorization. */
@@ -357,7 +364,23 @@ object McpClient:
 
   private enum Attempt:
     case Ok(result: Json)
-    case Unauthorized(body: String)
+    /** A 401, with the `WWW-Authenticate` challenge that came with it. */
+    case Unauthorized(body: String, challenge: Option[String] = None)
+    /** A 403 `insufficient_scope` challenge naming the scopes the operation needs. */
+    case InsufficientScope(body: String, scopes: Set[String])
+
+  /** Step-up authorizations a single request may make before its 403 is final
+    * (2026-07-28 Authorization, Step-Up Authorization Flow: "no more than a few times"). */
+  private val MaxStepUps: Int = 2
+
+  /** One SSE event: its `id`, its `retry` (milliseconds) and its JSON-RPC message. */
+  private final case class SseEvent(id: Option[String], retry: Option[Long], data: Option[Json.Obj])
+
+  /** Reading an SSE stream for one response: the response once seen, and where to resume. */
+  private final case class SseProgress(response: Option[Json.Obj], lastEventId: Option[String], retryMs: Option[Long])
+
+  private val MaxSseReconnects: Int = 10
+  private val DefaultSseRetryMs: Long = 1000L
 
   /** Encode any `JsonEncoder` value into a JSON object (empty object on failure). */
   private def asObj[A: JsonEncoder](a: A): Json.Obj =
@@ -397,6 +420,8 @@ object McpClient:
     wire: McpWire,
     stateRef: Ref[ClientState],
     idRef: Ref[Long],
+    // Each listed tool's `x-mcp-header` annotations, by tool name.
+    paramHeaders: Ref[Map[String, Chunk[McpParamHeader]]],
   ):
 
     /**
@@ -508,7 +533,7 @@ object McpClient:
         _      <- stateRef.update(_.copy(modern = false, sessionId = None))
         params  = asObj(InitializeParams(
                     requestedVersion,
-                    McpExtensionCapabilities.toClientCapabilities(extensions.capabilities),
+                    Json.Obj(inputCapabilities ++ McpExtensionCapabilities.toClientCapabilities(extensions.capabilities).fields),
                     config.clientInfo,
                   ))
         result <- rpc[InitializeResult]("initialize", params)
@@ -541,9 +566,69 @@ object McpClient:
         version = st.protocolVersion.flatMap(ProtocolVersion.parse).getOrElse(config.preferredVersion)
         effParams = if st.modern then withModernMeta(params, version) else params
         body    = (JsonRpcMessage.Request(id, method, Some(effParams)): JsonRpcMessage).toJson
-        extra   = if st.modern then modernHeaders(version, method, effParams, routingName) else Headers.empty
+        mirrored <- if st.modern then mirroredParams(method, effParams) else ZIO.succeed(Headers.empty)
+        extra   = if st.modern then modernHeaders(version, method, effParams, routingName) ++ mirrored else Headers.empty
         result <- wire.request(Outgoing(body, id, extra, sendSession = !st.modern))
       yield result
+
+    /**
+     * One listed tool, or `None` with a warning when its definition is invalid,
+     * so one bad tool doesn't hide the rest. Invalid is what the spec rules out,
+     * such as an `inputSchema` that isn't a JSON Schema object.
+     */
+    private def decodeTool(json: Json): UIO[Option[ToolDefinition]] =
+      json.as[ToolDefinition] match
+        case Right(tool) => ZIO.some(tool)
+        case Left(reason) =>
+          val name = json.asObject.flatMap(_.get("name")).flatMap(_.asString).getOrElse("(unnamed)")
+          ZIO.logWarning(s"Leaving out tool '$name': its definition is invalid: $reason").as(None)
+
+    /** The `Mcp-Param-*` headers of a `tools/call`, from the called tool's listed annotations. */
+    private def mirroredParams(method: String, params: Json.Obj): IO[McpClientError, Headers] =
+      if method != "tools/call" || !wire.mirrorsParamHeaders then ZIO.succeed(Headers.empty)
+      else
+        val name = params.get("name").flatMap(_.asString).getOrElse("")
+        val arguments = params.get("arguments").flatMap(_.asObject).getOrElse(Json.Obj())
+        paramHeaders.get.flatMap: known =>
+          ZIO.fromEither(McpParamHeaders.headers(known.getOrElse(name, Chunk.empty), arguments))
+            .mapBoth(
+              e => McpClientError.Protocol(s"Can't call '$name': $e"),
+              hs => hs.foldLeft(Headers.empty)((acc, h) => acc ++ Headers(h._1, h._2)),
+            )
+
+    /**
+     * Every tool the server lists, following pagination. Over Streamable HTTP, a
+     * tool whose `x-mcp-header` annotations are invalid is left out with a
+     * warning, and the annotations of the rest are kept for their calls.
+     */
+    def listTools: IO[McpClientError, Chunk[ToolDefinition]] =
+      def loop(
+        cursor: Option[String],
+        seen: Set[String],
+        accumulated: Chunk[ToolDefinition],
+      ): IO[McpClientError, Chunk[ToolDefinition]] =
+        val params = cursor.fold(Json.Obj())(value => asObj(ToolsListParams(Some(value))))
+        rpcRaw("tools/list", params).flatMap: result =>
+          val page = result.asObject.getOrElse(Json.Obj())
+          val nextCursor = page.get("nextCursor").flatMap(_.asString)
+          ZIO.foreach(page.get("tools").flatMap(_.asArray).getOrElse(Chunk.empty))(decodeTool).flatMap: decoded =>
+            val all = accumulated ++ decoded.flatten
+            nextCursor match
+              case None => ZIO.succeed(all)
+              case Some(next) if seen.contains(next) =>
+                ZIO.fail(McpClientError.Protocol(s"tools/list repeated pagination cursor '$next'"))
+              case Some(next) => loop(Some(next), seen + next, all)
+      loop(None, Set.empty, Chunk.empty).flatMap: tools =>
+        if !wire.mirrorsParamHeaders then ZIO.succeed(tools)
+        else
+          ZIO.foreach(tools): tool =>
+            McpParamHeaders.annotations(tool.inputSchema) match
+              case Right(headers) => ZIO.succeed(Some(tool.name.value -> headers) -> Some(tool))
+              case Left(reason) =>
+                ZIO.logWarning(s"Leaving out tool '${tool.name.value}': its x-mcp-header annotations are invalid: $reason")
+                  .as(None -> None)
+          .flatMap: checked =>
+            paramHeaders.update(_ ++ checked.flatMap(_._1)).as(checked.flatMap(_._2))
 
     /** Send a request answered with a stream: its notifications as they arrive.
       * The stream ends with the request's result, and fails with its error. */
@@ -596,7 +681,12 @@ object McpClient:
           else Json.Obj(
             params.fields.filterNot((key, _) => key == "inputResponses" || key == "requestState") ++ retryFields
           )
-        rpcRaw("tools/call", callParams).flatMap: result =>
+        // A HeaderMismatch may mean the tool's annotations changed since they
+        // were listed: list the tools again and retry once (Client Behavior).
+        val call = rpcRaw("tools/call", callParams).catchSome:
+          case McpClientError.JsonRpc(code, _, _) if code == ErrorCode.HeaderMismatch.code && wire.mirrorsParamHeaders =>
+            listTools *> rpcRaw("tools/call", callParams)
+        call.flatMap: result =>
           val resultType = result.asObject.flatMap(_.get("resultType")).flatMap(_.asString)
           if resultType.contains(ModernEnvelope.ResultTypeInputRequired) then
             config.onInputRequest match
@@ -706,7 +796,13 @@ object McpClient:
       * handles (see [[toolsCall]]). */
     private val modernCapabilities: Json.Obj =
       val tasks = McpExtensionId.parse(McpMeta.Tasks).toOption.map(_ -> (Json.Obj(): Json))
-      McpExtensionCapabilities.toClientCapabilities(tasks.toMap ++ extensions.capabilities)
+      val declared = McpExtensionCapabilities.toClientCapabilities(tasks.toMap ++ extensions.capabilities)
+      Json.Obj(inputCapabilities ++ declared.fields)
+
+    /** The input handler answers every kind of input, so declare each one it can. */
+    private def inputCapabilities: Chunk[(String, Json)] =
+      config.onInputRequest.fold(Chunk.empty[(String, Json)])(_ =>
+        Chunk("elicitation", "sampling", "roots").map(_ -> (Json.Obj(): Json)))
 
     /** Merge the modern `_meta` (protocol version, client info, client
       * capabilities) into a request's params, preserving any existing `_meta`. */
@@ -742,6 +838,48 @@ object McpClient:
     stateRef: Ref[ClientState],
   ) extends McpWire:
 
+    override def mirrorsParamHeaders: Boolean = true
+
+    /**
+     * On a legacy session whose client answers input, open the session's
+     * standalone SSE stream (a `GET`, which a client MAY open: 2025-11-25
+     * Streamable HTTP, Listening for Messages from the Server). A server sends
+     * requests that belong to no request of the client's there, such as an
+     * elicitation it starts on its own. The stream is reopened, with
+     * `Last-Event-ID`, whenever the server ends it, and given up once the server
+     * refuses it (`405` when it offers none).
+     */
+    override def listen: URIO[Scope, Unit] =
+      def open(lastEventId: Option[String]): IO[McpClientError, Option[(Option[String], Option[Long])]] =
+        ZIO.scoped:
+          for
+            token <- ensureToken(forceRefresh = false)
+            url   <- decodeUrl(config.serverUrl)
+            st    <- stateRef.get
+            base   = Request.get(url).addHeader("accept", "text/event-stream").addHeaders(config.headers)
+            wSid   = st.sessionId.fold(base)(sid => base.addHeader("mcp-session-id", sid))
+            wVer   = st.protocolVersion.fold(wSid)(v => wSid.addHeader("mcp-protocol-version", v))
+            wLast  = lastEventId.fold(wVer)(id => wVer.addHeader("last-event-id", id))
+            req    = token.fold(wLast)(t => wLast.addHeader(Header.Authorization.Bearer(t)))
+            resp  <- streaming(req)
+            out   <-
+              if !resp.status.isSuccess then ZIO.none
+              else
+                sseEvents(resp)
+                  .runFoldZIO((lastEventId, Option.empty[Long])): (progress, event) =>
+                    ZIO.foreachDiscard(event.data.filter(isServerRequest))(answerServerRequest(_, token))
+                      .as((event.id.orElse(progress._1), event.retry.orElse(progress._2)))
+                  .asSome
+          yield out
+      def loop(lastEventId: Option[String]): IO[McpClientError, Unit] =
+        open(lastEventId).flatMap:
+          case None => ZIO.unit
+          case Some((last, retry)) =>
+            ZIO.sleep(Duration.fromMillis(retry.getOrElse(DefaultSseRetryMs))) *> loop(last)
+      ZIO.whenZIO(stateRef.get.map(st => !st.modern && st.sessionId.isDefined && config.onInputRequest.isDefined))(
+        loop(None).catchAll(e => ZIO.logDebug(s"Standalone SSE stream closed: ${e.getMessage}")).forkScoped
+      ).unit
+
     def close: IO[McpClientError, Unit] =
       stateRef.get.flatMap: st =>
         st.sessionId match
@@ -760,50 +898,128 @@ object McpClient:
       // Notifications (only `notifications/initialized`, on the legacy path)
       // carry the session and legacy protocol-version header.
       val out = Outgoing(body, RequestId.Num(0), Headers.empty, sendSession = true)
-      for
-        token <- ensureToken(forceRefresh = false)
-        _     <- ZIO.scoped:
-                   for
-                     req  <- buildRequest(out, token)
-                     resp <- streaming(req)
-                     _    <- captureSession(resp)
-                     _    <- ZIO.unless(resp.status.code == 202 || resp.status.isSuccess)(
-                               failStatus(resp, s"Notification '$method'")
-                             )
-                   yield ()
-      yield ()
+      def send(token: Option[String], authorized: Boolean): IO[McpClientError, Unit] =
+        ZIO.scoped:
+          for
+            req  <- buildRequest(out, token)
+            resp <- streaming(req)
+            _    <- captureSession(resp)
+            _    <-
+              if resp.status.code == 401 && config.oauth.isDefined && !authorized then
+                ensureToken(forceRefresh = true, resp.rawHeader("www-authenticate")).flatMap(send(_, authorized = true))
+              else
+                ZIO.unless(resp.status.code == 202 || resp.status.isSuccess)(
+                  failStatus(resp, s"Notification '$method'")
+                ).unit
+          yield ()
+      ensureToken(forceRefresh = false).flatMap(send(_, authorized = false))
 
+    /**
+     * Send a request, recovering from the authorization failures the spec lets a
+     * client recover from:
+     *
+     *   - a `401` gets a fresh token (a refresh, or a new authorization); a second
+     *     `401` re-reads the protected resource metadata, and if it names another
+     *     authorization server, the client registers there and authorizes again
+     *     (2026-07-28 Client Registration, Authorization Server Binding);
+     *   - a `403` `insufficient_scope` whose challenge asks for scopes the client
+     *     hasn't requested gets a new authorization with the union of the two, at
+     *     most [[MaxStepUps]] times (Step-Up Authorization Flow).
+     */
     def request(o: Outgoing): IO[McpClientError, Json] =
-      for
-        token <- ensureToken(forceRefresh = false)
-        res1  <- attempt(o, token)
-        out   <- res1 match
-                   case Attempt.Ok(json) => ZIO.succeed(json)
-                   case Attempt.Unauthorized(b) =>
-                     config.oauth match
-                       case None => ZIO.fail(McpClientError.Auth(s"Server returned 401 Unauthorized: $b"))
-                       case Some(_) =>
-                         for
-                           token2 <- ensureToken(forceRefresh = true)
-                           res2   <- attempt(o, token2)
-                           json   <- res2 match
-                                       case Attempt.Ok(json)         => ZIO.succeed(json)
-                                       case Attempt.Unauthorized(b2) => ZIO.fail(McpClientError.Auth(s"401 after refreshing token: $b2"))
-                         yield json
-      yield out
+      def go(token: Option[String], refreshed: Boolean, rediscovered: Boolean, stepUps: Int): IO[McpClientError, Json] =
+        attempt(o, token).flatMap:
+          case Attempt.Ok(json) => ZIO.succeed(json)
+          case Attempt.Unauthorized(b, _) if config.oauth.isEmpty =>
+            ZIO.fail(McpClientError.Auth(s"Server returned 401 Unauthorized: $b"))
+          case Attempt.Unauthorized(_, challenge) if !refreshed =>
+            ensureToken(forceRefresh = true, challenge).flatMap(go(_, refreshed = true, rediscovered, stepUps))
+          case Attempt.Unauthorized(b, _) if !rediscovered =>
+            rediscoverAuthorizationServer.flatMap:
+              case true  => ensureToken(forceRefresh = true).flatMap(go(_, refreshed = true, rediscovered = true, stepUps))
+              case false => ZIO.fail(McpClientError.Auth(s"401 after refreshing token: $b"))
+          case Attempt.Unauthorized(b, _) =>
+            ZIO.fail(McpClientError.Auth(s"401 after refreshing token: $b"))
+          case Attempt.InsufficientScope(b, scopes) if stepUps < MaxStepUps =>
+            stepUp(scopes).flatMap:
+              case true  => ensureToken(forceRefresh = true).flatMap(go(_, refreshed, rediscovered, stepUps + 1))
+              case false => ZIO.fail(McpClientError.Protocol(s"Request returned 403: $b"))
+          case Attempt.InsufficientScope(b, _) =>
+            ZIO.fail(McpClientError.Protocol(s"Request returned 403 after $MaxStepUps step-up authorizations: $b"))
+      ensureToken(forceRefresh = false).flatMap(go(_, refreshed = false, rediscovered = false, stepUps = 0))
+
+    /**
+     * Widen the next authorization to the union of the scopes already requested
+     * and those a `403` challenge asks for, dropping the token so the next one
+     * comes from a new authorization (a refresh can't widen a grant). `false`
+     * when the challenge asks for nothing new, or the client acts on its own
+     * behalf (`client_credentials`, whose scopes are configured), so the `403`
+     * stands.
+     */
+    private def stepUp(challenge: Set[String]): IO[McpClientError, Boolean] =
+      config.oauth match
+        case Some(_: OAuthAuthorizationCode) =>
+          stateRef.modify: st =>
+            st.resolvedOAuth match
+              case Some(r) if !challenge.subsetOf(r.scopes) =>
+                (true, st.copy(resolvedOAuth = Some(r.copy(scopes = r.scopes ++ challenge)), token = None))
+              case _ => (false, st)
+        case _ => ZIO.succeed(false)
+
+    /**
+     * Re-read the protected resource metadata after a refreshed token was refused.
+     * `true` when it names a different authorization server, which then replaces
+     * the old one: the old token and any credentials registered there are dropped,
+     * since they must not be used with another authorization server. A
+     * pre-registered client id belongs to the server it was registered with, so a
+     * change is an error for it.
+     */
+    private def rediscoverAuthorizationServer: IO[McpClientError, Boolean] =
+      config.oauth match
+        case None => ZIO.succeed(false)
+        case Some(oauth) =>
+          for
+            st      <- stateRef.get
+            current <- ClientOAuth.currentAuthorizationServer(zclient, config.serverUrl)
+            changed  = (st.resolvedOAuth.flatMap(_.issuer), current) match
+                         case (Some(old), Some(now)) => old.stripSuffix("/") != now.stripSuffix("/")
+                         case _                      => false
+            fresh   <- if changed then ClientOAuth.resolve(zclient, config.serverUrl, oauth).asSome else ZIO.none
+            _       <- (oauth match
+                         case ac: OAuthAuthorizationCode if changed && ac.clientId.isDefined =>
+                           ZIO.fail(McpClientError.Auth(
+                             s"The authorization server changed from '${st.resolvedOAuth.flatMap(_.issuer).getOrElse("?")}' " +
+                               s"to '${current.getOrElse("?")}', and the pre-registered client id " +
+                               s"'${ac.clientId.getOrElse("")}' belongs to the old one"))
+                         case _ => ZIO.unit
+                       )
+            _       <- ZIO.foreachDiscard(fresh): r =>
+                         ZIO.logInfo(s"Authorization server changed to '${current.getOrElse("?")}'; authorizing there") *>
+                           stateRef.update(_.copy(resolvedOAuth = Some(r), token = None))
+          yield changed
 
     def stream(o: Outgoing): ZStream[Any, McpClientError, Json.Obj] =
+      // The first 401 is answered with an authorization, as for `request`.
+      def open(token: Option[String], authorized: Boolean): ZIO[Scope, McpClientError, Response] =
+        for
+          req  <- buildRequest(o, token)
+          resp <- streaming(req)
+          _    <- captureSession(resp)
+          out  <-
+            if resp.status.code == 401 && config.oauth.isDefined && !authorized then
+              ensureToken(forceRefresh = true, resp.rawHeader("www-authenticate")).flatMap(open(_, authorized = true))
+            else ZIO.succeed(resp)
+        yield out
       ZStream.unwrapScoped:
         for
           token <- ensureToken(forceRefresh = false)
-          req   <- buildRequest(o, token)
-          resp  <- streaming(req)
-          _     <- captureSession(resp)
+          resp  <- open(token, authorized = false)
           out   <-
             if !resp.status.isSuccess then
               interpret(resp, o.id).flatMap:
-                case Attempt.Unauthorized(b) => ZIO.fail(McpClientError.Auth(s"Server returned 401 Unauthorized: $b"))
-                case Attempt.Ok(_)           => ZIO.fail(McpClientError.Protocol(s"Request returned ${resp.status.code}"))
+                case Attempt.Unauthorized(b, _)      => ZIO.fail(McpClientError.Auth(s"Server returned 401 Unauthorized: $b"))
+                case Attempt.InsufficientScope(b, _) => ZIO.fail(McpClientError.Protocol(s"Request returned 403: $b"))
+                case Attempt.Ok(_)                   => ZIO.fail(McpClientError.Protocol(s"Request returned ${resp.status.code}"))
             else if resp.rawHeader("content-type").exists(_.toLowerCase.contains("text/event-stream")) then
               // The response to this request is the last message: messages after it belong to nothing.
               ZIO.succeed(sseObjects(resp).takeUntil(isResponseFor(_, o.id)))
@@ -821,19 +1037,27 @@ object McpClient:
           req  <- buildRequest(o, token)
           resp <- streaming(req)
           _    <- captureSession(resp)
-          out  <- interpret(resp, o.id)
+          out  <- interpret(resp, o.id, token)
         yield out
 
-    private def interpret(resp: Response, id: RequestId): ZIO[Scope, McpClientError, Attempt] =
+    private def interpret(resp: Response, id: RequestId, token: Option[String] = None): ZIO[Scope, McpClientError, Attempt] =
       if resp.status.code == 401 then
-        resp.body.asString.orElseSucceed("").map(Attempt.Unauthorized.apply)
+        resp.body.asString.orElseSucceed("").map(Attempt.Unauthorized(_, resp.rawHeader("www-authenticate")))
       else if resp.status.code == 403 then
-        // Authorization denial (insufficient scope): an HTTP-layer auth outcome,
-        // the sibling of the 401 case above — not a JSON-RPC negotiation error.
-        // Surface it as a protocol-level failure; the body still carries the
-        // server's JSON-RPC -32003 "insufficient_scope" detail in the message.
+        // Authorization denial: an HTTP-layer auth outcome, the sibling of the
+        // 401 case above, not a JSON-RPC negotiation error. An
+        // `insufficient_scope` challenge naming scopes can be answered with a
+        // step-up authorization; anything else is a protocol-level failure whose
+        // message carries the server's JSON-RPC detail.
+        val challenge = resp.rawHeader("www-authenticate")
+          .filter(h => ClientOAuth.parseChallengeParam(h, "error").contains("insufficient_scope"))
+          .flatMap(ClientOAuth.parseChallengeParam(_, "scope"))
+          .map(_.split(' ').toSet.filter(_.nonEmpty))
+          .filter(_.nonEmpty)
         resp.body.asString.orElseSucceed("").flatMap: b =>
-          ZIO.fail(McpClientError.Protocol(s"Request returned 403: $b"))
+          challenge match
+            case Some(scopes) if config.oauth.isDefined => ZIO.succeed(Attempt.InsufficientScope(b, scopes))
+            case _ => ZIO.fail(McpClientError.Protocol(s"Request returned 403: $b"))
       else if !resp.status.isSuccess then
         // A modern server signals negotiation failures with a non-2xx status and
         // a JSON-RPC error body (UnsupportedProtocolVersion -32022, HeaderMismatch
@@ -850,26 +1074,35 @@ object McpClient:
             case None =>
               ZIO.fail(McpClientError.Protocol(s"Request returned ${resp.status.code}: $b"))
       else
-        parseResponse(resp, id).map(Attempt.Ok.apply)
+        parseResponse(resp, id, token).map(Attempt.Ok.apply)
 
-    private def ensureToken(forceRefresh: Boolean): IO[McpClientError, Option[String]] =
+    /**
+     * The access token to send, if any. The client authorizes when the server
+     * asks: until a `401` arrives (`forceRefresh`, with its `WWW-Authenticate`
+     * `challenge`), requests go without a token, so the first authorization can
+     * request the scopes the challenge names (2026-07-28 Authorization, Scope
+     * Selection Strategy). After that, an expired token is renewed before use.
+     */
+    private def ensureToken(forceRefresh: Boolean, challenge: Option[String] = None): IO[McpClientError, Option[String]] =
       config.oauth match
         case None => ZIO.none
         case Some(oauth) =>
-          for
-            now      <- Clock.instant
-            st       <- stateRef.get
-            resolved <- st.resolvedOAuth match
-                          case Some(r) => ZIO.succeed(r)
-                          case None    =>
-                            ClientOAuth.resolve(zclient, config.serverUrl, oauth)
-                              .tap(r => stateRef.update(_.copy(resolvedOAuth = Some(r))))
-            token    <- st.token match
-                          case Some(t) if !forceRefresh && t.isValid(now) => ZIO.succeed(t)
-                          case _ =>
-                            ClientOAuth.fetchToken(zclient, resolved, oauth, st.token)
-                              .tap(t => stateRef.update(_.copy(token = Some(t))))
-          yield Some(token.value)
+          stateRef.get.flatMap: st =>
+            if st.resolvedOAuth.isEmpty && !forceRefresh then ZIO.none
+            else
+              for
+                now      <- Clock.instant
+                resolved <- st.resolvedOAuth match
+                              case Some(r) => ZIO.succeed(r)
+                              case None    =>
+                                ClientOAuth.resolve(zclient, config.serverUrl, oauth, challenge)
+                                  .tap(r => stateRef.update(_.copy(resolvedOAuth = Some(r))))
+                token    <- st.token match
+                              case Some(t) if !forceRefresh && t.isValid(now) => ZIO.succeed(t)
+                              case _ =>
+                                ClientOAuth.fetchToken(zclient, resolved, oauth, st.token)
+                                  .tap(t => stateRef.update(_.copy(token = Some(t))))
+              yield Some(token.value)
 
     private def buildRequest(o: Outgoing, token: Option[String]): IO[McpClientError, Request] =
       for
@@ -905,9 +1138,9 @@ object McpClient:
         case None      => ZIO.unit
 
     /** Read the JSON-RPC result for `id`, whether the body is JSON or an SSE stream. */
-    private def parseResponse(resp: Response, id: RequestId): ZIO[Scope, McpClientError, Json] =
+    private def parseResponse(resp: Response, id: RequestId, token: Option[String]): ZIO[Scope, McpClientError, Json] =
       val contentType = resp.rawHeader("content-type").getOrElse("").toLowerCase
-      if contentType.contains("text/event-stream") then parseSse(resp, id)
+      if contentType.contains("text/event-stream") then parseSse(resp, id, token, reconnects = 0)
       else parseJsonBody(resp)
 
     private def parseJsonBody(resp: Response): IO[McpClientError, Json] =
@@ -919,28 +1152,102 @@ object McpClient:
         out  <- ZIO.fromEither(extractResult(obj))
       yield out
 
-    private def parseSse(resp: Response, id: RequestId): ZIO[Scope, McpClientError, Json] =
-      sseObjects(resp)
-        .filter(obj => isResponseFor(obj, id))
-        .runHead
+    /**
+     * Read the response for `id` from an SSE stream. A server may close the
+     * stream before it sends the response, having given its events ids; the
+     * client then resumes with a `GET` carrying `Last-Event-ID`, after the
+     * stream's `retry` delay, which the client MUST respect (2025-11-25
+     * Streamable HTTP, Sending Messages to the Server), at most
+     * [[MaxSseReconnects]] times.
+     */
+    private def parseSse(resp: Response, id: RequestId, token: Option[String], reconnects: Int): ZIO[Scope, McpClientError, Json] =
+      sseEvents(resp)
+        .runFoldWhileZIO(SseProgress(None, None, None))(_.response.isEmpty): (progress, event) =>
+          ZIO.foreachDiscard(event.data.filter(isServerRequest))(answerServerRequest(_, token)).as(
+            SseProgress(
+              event.data.filter(isResponseFor(_, id)),
+              event.id.orElse(progress.lastEventId),
+              event.retry.orElse(progress.retryMs),
+            ))
         .flatMap:
-          case Some(obj) => ZIO.fromEither(extractResult(obj))
-          case None      => ZIO.fail(McpClientError.Protocol("SSE stream ended before a matching JSON-RPC response"))
+          case SseProgress(Some(obj), _, _) => ZIO.fromEither(extractResult(obj))
+          case SseProgress(None, Some(lastId), retry) if reconnects < MaxSseReconnects =>
+            ZIO.sleep(Duration.fromMillis(retry.getOrElse(DefaultSseRetryMs))) *>
+              resume(lastId, token).flatMap(next => parseSse(next, id, token, reconnects + 1))
+          case _ => ZIO.fail(McpClientError.Protocol("SSE stream ended before a matching JSON-RPC response"))
+
+    private def isServerRequest(obj: Json.Obj): Boolean =
+      obj.get("method").isDefined && obj.get("id").isDefined
+
+    /**
+     * Answer a request the server sent on a legacy SSE stream: `ping` with an
+     * empty result, and `elicitation/create`, `sampling/createMessage` and
+     * `roots/list` through `onInputRequest`. Anything else, or input without a
+     * handler (whose capabilities the client then didn't declare), is
+     * `-32601`. The answer is POSTed on the session, as every client message is.
+     */
+    private def answerServerRequest(obj: Json.Obj, token: Option[String]): IO[McpClientError, Unit] =
+      val method  = obj.get("method").flatMap(_.asString).getOrElse("")
+      val reqId   = obj.get("id").flatMap(_.as[RequestId].toOption)
+      val params  = obj.get("params").flatMap(_.asObject).getOrElse(Json.Obj())
+      val inputMethods = Set("elicitation/create", "sampling/createMessage", "roots/list")
+      val answer: IO[McpClientError, Either[ErrorDetail, Json]] =
+        (method, config.onInputRequest) match
+          case ("ping", _) => ZIO.succeed(Right(Json.Obj()))
+          case (m, Some(handler)) if inputMethods.contains(m) =>
+            handler(InputRequest(reqId.fold("") { case RequestId.Str(v) => v; case RequestId.Num(v) => v.toString }, m, params)).map(Right(_))
+              .catchAll(e => ZIO.succeed(Left(ErrorDetail(ErrorCode.InternalError.code, e.getMessage))))
+          case (m, _) => ZIO.succeed(Left(ErrorDetail(ErrorCode.MethodNotFound.code, s"Method not found: $m")))
+      ZIO.foreachDiscard(reqId): rid =>
+        answer.flatMap: outcome =>
+          val body = outcome.fold(err => JsonRpcError(Some(rid), err).toJson, result => JsonRpcResponse(rid, result).toJson)
+          ZIO.scoped:
+            buildRequest(Outgoing(body, rid, Headers.empty, sendSession = true), token)
+              .flatMap(streaming)
+              .flatMap(resp => ZIO.unless(resp.status.isSuccess)(failStatus(resp, s"Answering '$method'")))
+              .unit
+
+    /** Reopen a closed SSE stream where it left off. */
+    private def resume(lastEventId: String, token: Option[String]): ZIO[Scope, McpClientError, Response] =
+      for
+        url  <- decodeUrl(config.serverUrl)
+        st   <- stateRef.get
+        base  = Request.get(url)
+                  .addHeader("accept", "text/event-stream")
+                  .addHeader("last-event-id", lastEventId)
+                  .addHeaders(config.headers)
+        wSid  = st.sessionId.fold(base)(sid => base.addHeader("mcp-session-id", sid))
+        wVer  = st.protocolVersion.fold(wSid)(v => wSid.addHeader("mcp-protocol-version", v))
+        req   = token.fold(wVer)(t => wVer.addHeader(Header.Authorization.Bearer(t)))
+        resp <- streaming(req)
+        _    <- ZIO.unless(resp.status.isSuccess)(failStatus(resp, "Resuming the SSE stream"))
+      yield resp
 
     /** The JSON-RPC messages of an SSE response body, as they arrive. */
     private def sseObjects(resp: Response): ZStream[Any, McpClientError, Json.Obj] =
+      sseEvents(resp).map(_.data).collectSome
+
+    /** The events of an SSE response body, as they arrive: each one's `id`,
+      * `retry` and JSON-RPC message, any of which it may lack. */
+    private def sseEvents(resp: Response): ZStream[Any, McpClientError, SseEvent] =
       resp.body.asStream
         .via(ZPipeline.utf8Decode)
         .via(ZPipeline.splitLines)
         .mapAccum(Chunk.empty[String]): (buf, line) =>
           if line.isEmpty then (Chunk.empty[String], Some(buf))
           else (buf :+ line, None)
-        .collect { case Some(lines) => lines }
-        .map(extractSseData)
-        .collectSome
-        .map(_.fromJson[Json.Obj])
-        .collect { case Right(obj) => obj }
+        .collect { case Some(lines) if lines.nonEmpty => lines }
+        .map: lines =>
+          SseEvent(
+            sseField(lines, "id"),
+            sseField(lines, "retry").flatMap(_.toLongOption),
+            extractSseData(lines).flatMap(_.fromJson[Json.Obj].toOption),
+          )
         .mapError(t => McpClientError.Transport(s"Failed reading SSE stream: ${t.getMessage}", Some(t)))
+
+    private def sseField(lines: Chunk[String], name: String): Option[String] =
+      lines.collectFirst:
+        case l if l.startsWith(s"$name:") => l.stripPrefix(s"$name:").stripPrefix(" ")
 
     /** True when the object is the JSON-RPC response (result or error) for `id`. */
     private def isResponseFor(obj: Json.Obj, id: RequestId): Boolean =
@@ -971,22 +1278,7 @@ object McpClient:
     def ping: IO[McpClientError, Unit] =
       transport.rpc[Json.Obj]("ping", Json.Obj()).unit
 
-    def listTools: IO[McpClientError, Chunk[ToolDefinition]] =
-      def loop(
-        cursor: Option[String],
-        seen: Set[String],
-        accumulated: Chunk[ToolDefinition],
-      ): IO[McpClientError, Chunk[ToolDefinition]] =
-        val params = cursor.fold(Json.Obj())(value => asObj(ToolsListParams(Some(value))))
-        transport.rpc[ToolsListResult]("tools/list", params).flatMap: page =>
-          val all = accumulated ++ page.tools
-          page.nextCursor match
-            case None => ZIO.succeed(all)
-            case Some(next) if seen.contains(next) =>
-              ZIO.fail(McpClientError.Protocol(s"tools/list repeated pagination cursor '$next'"))
-            case Some(next) => loop(Some(next), seen + next, all)
-
-      loop(None, Set.empty, Chunk.empty)
+    def listTools: IO[McpClientError, Chunk[ToolDefinition]] = transport.listTools
 
     def callTool(name: String, arguments: Json.Obj): IO[McpClientError, CallToolResult] =
       val argOpt = if arguments.fields.isEmpty then None else Some(arguments)

@@ -10,21 +10,15 @@ import zio.test.TestAspect.*
 import java.time.Instant
 
 /**
- * REPRODUCTION (pre-fix, expected RED): a parameterised mount must accept a token
- * whose audience is the host ORIGIN, not only the per-mount resource.
+ * The `McpAuth.acceptOriginAudience` quirk. A `mountedAtParam("slug")` mount
+ * advertises a per-mount resource (`http://host/<slug>`), so a client asks for a
+ * token for it. RFC 8707 §2.1 lets an authorization server shorten that `resource`,
+ * and some shorten it to the origin (`http://host`) in the token's `aud`.
  *
- * Why this happens in the real world: a `mountedAtParam("slug")` mount advertises a
- * per-mount PRM `resource` (`http://host/<slug>`) — required so RFC 9728 §3.3-strict
- * clients (e.g. the Rust `rmcp` client behind some MCP CLIs) accept it. The client
- * then requests `resource=http://host/<slug>` at the token endpoint. But per RFC 8707
- * §2.1 an authorization server MAY canonicalize the resource, and real ones do — they
- * fold it to the ORIGIN (`http://host`) when minting the token `aud`. The resource
- * server therefore receives `aud=http://host` while the mount, if it only accepts the
- * per-mount audience, rejects it with "Audience mismatch" — breaking auth for every
- * such client. zio-http-mcp must accept the host-origin audience on a param mount so
- * library users don't have to discover and work around this themselves.
- *
- * See `.specs/MCP_AUTH_ERA_TESTING.md` (toolbook) for the end-to-end kiro-cli trace.
+ * By default the server refuses such a token: the MCP spec requires a server to
+ * check that a token was issued for it specifically, and a token for the origin
+ * would otherwise be accepted at every mount on it. A server behind such an
+ * authorization server turns the quirk on to accept it.
  */
 object ParameterizedMountAudienceCompatSpec extends ZIOSpecDefault:
 
@@ -48,7 +42,7 @@ object ParameterizedMountAudienceCompatSpec extends ZIOSpecDefault:
 
   private val pingTool: McpToolHandler = McpTool("ping").description("ping").handle(ZIO.succeed("pong"))
 
-  private val server: McpServer[Any] =
+  private def server(acceptOriginAudience: Boolean): McpServer[Any] =
     McpServer("param-mount", "0.1.0")
       .mountedAtParam("tenant")
       .auth(McpAuth(
@@ -56,6 +50,7 @@ object ParameterizedMountAudienceCompatSpec extends ZIOSpecDefault:
         verifier             = audienceEchoVerifier,
         scopesSupported      = Chunk(reqScope),
         requiredScopes       = Set(reqScope),
+        acceptOriginAudience = acceptOriginAudience,
       ))
       .tool(pingTool)
 
@@ -72,19 +67,28 @@ object ParameterizedMountAudienceCompatSpec extends ZIOSpecDefault:
   override def spec =
     suite("ParameterizedMountAudienceCompatSpec")(
 
-      test("a token whose aud is the host ORIGIN is accepted on a param mount (AS canonicalized the resource)"):
+      test("by default, a token whose aud is only the host origin is refused on a param mount"):
         for
-          port <- Server.install(server.statelessRoutes)
-          // The AS folded the requested `http://localhost:$port/tenant-a` to its origin.
+          port <- Server.install(server(acceptOriginAudience = false).statelessRoutes)
+          resp <- post(port, "/tenant-a", toolsListRequest, token = s"http://localhost:$port")
+        yield assertTrue(resp.status.code == 401)
+      ,
+
+      test("with acceptOriginAudience, a token whose aud is the host origin is accepted on a param mount"):
+        for
+          port <- Server.install(server(acceptOriginAudience = true).statelessRoutes)
+          // The AS shortened the requested `http://localhost:$port/tenant-a` to its origin.
           resp <- post(port, "/tenant-a", toolsListRequest, token = s"http://localhost:$port")
         yield assertTrue(resp.status.code == 200)
       ,
 
-      test("the exact per-mount audience is still accepted (regression guard)"):
+      test("the exact per-mount audience is accepted either way"):
         for
-          port <- Server.install(server.statelessRoutes)
-          resp <- post(port, "/tenant-a", toolsListRequest, token = s"http://localhost:$port/tenant-a")
-        yield assertTrue(resp.status.code == 200)
+          port  <- Server.install(server(acceptOriginAudience = false).statelessRoutes)
+          plain <- post(port, "/tenant-a", toolsListRequest, token = s"http://localhost:$port/tenant-a")
+          port2 <- Server.install(server(acceptOriginAudience = true).statelessRoutes)
+          quirk <- post(port2, "/tenant-a", toolsListRequest, token = s"http://localhost:$port2/tenant-a")
+        yield assertTrue(plain.status.code == 200, quirk.status.code == 200)
       ,
 
     ).provide(

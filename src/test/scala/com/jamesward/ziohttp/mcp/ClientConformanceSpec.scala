@@ -7,13 +7,17 @@ import zio.test.TestAspect.*
 import scala.jdk.CollectionConverters.*
 
 /**
- * Runs the official MCP conformance kit's *client* auth scenarios against our
+ * Runs the official MCP conformance kit's *client* scenarios against our
  * [[com.jamesward.ziohttp.mcp.client.McpClient]] (as [[ConformanceClientMain]]).
  *
- * For each scenario the kit starts a mock MCP resource server + mock authorization
- * server, spawns our client with the server URL, and grades the wire-level OAuth
- * behavior: CIMD client ids, PKCE S256, RFC 8707 `resource`, RFC 9207 `iss`
- * handling, metadata discovery forms, and scope selection.
+ * For each scenario the kit starts a mock MCP server (and, for the `auth/` scenarios, a mock
+ * authorization server), spawns our client with the server URL, and grades its
+ * wire-level behavior. Most scenarios are OAuth: CIMD client ids, PKCE S256,
+ * RFC 8707 `resource`, RFC 9207 `iss` handling, metadata discovery forms, scope
+ * selection, token endpoint client authentication and `offline_access`. The rest
+ * are the ones [[ConformanceClientMain]]'s generic flow (connect, list tools,
+ * call the first) satisfies: the handshake, request metadata, invalid tool
+ * headers, and SEP-2640 skill verification.
  *
  * Needs `npx` (Node) and network access to the npm registry; tagged
  * `conformance-client` for filtering. The kit version is pinned to the same
@@ -22,7 +26,7 @@ import scala.jdk.CollectionConverters.*
 object ClientConformanceSpec extends ZIOSpecDefault:
 
   private val ConformancePackage = "@modelcontextprotocol/conformance"
-  private val KitVersion         = "0.2.0-alpha.10"
+  private val KitVersion         = "0.2.0-alpha.12"
 
   private val scenarios = List(
     // client registration mechanisms
@@ -47,8 +51,44 @@ object ClientConformanceSpec extends ZIOSpecDefault:
     "auth/scope-from-www-authenticate",
     "auth/scope-from-scopes-supported",
     "auth/scope-omitted-when-undefined",
+    "auth/scope-retry-limit",
+    // step-up authorization on 403 insufficient_scope (scope union)
+    "auth/scope-step-up",
+    // re-registration when the PRM names a new authorization server (SEP-2352)
+    "auth/authorization-server-migration",
+    // 2025-03-26 servers: no PRM, the server origin is the authorization server
+    "auth/2025-03-26-oauth-metadata-backcompat",
+    "auth/2025-03-26-oauth-endpoint-fallback",
+    // refresh tokens via offline_access
+    "auth/offline-access-scope",
+    "auth/offline-access-not-supported",
+    // token endpoint client authentication
+    "auth/token-endpoint-auth-basic",
+    "auth/token-endpoint-auth-post",
+    "auth/token-endpoint-auth-none",
     // client_credentials extension
     "auth/client-credentials-basic",
+    // handshake and request metadata
+    "initialize",
+    "request-metadata",
+    // SSE resumption: GET with Last-Event-ID after the server closes the stream
+    "sse-retry",
+    // tool calls, and input the server asks for while one runs
+    "tools_call",
+    "elicitation-sep1034-client-defaults",
+    "sep-2322-client-request-state",
+    // JSON Schema handling of tool inputSchemas
+    "json-schema-ref-no-deref",
+    "json-schema-2020-12-preservation",
+    // SEP-2243 standard and custom (x-mcp-header) request headers
+    "http-standard-headers",
+    "http-custom-headers",
+    "http-invalid-tool-headers",
+    // SEP-2640 skills: no prefetch, and verifying what a skill's files declare
+    "sep-2640-client-no-prefetch",
+    "sep-2640-client-verify-digest",
+    "sep-2640-client-verify-size",
+    "sep-2640-client-verify-frontmatter",
   )
 
   private def clientCommand: Task[String] =
@@ -89,7 +129,7 @@ object ClientConformanceSpec extends ZIOSpecDefault:
     }
 
   override def spec =
-    suite("MCP client conformance (auth)")(
+    suite("MCP client conformance")(
       scenarios.map { scenario =>
         test(scenario):
           for

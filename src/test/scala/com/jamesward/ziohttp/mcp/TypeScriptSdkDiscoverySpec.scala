@@ -14,17 +14,14 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Drives the REAL TypeScript MCP SDK (`@modelcontextprotocol/sdk`) — the one MCP
- * Inspector uses — against our server, to validate the User-Agent-keyed
- * AS-metadata discovery (see [[McpServer.asMetadataRedirectRoutes]] /
- * [[McpServer.isPrmCapableClient]]).
+ * Inspector uses — against our server, to validate its authorization-server
+ * discovery against a cross-origin authorization server.
  *
  * We use the SDK's own `buildDiscoveryUrls` to generate the exact resource-origin
  * AS-metadata URLs Inspector probes, then fetch each with the SDK's transport
- * (Node's global `fetch`, user-agent `node`) and with a legacy `kiro-cli`
- * user-agent, asserting:
- *   - the SDK/Inspector (node) origin probe → 404 (so it falls back to the PRM,
- *     which advertises the real cross-origin AS — no RFC 8414 §3.3 issuer mismatch)
- *   - a legacy kiro-cli / rmcp probe → still a redirect (compat preserved)
+ * (Node's global `fetch`, user-agent `node`), asserting:
+ *   - every origin probe → 404 (so it falls back to the PRM, which advertises the
+ *     real cross-origin AS — no RFC 8414 §3.3 issuer mismatch)
  *   - the PRM correctly advertises the configured cross-origin authorization server
  *
  * Needs Node + npm + network (to install the SDK). It auto-detects whether Node
@@ -64,10 +61,9 @@ object TypeScriptSdkDiscoverySpec extends ZIOSpecDefault:
       |  out.authServers = prm.authorization_servers;
       |  const urls = buildDiscoveryUrls(new URL(resource)).map(u => (u.url ?? u).toString());
       |  out.probeUrls = urls;
-      |  out.node = []; out.kiro = [];
+      |  out.node = [];
       |  for (const u of urls) {
       |    out.node.push(await hit(u, 'node'));
-      |    out.kiro.push(await hit(u, 'kiro-cli/0.3 rmcp/0.1'));
       |  }
       |  out.ok = true;
       |} catch (e) { out.ok = false; out.error = String(e && e.message); }
@@ -79,7 +75,6 @@ object TypeScriptSdkDiscoverySpec extends ZIOSpecDefault:
       authServers: List[String] = Nil,
       probeUrls:   List[String] = Nil,
       node:        List[Probe]  = Nil,
-      kiro:        List[Probe]  = Nil,
       ok:          Boolean      = false,
       error:       Option[String] = None,
   ) derives JsonDecoder
@@ -104,7 +99,7 @@ object TypeScriptSdkDiscoverySpec extends ZIOSpecDefault:
 
   private def realSuite =
     suite("TypeScriptSdkDiscoverySpec")(
-      test("the TypeScript SDK (MCP Inspector) origin probe gets 404; a legacy kiro-cli probe still redirects"):
+      test("the TypeScript SDK (MCP Inspector) origin probe gets 404 and the PRM names the cross-origin AS"):
         for
           port    <- Server.install(server.statelessRoutes)
           resource = s"http://localhost:$port/tenant-a"
@@ -117,7 +112,7 @@ object TypeScriptSdkDiscoverySpec extends ZIOSpecDefault:
           // PRM advertises the configured cross-origin AS.
           res.authServers == List("http://localhost:65535"),
           // The SDK generates resource-origin AS-metadata probe URLs (this is what
-          // Inspector hits — and where our old 302 caused the issuer mismatch).
+          // Inspector hits — and where a cross-origin 302 would cause an issuer mismatch).
           res.probeUrls.nonEmpty,
           res.probeUrls.forall(_.contains(s"localhost:$port")),
           // TS SDK / Node fetch (user-agent "node") → 404 on every origin-probe
@@ -125,11 +120,6 @@ object TypeScriptSdkDiscoverySpec extends ZIOSpecDefault:
           // cross-origin redirect.
           res.node.nonEmpty,
           res.node.forall(_.status == 404),
-          // Same origin-probe URL, different behavior by client: Inspector (node)
-          // gets 404 while legacy kiro-cli / rmcp gets the 302 compat redirect —
-          // the User-Agent-keyed branch.
-          res.kiro.nonEmpty,
-          res.node.zip(res.kiro).exists((n, k) => n.status == 404 && k.status == 302),
         )
     ).provide(
       Server.defaultWith(_.onAnyOpenPort),

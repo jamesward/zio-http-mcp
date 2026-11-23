@@ -48,6 +48,8 @@ object McpSkills:
       GetMethod,
       McpSkillsWireCodecs.getParams,
       McpSkillsWireCodecs.getResult,
+      // GetSkillResult extends CacheableResult: `ttlMs` and `cacheScope` are required on 2026-07-28.
+      cachePolicy = McpCachePolicy.Default,
       routingName = params => Some(McpRoutingName.fromValid(params.uri.value)),
     )
 

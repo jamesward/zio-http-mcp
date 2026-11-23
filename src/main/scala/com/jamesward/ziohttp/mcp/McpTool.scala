@@ -232,6 +232,8 @@ final class McpTool private (
               // InputRequiredResult and re-run the handler on the retry.
               case signal: McpToolContext.InputRequiredSignal =>
                 ZIO.die(signal)
+              case signal: McpToolContext.MissingCapabilitySignal =>
+                ZIO.die(signal)
               case defect =>
                 McpTool.defectResult(capturedName, Cause.die(defect))
 
