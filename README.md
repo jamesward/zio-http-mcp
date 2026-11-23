@@ -833,7 +833,7 @@ val webhookEvents: ZIO[McpWebhookStore & Scope, McpEventsError, McpExtensions[An
   - The event's `eventId` as its `webhook-id`, rather than a fresh id per message, for a client that doesn't declare the extension (ChatGPT, `@ai-sdk/mcp` 2.0) and for `@tanstack/ai-mcp` 1.3, which declares it: they refuse a delivery whose `webhook-id` isn't the `eventId`.
   - The events methods without the `Mcp-Name` header, which clients on the MCP TypeScript SDK 2.4 (`@mastra/mcp` 2.10, `@ai-sdk/mcp` 2.0) don't send there. One that doesn't match the event name is still refused.
 
-  `AiSdkEventsSpec`, `TanStackEventsSpec` and `MastraEventsSpec` check each client end to end, in a container.
+  `AiSdkEventsSpec`, `TanStackEventsSpec` and `MastraEventsSpec` check each client end to end with `KnownClients`, in a container. `PythonEventsSpec` checks the Python MCP SDK's unreleased Events client (python-sdk PR 3822), which follows SEP-3415, with the default.
 
 - **Logging.** Every events request logs who called (protocol, `clientInfo`, `User-Agent`, principal) and the dialect chosen; `events/subscribe` and `events/unsubscribe` log their arguments and outcome; every POST logs its `webhook-id`, kind, attempt, the endpoint's status or failure, and duration; each subscription's delivery logs as it starts, reads events, retries, gives up and stops. Each detail is a log annotation (`subscription_id`, `webhook_id`, `event`, ...). Secrets and tokens are never logged, and callback URLs are logged without their query; subscription arguments are logged at `INFO`, so an event type whose arguments are sensitive should be logged at `WARN` or above. `McpRequestContext.userAgent` is the request's `User-Agent`.
 

@@ -12,17 +12,18 @@ import zio.test.*
 import java.time.Duration as JDuration
 
 /**
- * MCP Events end to end with a JavaScript MCP client in a container, for [[AiSdkEventsSpec]], [[TanStackEventsSpec]]
- * and [[MastraEventsSpec]].
- * The container runs `src/test/resources/mcp-events-js/probe.mjs`: the client subscribes to `incident.created`
- * with a webhook on its own `127.0.0.1`, the spec emits one incident once the subscription is stored, and the
- * client's webhook handler verifies it and hands it to `onEvent`, then the client unsubscribes.
+ * MCP Events end to end with an MCP client in a container, for [[AiSdkEventsSpec]], [[TanStackEventsSpec]],
+ * [[MastraEventsSpec]] and [[PythonEventsSpec]]. The container runs a probe, `src/test/resources/mcp-events-js/probe.mjs`
+ * or `src/test/resources/mcp-events-python/probe.py`: the client subscribes to `incident.created` with a webhook on its
+ * own `127.0.0.1`, the spec emits one incident once the client has its subscribe answer, and the client's webhook
+ * receiver verifies it and hands it to the probe, then the client unsubscribes. Each probe prints the same `RESULT`
+ * lines.
  *
  * The AI SDK and TanStack accept a plain-http callback only on `127.0.0.1`, so the server must reach the container's
  * loopback: the container shares the host's network, and the specs are ignored where that isn't available
  * ([[DockerSupport.useHostNetwork]]).
  */
-object JsEventsClients:
+object EventsClients:
   case class Incident(id: String, severity: String) derives Schema
   case class IncidentFilter(severity: Option[String]) derives Schema
 
@@ -42,17 +43,50 @@ object JsEventsClients:
   /** With the workarounds for the known clients, which each of these needs. */
   val knownClients: McpWebhookConfig = spec.copy(compatibility = McpEventsCompatibility.KnownClients)
 
-  private val files = List("package.json", "package-lock.json", "probe.mjs", "ai-sdk.mjs", "tanstack.mjs", "mastra.mjs")
+  private val PythonSdkCommit = "a5e06301315a4f56b9467f7dd30eaecd525ff0cc"
 
-  private val image: ImageFromDockerfile =
-    val base = files.foldLeft(ImageFromDockerfile("mcp-events-js", false)): (image, file) =>
+  /** A client in a container: its image, and the arguments before the MCP endpoint URL. */
+  final case class Probe(image: ImageFromDockerfile, args: List[String])
+
+  /** A JavaScript client, by the name probe.mjs gives it: `ai-sdk`, `tanstack` or `mastra`. */
+  def js(sdk: String): Probe = Probe(jsImage, List(sdk))
+
+  /** The Python MCP SDK's Events client, from python-sdk PR 3822 at its commit of 5 Nov 2026 (not released). */
+  lazy val python: Probe = Probe(pythonImage, Nil)
+
+  private val jsFiles = List("package.json", "package-lock.json", "probe.mjs", "ai-sdk.mjs", "tanstack.mjs", "mastra.mjs")
+
+  private val ProxyCa = "/usr/local/share/ca-certificates/proxy-ca.crt"
+
+  private def withHostCa(image: ImageFromDockerfile): ImageFromDockerfile =
+    DockerSupport.hostCaBundle.fold(image)(ca => image.withFileFromPath("ca-bundle.crt", ca))
+
+  private lazy val pythonImage: ImageFromDockerfile =
+    withHostCa(ImageFromDockerfile("mcp-events-python", false)
+      .withFileFromClasspath("probe.py", "mcp-events-python/probe.py")).withDockerfileFromBuilder: builder =>
+      builder.from("python:3.12-slim").workDir("/probe")
+      DockerSupport.hostCaBundle.foreach: _ =>
+        builder.copy("ca-bundle.crt", ProxyCa)
+        builder.env("SSL_CERT_FILE", ProxyCa)
+        builder.env("PIP_CERT", ProxyCa)
+        builder.env("GIT_SSL_CAINFO", ProxyCa)
+      builder
+        .run("apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*")
+        // A clone with its tags: the package's version comes from them (uv-dynamic-versioning).
+        .run(s"git clone --filter=blob:none https://github.com/modelcontextprotocol/python-sdk /sdk && git -C /sdk checkout $PythonSdkCommit")
+        .run("pip install --no-cache-dir /sdk/src/mcp-types /sdk")
+        .copy("probe.py", "probe.py")
+        .entryPoint("python", "probe.py")
+        .build()
+
+  private lazy val jsImage: ImageFromDockerfile =
+    val base = jsFiles.foldLeft(ImageFromDockerfile("mcp-events-js", false)): (image, file) =>
       image.withFileFromClasspath(file, s"mcp-events-js/$file")
-    val withContext = DockerSupport.hostCaBundle.fold(base)(ca => base.withFileFromPath("ca-bundle.crt", ca))
-    withContext.withDockerfileFromBuilder: builder =>
+    withHostCa(base).withDockerfileFromBuilder: builder =>
       builder.from("node:22-slim").workDir("/probe")
       DockerSupport.hostCaBundle.foreach: _ =>
-        builder.copy("ca-bundle.crt", "/usr/local/share/ca-certificates/proxy-ca.crt")
-        builder.env("NODE_EXTRA_CA_CERTS", "/usr/local/share/ca-certificates/proxy-ca.crt")
+        builder.copy("ca-bundle.crt", ProxyCa)
+        builder.env("NODE_EXTRA_CA_CERTS", ProxyCa)
       builder
         .copy("package.json", "package.json")
         .copy("package-lock.json", "package-lock.json")
@@ -69,8 +103,8 @@ object JsEventsClients:
     def has(line: String): Boolean = results.contains(line)
     def startingWith(prefix: String): List[String] = results.filter(_.startsWith(prefix))
 
-  /** Serve `incident.created` with webhook delivery, run the probe for `sdk`, and emit the incident once it has subscribed. */
-  def run(sdk: String, config: McpWebhookConfig): ZIO[Server & McpServer.State & Scope, McpEventsError | Throwable, Run] =
+  /** Serve `incident.created` with webhook delivery, run `probe`, and emit the incident once it has subscribed. */
+  def run(probe: Probe, config: McpWebhookConfig): ZIO[Server & McpServer.State & Scope, McpEventsError | Throwable, Run] =
     for
       store     <- TestWebhookStore.make()
       incidents <- McpEventBuffer.make[Incident]()
@@ -79,21 +113,21 @@ object JsEventsClients:
       events    <- McpEvents.withWebhooks(config)(created).provideSomeEnvironment[Scope](_.add[McpWebhookStore](store))
       port      <- Server.install(McpServer("events-interop", "1.0.0").withExtensions(events).routes)
       stdout     = ToStringConsumer()
-      probe     <- container(sdk, s"http://localhost:$port/mcp", stdout).fork
+      client    <- container(probe, s"http://localhost:$port/mcp", stdout).fork
       // Emit once the client has its subscribe answer, so the subscription's starting point is before the event. A
       // probe that fails to subscribe exits without it: then nothing is emitted, and its RESULT lines say why.
       subscribed = ZIO.succeed(stdout.toUtf8String.contains("RESULT subscribed "))
-      ready     <- subscribed.delay(100.millis).repeatUntilZIO(ok => if ok then ZIO.succeed(true) else probe.poll.map(_.isDefined))
+      ready     <- subscribed.delay(100.millis).repeatUntilZIO(ok => if ok then ZIO.succeed(true) else client.poll.map(_.isDefined))
       _         <- incidents.emit(incident, Some(eventId)).when(ready)
-      output    <- probe.join
+      output    <- client.join
       leftOver  <- store.all.mapError(e => RuntimeException(e.toString))
     yield Run(output.linesIterator.filter(_.startsWith("RESULT ")).map(_.stripPrefix("RESULT ")).toList, output, leftOver)
 
-  private def container(sdk: String, mcpUrl: String, stdout: ToStringConsumer): Task[String] =
+  private def container(probe: Probe, mcpUrl: String, stdout: ToStringConsumer): Task[String] =
     ZIO.attemptBlocking:
-      val container = GenericContainer(image)
+      val container = GenericContainer(probe.image)
       container.withNetworkMode("host")
-      container.withCommand(sdk, mcpUrl)
+      container.withCommand((probe.args :+ mcpUrl)*)
       container.withStartupCheckStrategy(OneShotStartupCheckStrategy().withTimeout(JDuration.ofMinutes(3)))
       container.withLogConsumer(stdout)
       try
@@ -106,10 +140,10 @@ object JsEventsClients:
         try container.stop()
         catch case _: Exception => ()
 
-  /** The full round trip with client `sdk` (as probe.mjs names it): subscribe, challenge, event in onEvent, unsubscribe. */
-  def endToEnd(sdk: String, config: McpWebhookConfig): Spec[Server & McpServer.State, McpEventsError | Throwable] =
-    zio.test.test("subscribes, passes the challenge, receives the event in onEvent, and unsubscribes"):
-      for run <- ZIO.scoped(run(sdk, config))
+  /** The full round trip with `probe`'s client: subscribe, challenge, the event in its receiver, unsubscribe. */
+  def endToEnd(probe: Probe, config: McpWebhookConfig): Spec[Server & McpServer.State, McpEventsError | Throwable] =
+    zio.test.test("subscribes, passes the challenge, receives the event, and unsubscribes"):
+      for run <- ZIO.scoped(run(probe, config))
       yield assertTrue(
         run.startingWith("subscribed ").nonEmpty,
         run.startingWith("verification 200 ").nonEmpty,
