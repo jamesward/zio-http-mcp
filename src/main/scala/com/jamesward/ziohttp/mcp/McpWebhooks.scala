@@ -11,7 +11,7 @@ import nl.vroste.rezilience.{Bulkhead, CircuitBreaker, TrippingStrategy}
 
 import java.net.{Inet4Address, Inet6Address, InetAddress, UnknownHostException}
 import java.nio.charset.StandardCharsets.UTF_8
-import java.security.MessageDigest
+import java.security.{MessageDigest, SecureRandom}
 import java.time.Instant
 import java.util.{Base64, UUID}
 import javax.crypto.Mac
@@ -784,8 +784,14 @@ private[mcp] object McpWebhookRuntime:
       _       <- runtime.expireLoop.forkIn(scope)
     yield runtime
 
+  // Challenges and message ids come from SecureRandom, not ZIO's Random, which is java.util.Random when live.
+  private val secureRandom = SecureRandom()
+
   private def randomToken(bytes: Int): UIO[String] =
-    Random.nextBytes(bytes).map(b => Base64.getUrlEncoder.withoutPadding.encodeToString(b.toArray))
+    ZIO.succeed:
+      val buffer = Array.ofDim[Byte](bytes)
+      secureRandom.nextBytes(buffer)
+      Base64.getUrlEncoder.withoutPadding.encodeToString(buffer)
 
 /** Structured logging for events and webhooks: each field is a top-level log annotation. */
 private[mcp] object McpWebhookLog:

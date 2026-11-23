@@ -305,6 +305,22 @@ object McpWebhooksSpec extends ZIOSpecDefault:
           extra.isEmpty,
         )
     ,
+    test("the challenge and webhook-ids don't come from ZIO's Random, which is not a secure source"):
+      ZIO.scoped:
+        for
+          fx                <- install()
+          _                 <- TestRandom.feedBytes(Chunk.fill(64)(0.toByte), Chunk.fill(64)(0.toByte), Chunk.fill(64)(0.toByte))
+          (_, verification) <- subscribed(fx, subscription(fx.url()))
+          _                 <- fx.incidents.emit(Incident("INC-5", "P1"))
+          delivery          <- fx.receiver.next
+        yield
+          val zeros = "AAAAAAAAAAAAAAAAAAAAAAAA"
+          assertTrue(
+            !verification.str("challenge").exists(_.startsWith(zeros)),
+            !verification.header("webhook-id").exists(_.contains(zeros)),
+            !delivery.header("webhook-id").exists(_.contains(zeros)),
+          )
+    ,
     test("a client that doesn't declare the extension gets a fresh webhook-id by default, and the eventId with KnownClients"):
       ZIO.scoped:
         for
