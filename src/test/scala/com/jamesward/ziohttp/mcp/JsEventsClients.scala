@@ -32,11 +32,15 @@ object JsEventsClients:
   val incident: Incident = Incident("INC-1", "P1")
   val eventId = "evt_inc_1"
 
-  private val config = McpWebhookConfig(
+  /** The spec for every client, as `McpWebhookConfig`'s default. */
+  val spec: McpWebhookConfig = McpWebhookConfig(
     anonymous = true,
     targets = McpWebhookTargets.unrestricted,
     retryDelays = Chunk(500.millis, 1.second, 2.seconds),
   )
+
+  /** With the workarounds for the known clients, which each of these needs. */
+  val knownClients: McpWebhookConfig = spec.copy(compatibility = McpEventsCompatibility.KnownClients)
 
   private val files = List("package.json", "package-lock.json", "probe.mjs", "ai-sdk.mjs", "tanstack.mjs", "mastra.mjs")
 
@@ -66,7 +70,7 @@ object JsEventsClients:
     def startingWith(prefix: String): List[String] = results.filter(_.startsWith(prefix))
 
   /** Serve `incident.created` with webhook delivery, run the probe for `sdk`, and emit the incident once it has subscribed. */
-  def run(sdk: String): ZIO[Server & McpServer.State & Scope, McpEventsError | Throwable, Run] =
+  def run(sdk: String, config: McpWebhookConfig): ZIO[Server & McpServer.State & Scope, McpEventsError | Throwable, Run] =
     for
       store     <- TestWebhookStore.make()
       incidents <- McpEventBuffer.make[Incident]()
@@ -102,23 +106,25 @@ object JsEventsClients:
         try container.stop()
         catch case _: Exception => ()
 
+  /** The full round trip with client `sdk` (as probe.mjs names it): subscribe, challenge, event in onEvent, unsubscribe. */
+  def endToEnd(sdk: String, config: McpWebhookConfig): Spec[Server & McpServer.State, McpEventsError | Throwable] =
+    zio.test.test("subscribes, passes the challenge, receives the event in onEvent, and unsubscribes"):
+      for run <- ZIO.scoped(run(sdk, config))
+      yield assertTrue(
+        run.startingWith("subscribed ").nonEmpty,
+        run.startingWith("verification 200 ").nonEmpty,
+        run.startingWith("delivery ").exists(_.startsWith("delivery 2")),
+        run.has(s"""event $eventId $EventName {"id":"${incident.id}","severity":"${incident.severity}"}"""),
+        run.has("unsubscribed"),
+        run.startingWith("error ").isEmpty,
+        run.leftOver.isEmpty,
+      )
+
   /**
-   * The end-to-end checks each spec makes, against the client `sdk` names in probe.mjs. The aspects go after
-   * `provide`: the server's handlers run on the clock the Server layer was built with, and a test clock would sign
-   * webhooks with a 1970 `webhook-timestamp`, which the clients refuse.
+   * A client's suite. The aspects go after `provide`: the server's handlers run on the clock the Server layer was
+   * built with, and a test clock would sign webhooks with a 1970 `webhook-timestamp`, which the clients refuse.
    */
-  def suite(name: String, sdk: String): Spec[Any, McpEventsError | Throwable] =
-    zio.test.suite(name)(
-      zio.test.test("subscribes, passes the challenge, receives the event in onEvent, and unsubscribes"):
-        for run <- ZIO.scoped(this.run(sdk))
-        yield assertTrue(
-          run.startingWith("subscribed ").nonEmpty,
-          run.startingWith("verification 200 ").nonEmpty,
-          run.startingWith("delivery ").exists(_.startsWith("delivery 2")),
-          run.has(s"""event $eventId $EventName {"id":"${incident.id}","severity":"${incident.severity}"}"""),
-          run.has("unsubscribed"),
-          run.startingWith("error ").isEmpty,
-          run.leftOver.isEmpty,
-        )
-    ).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@ TestAspect.withLiveClock @@ TestAspect.timeout(10.minutes) @@
+  def suite(name: String)(tests: Spec[Server & McpServer.State, McpEventsError | Throwable]*): Spec[Any, McpEventsError | Throwable] =
+    zio.test.suite(name)(tests*).provide(Server.defaultWith(_.onAnyOpenPort), McpServer.State.default) @@
+      TestAspect.withLiveClock @@ TestAspect.timeout(10.minutes) @@ TestAspect.sequential @@
       (if DockerSupport.useHostNetwork then TestAspect.identity else TestAspect.ignore)
