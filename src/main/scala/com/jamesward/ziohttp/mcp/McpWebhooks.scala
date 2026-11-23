@@ -247,8 +247,11 @@ private[mcp] object McpWebhookSender:
               .filterOrFail(_.nonEmpty)(UnknownHostException(
                 s"$host resolves only to addresses webhooks may not reach: ${addresses(refused)}"))
     // zio-http's default TLS setting trusts every certificate: verify against the JDK's trust store,
-    // with the host name checked.
+    // with the host name checked. Its default pool is fixed at 10 connections per host, all opened on the
+    // host's first POST, and one that failed in the background fails a later POST at once (seen in rss2mcp's
+    // feed client): a dynamic pool opens connections only as POSTs need them, and keeps them while idle.
     val clientConfig = ZClient.Config.default.idleTimeout(30.seconds).ssl(ClientSSLConfig.FromSystemTrustStore)
+      .dynamicConnectionPool(minimum = 0, maximum = config.maxConcurrentPosts, ttl = 30.seconds)
     val layer = (ZLayer.succeed(clientConfig) ++
       ZLayer.succeed(NettyConfig.defaultWithFastShutdown) ++ ZLayer.succeed(dns)) >>> ZClient.live
     layer.build.map(env => McpWebhookSender(env.get[Client], config.deliveryTimeout))
