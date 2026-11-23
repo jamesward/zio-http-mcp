@@ -727,6 +727,39 @@ object McpWebhooksSpec extends ZIOSpecDefault:
             _      <- first.join
           yield assertTrue(code(second).contains(-32025), str(second, "error", "data", "limit").contains("queuedPosts"))
       ,
+      test("an endpoint that doesn't answer fails at deliveryTimeout, and its POST gives back its slot"):
+        ZIO.scoped:
+          for
+            fx      <- install(config = testConfig.copy(deliveryTimeout = 500.millis, maxConcurrentPosts = 1, maxQueuedPosts = 0))
+            _       <- fx.receiver.delay.set(1.minute)
+            started <- Clock.nanoTime
+            stuck   <- call(fx.port, "events/subscribe", subscription(fx.url()))
+            ended   <- Clock.nanoTime
+            _       <- fx.receiver.delay.set(Duration.Zero)
+            next    <- call(fx.port, "events/subscribe", subscription(fx.url("b")))
+          yield assertTrue(
+            code(stuck).contains(-32027),
+            str(stuck, "error", "data", "reason").contains("timeout"),
+            (ended - started) < 5.seconds.toNanos,
+            str(next, "result", "id").isDefined,
+          )
+      ,
+      test("an endpoint that sends its headers and never finishes its body fails at deliveryTimeout"):
+        ZIO.scoped:
+          for
+            fx      <- install(config = testConfig.copy(deliveryTimeout = 500.millis))
+            hanging <- Server.install(Routes(Method.POST / "hooks" / "stuck" -> handler(
+                         Response(Status.Ok, Headers(Header.ContentType(MediaType.application.json)),
+                           Body.fromStreamChunked(zio.stream.ZStream.never)))))
+            started <- Clock.nanoTime
+            stuck   <- call(fx.port, "events/subscribe", subscription(s"http://localhost:$hanging/hooks/stuck"))
+            ended   <- Clock.nanoTime
+          yield assertTrue(
+            code(stuck).contains(-32027),
+            str(stuck, "error", "data", "reason").contains("timeout"),
+            (ended - started) < 5.seconds.toNanos,
+          )
+      ,
       test("a negative ttlMs is clamped, not refused"):
         ZIO.scoped:
           for
