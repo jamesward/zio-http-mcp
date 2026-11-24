@@ -7,7 +7,7 @@ import zio.json.ast.Json
 import java.net.{JarURLConnection, URLConnection, URLEncoder}
 import java.nio.ByteBuffer
 import java.nio.charset.{CodingErrorAction, StandardCharsets}
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{FileSystemAlreadyExistsException, FileSystems, Files, Path, Paths}
 import java.security.MessageDigest
 import java.util.Base64
 import scala.jdk.CollectionConverters.*
@@ -171,13 +171,23 @@ object McpSkillsJars:
                 add(entry.getName.stripPrefix(ResourcePrefix), jar.getInputStream(entry).readAllBytes())
           finally jar.close()
         case "file" =>
-          val root = Paths.get(url.toURI)
-          val stream = Files.walk(root)
-          try
-            stream.iterator().asScala.filter(Files.isRegularFile(_)).foreach: file =>
-              add(relativePath(root, file), Files.readAllBytes(file))
-          finally stream.close()
+          walk(Paths.get(url.toURI))
+        case "resource" =>
+          // A GraalVM native image's resources, read through its `resource:` file system. That file
+          // system has to be created before a `resource:` URI resolves to a path. It stays open: it is
+          // read-only and in memory, and closing it could pull it from under another reader.
+          val uri = url.toURI
+          try FileSystems.newFileSystem(uri, java.util.Map.of[String, Any]())
+          catch case _: FileSystemAlreadyExistsException => ()
+          walk(Paths.get(uri))
         case _ => ()
+
+    def walk(root: Path): Unit =
+      val stream = Files.walk(root)
+      try
+        stream.iterator().asScala.filter(Files.isRegularFile(_)).foreach: file =>
+          add(relativePath(root, file), Files.readAllBytes(file))
+      finally stream.close()
 
     found.toMap
 

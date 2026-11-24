@@ -708,6 +708,8 @@ Your own project's skills load the same way: put them in the same layout under `
 
 Skills with invalid `SKILL.md` frontmatter, or that go over the static-entry limits, are left out with a logged warning and listed in `jars.skipped`. `McpSkillsJars.load(classLoader)` scans a specific class loader instead of the thread's context class loader, and `McpSkillsJars.load(entries)` reads a `Chunk[Path]` of jar files and classpath directories directly (it finds skills in a jar that has no `META-INF/skills/` directory entry, which a class loader misses).
 
+In a GraalVM native image, `McpSkillsJars.load` reads the skills through the image's `resource:` file system. This library's `META-INF/native-image/com.jamesward/zio-http-mcp/reachability-metadata.json` includes everything under `META-INF/skills/` in the image, so a native build needs no extra configuration.
+
 ### MCP Apps
 
 Apps support is capability-only on the server. Typed helpers emit only the stable nested `_meta.ui` form, preserve unrelated metadata, and guarantee a meaningful text fallback for clients that do not render Apps.

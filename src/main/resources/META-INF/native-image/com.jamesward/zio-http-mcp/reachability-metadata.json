@@ -1,0 +1,6 @@
+{
+  "resources": [
+    { "glob": "META-INF/skills" },
+    { "glob": "META-INF/skills/**" }
+  ]
+}
