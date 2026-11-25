@@ -20,11 +20,11 @@ val zioVersion = "2.1.27"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                   % zioVersion,
-  "dev.zio" %% "zio-http"              % "3.11.6",
+  "dev.zio" %% "zio-http"              % "3.12.0",
   "dev.zio" %% "zio-schema-derivation" % "1.9.2",
   "dev.zio" %% "zio-schema-json"       % "1.9.2",
   // Subprocesses for the stdio client transport.
-  "dev.zio" %% "zio-process"           % "0.8.1",
+  "dev.zio" %% "zio-process"           % "0.8.2",
   // Circuit breaker (suspending a failing webhook endpoint) and bulkhead (bounding outbound POSTs).
   "nl.vroste" %% "rezilience"          % "0.10.6",
 
@@ -46,9 +46,9 @@ libraryDependencies ++= Seq(
 
   // kpavlov/tachyon — a standalone pure-Java MCP server runtime, used as a
   // third-party interop target for cross-version negotiation tests.
-  "dev.tachyonmcp" % "tachyon-core" % "1.0.1" % Test,
+  "dev.tachyonmcp" % "tachyon-core" % "1.1.0" % Test,
   // tachyon's SEP-2663 Tasks extension, for task interop with our client.
-  "dev.tachyonmcp" % "tachyon-extensions-tasks" % "1.0.1" % Test,
+  "dev.tachyonmcp" % "tachyon-extensions-tasks" % "1.1.0" % Test,
 
   // Real SkillsJars (https://skillsjars.com) on the test classpath for McpSkillsJarsSpec.
   "com.skillsjars" % "anthropics__skills__pdf"              % "2026_02_25-3d59511" % Test,
